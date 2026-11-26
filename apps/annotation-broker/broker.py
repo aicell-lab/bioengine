@@ -40,6 +40,22 @@ COLLECTION_ID = "bioimage-io/colab-annotations"
 STATE_ROOT = Path.home() / "annotation_broker"
 MANIFEST_CACHE_TTL_S = 60.0
 
+#: How long the public gallery may reuse one dataset's name and description.
+#: The gallery is an anonymous read whose cost was one uncached artifact read
+#: per published dataset on EVERY visit, so it got slower the more data the
+#: project shared -- for exactly the audience it exists for. Short, because the
+#: alternative to a short window is a record of somebody's dataset name living
+#: in this app's state and going stale with nothing to refresh it.
+PUBLIC_CARD_CACHE_TTL_S = 60.0
+
+#: How many of a cold gallery fill's per-dataset reads may be in flight at once.
+#: The reads were issued one dataset after another, so a cold fill cost N round
+#: trips end to end however fast each one was. A bound rather than "all of
+#: them": the point is to stop N round trips being N serial round trips, not to
+#: let one anonymous visit open an unbounded number of connections to the
+#: artifact manager.
+PUBLIC_CARD_FILL_CONCURRENCY = 8
+
 
 # A send-side RPC failure: the request never reached the server, so re-resolving
 # the service and retrying is safe even for writes.
@@ -150,6 +166,15 @@ class AnnotationBroker:
         self._manifest_name_cache: Dict[str, tuple] = {}
         # artifact_id -> (cached_at, {stem: entry}); see _image_manifest
         self._image_manifest_cache: Dict[str, tuple] = {}
+        # artifact_id -> (stamped_at, {"name": ..., "description": ...}) for the
+        # public gallery's cards. NOT a record of which datasets are public:
+        # `iter_public_metadata` is the only thing that decides that, and this
+        # is consulted only for ids it has already returned.
+        self._public_card_cache: Dict[str, tuple] = {}
+        # artifact_id -> lock, so K visitors arriving on a cold cache make ONE
+        # read per dataset between them rather than K. Same shape as
+        # `_image_manifest_locks`, and the reason is the same.
+        self._public_card_locks: Dict[str, asyncio.Lock] = {}
         self._image_manifest_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
@@ -437,16 +462,21 @@ class AnnotationBroker:
             # nothing, then declare the read incomplete. That is a bound rather
             # than a proof, and it is deliberately generous; the alternative
             # designs are recorded on the row.
-            names = [
-                entry.get("name") if isinstance(entry, dict) else str(entry)
-                for entry in batch
-            ]
-            before = len(seen)
-            for entry in batch:
-                name = entry.get("name") if isinstance(entry, dict) else str(entry)
-                if isinstance(name, str) and name not in seen:
-                    seen.add(name)
-                    out.append(entry)
+            #
+            # `before` is taken ABOVE, before the page is merged, and there is
+            # exactly ONE merge loop. There used to be a second copy of both
+            # here: the page was added, `before` was then taken from the
+            # already-grown set, and the second loop added nothing -- so
+            # `len(seen) == before` was true for EVERY non-empty page and
+            # `stalled` climbed on all of them. A correctly paging server was
+            # therefore declared INCOMPLETE after _NO_PROGRESS_PAGES pages.
+            # Measured by a review, through the shipped method against a double
+            # that serves every page in full: at a 1000-entry page, 7000
+            # entries came back complete and 8000 came back as 8000 entries
+            # with complete=False; at 10000, the cliff was at 80000. Harmless
+            # before the image reads depended on the flag, and not harmless
+            # after: every mint, import and finish into a dataset that size
+            # refused permanently and the pruning sync always skipped.
             if len(seen) == before:
                 stalled += 1
                 if stalled >= _NO_PROGRESS_PAGES:
@@ -520,6 +550,13 @@ class AnnotationBroker:
             self._image_manifest_locks[artifact_id] = lock
         return lock
 
+    def _public_card_lock(self, artifact_id: str) -> asyncio.Lock:
+        lock = self._public_card_locks.get(artifact_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._public_card_locks[artifact_id] = lock
+        return lock
+
     async def _image_manifest(
         self,
         artifact_id: str,
@@ -533,10 +570,30 @@ class AnnotationBroker:
         before 0.10.0) still resolves through this one path.
 
         Cached for ``MANIFEST_CACHE_TTL_S``, because ``get_image_url`` is the
-        annotate page's featherweight first call and must not grow two
-        round-trips. *require_stem* forces a refresh when the cache does not
-        contain it, so a just-uploaded image is never reported missing --
-        the cache can be stale, but only in the harmless direction.
+        annotate page's featherweight first call. *require_stem* forces a
+        refresh when the cache does not contain it, so a just-uploaded image is
+        never reported missing -- the cache can be stale, but only in the
+        harmless direction.
+
+        **THE LISTING IS PAGED, AND THAT COSTS A SECOND ROUND TRIP ON A CACHE
+        MISS.** This comment used to say the call "must not grow two
+        round-trips", and the reason it now does is that one call was not
+        reading the directory. `list_files`'s `limit` defaults to 1000 --
+        measured from the live artifact manager's own published schema,
+        ``{"default": 1000, "minimum": 1, "maximum": 10000}`` -- so a single
+        call answers a PAGE, and every image past the first page was simply
+        missing from the dataset's image list, with no error and nothing saying
+        so. `_list_files_all` pages until an EMPTY page, which for any
+        non-empty directory under 10000 entries is two calls rather than one.
+        That is the whole cost, it is paid only on a cache MISS, and the
+        alternative to it is an image list that is silently wrong above 1000
+        images. A test pins the call count so a change that doubles it again is
+        visible rather than inferred.
+
+        ``complete`` is discarded here, DELIBERATELY and named so. This is a
+        read: a short answer under-reports for one cache period and the next
+        read recomputes it. The callers that must NOT be handed a partial
+        listing are the ones that WRITE, and each of those checks it.
         """
         cached = self._image_manifest_cache.get(artifact_id)
         if (
@@ -547,7 +604,7 @@ class AnnotationBroker:
             return cached[1]
 
         doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
-        listing = await self._list_files_safe(artifact_id, "images")
+        listing, _listing_complete = await self._list_files_all(artifact_id, "images")
         # Uploads still in flight are withheld from the LISTING side. An object
         # that has only been PUT would otherwise be a dataset image whether or
         # not the finishing call was ever made, which is how a caller that
@@ -1495,42 +1552,158 @@ class AnnotationBroker:
         owner". See the block comment above `public_dataset_entry` in
         broker_core for the measurement behind that.
 
-        One artifact read per public dataset, for the name, description and
-        image count. That is proportional to the number of PUBLIC datasets
-        rather than to all of them, and a dataset whose artifact cannot be
-        read is listed with whatever is known rather than dropped -- a
-        gallery that silently shrinks is worse than one with a sparse card.
+        **The per-dataset reads are CACHED and the cold fill is CONCURRENT, and
+        those are two different costs rather than one.** This method used to
+        make one uncached ``_am.read`` per public dataset on every visit, issued
+        one dataset after another, so the page meant to show the project's
+        shared data was the page that got slower the more data the project
+        shared -- for anonymous visitors, who are the audience it exists for.
+        Measured on a counting double before the change: at N datasets, N
+        ``read`` calls per visit, repeating in full on the next visit, plus N
+        more for the image counts (those already behind a cache).
+
+        What each half buys, kept separate because a fix aimed at the wrong one
+        would have shown no improvement:
+
+        * the CACHE removes the repeat. A warm visit costs **zero** artifact
+          reads at any N.
+        * the CONCURRENCY removes the serialisation. A cold fill still costs N
+          reads -- the data is in N artifacts and no cache can invent it -- but
+          they are no longer N round trips end to end. Note the semaphore is
+          created per CALL, so its bound of
+          ``PUBLIC_CARD_FILL_CONCURRENCY`` is per visit and K visitors can have
+          8K reads in flight. That is deliberate and is NOT what bounds the
+          total: the single-flight below is.
+
+        **A cold call is still proportional to N, deliberately**, and what
+        bounds the damage is the TTL together with the PER-ARTIFACT
+        SINGLE-FLIGHT below: K visitors arriving on a cold cache make N reads
+        between them, not K x N. The earlier version of this paragraph claimed
+        the TTL alone did that -- "one cold fill per window is shared by every
+        visitor in it" -- and a review measured it false: 5 concurrent cold
+        visits at 10 datasets made 50 reads, because nothing coordinated them.
+        The row names "the number of visitors at once" as one of the two things
+        the cost grew with, so that was half of clause 1 unmet behind a true
+        sentence about a single visit.
+
+        The alternative -- copying each dataset's name into this app's own state
+        at publish time, so the gallery never reads an artifact at all -- was
+        not taken: it makes this app a second record of somebody else's dataset
+        name, with nothing to refresh it when they rename the dataset, and a
+        gallery showing a name the dataset no longer has is a worse failure than
+        a slow first visit.
+
+        **The cache is NOT a second source of truth for whether a dataset is
+        public.** ``iter_public_metadata`` decides that and nothing else does;
+        the cache is consulted only for ids that call has already returned, so
+        an unpublished dataset cannot be served from it however warm it is.
+        ``set_public`` drops the entry it changes, so a rename or a republish
+        shows up at once rather than after the TTL.
+
+        A dataset whose artifact cannot be read is listed with whatever is
+        known rather than dropped -- a gallery that silently shrinks is worse
+        than one with a sparse card -- and a failed read is NOT cached, so the
+        next visit retries it.
         """
-        entries: List[Dict[str, Any]] = []
-        for meta in core.iter_public_metadata(STATE_ROOT):
+        metas = core.iter_public_metadata(STATE_ROOT)
+        now = time.time()
+
+        # Entries for ids that are no longer public are DROPPED here. Keeping
+        # them is harmless for correctness -- the cache decides nothing about
+        # who is public -- but the dict would otherwise grow with every id that
+        # was ever public and never shrink. The authority is walked anyway, so
+        # this costs one set difference.
+        live_ids = {m["artifact_id"] for m in metas}
+        # THE UNION OF BOTH DICTS, not the cache's keys. A review found the leak:
+        # iterating the CACHE means an artifact whose read never SUCCEEDED has no
+        # cache entry, so its key never comes up and its lock is never dropped --
+        # one asyncio.Lock left behind per such id, in an app that runs for weeks.
+        # The `pop` on the lock was already here and was simply unreachable for
+        # exactly the ids that needed it.
+        for gone in [
+            k
+            for k in set(self._public_card_cache) | set(self._public_card_locks)
+            if k not in live_ids
+        ]:
+            self._public_card_cache.pop(gone, None)
+            self._public_card_locks.pop(gone, None)
+
+        async def _card(meta: Dict[str, Any]) -> Dict[str, Any]:
             artifact_id = meta["artifact_id"]
-            name = description = None
+
+            def _fresh():
+                cached = self._public_card_cache.get(artifact_id)
+                if cached is not None and core.is_cache_fresh(
+                    cached[0], ttl_s=PUBLIC_CARD_CACHE_TTL_S, now=now
+                ):
+                    return cached[1]
+                return None
+
+            card = _fresh()
+            if card is None:
+                # SINGLE-FLIGHT PER ARTIFACT, and leaving it out was a measured
+                # defect rather than an optimisation left on the table. A review
+                # ran 5 concurrent cold visits at 10 datasets and got 50 reads:
+                # nothing coordinated the visitors, so every one of them did the
+                # whole fill. The docstring above used to claim "one cold fill
+                # per window is shared by every visitor in it", which was FALSE
+                # -- and the row names "the number of visitors at once" as one
+                # of the two things the cost grew with, so this was the half of
+                # clause 1 that was not met.
+                #
+                # The same shape as `_image_manifest_locks`, which is why the
+                # image-count leg in that same probe made 10 reads and not 50.
+                # The cache is re-checked INSIDE the lock: whoever waited wants
+                # the winner's answer, not a second read of the same artifact.
+                async with self._public_card_lock(artifact_id):
+                    card = _fresh()
+                    if card is None:
+                        try:
+                            art = await self._am.read(artifact_id=artifact_id)
+                            manifest = (art or {}).get("manifest") or {}
+                            card = {
+                                "name": manifest.get("name"),
+                                "description": manifest.get("description"),
+                            }
+                            self._public_card_cache[artifact_id] = (
+                                time.time(),
+                                card,
+                            )
+                        except Exception:
+                            # Deliberately not logged per dataset: the id comes
+                            # from the broker's own state, but the read is a
+                            # network call and a transient failure must not turn
+                            # the gallery into a log amplifier. The sparse card
+                            # is the whole response -- and the failure is NOT
+                            # cached, or one bad moment would hold a blank card
+                            # for the whole TTL.
+                            card = {}
+            name = card.get("name")
+            description = card.get("description")
             image_count = None
-            try:
-                art = await self._am.read(artifact_id=artifact_id)
-                manifest = (art or {}).get("manifest") or {}
-                name = manifest.get("name")
-                description = manifest.get("description")
-            except Exception:
-                # Deliberately not logged per dataset: the id comes from the
-                # broker's own state, but the read is a network call and a
-                # transient failure must not turn the gallery into a log
-                # amplifier. The sparse card is the whole response.
-                pass
             try:
                 manifest_images = await self._image_manifest(artifact_id)
                 image_count = len(manifest_images)
             except Exception:
                 pass
-            entries.append(
-                core.public_dataset_entry(
-                    meta,
-                    name=name,
-                    description=description,
-                    image_count=image_count,
-                )
+            return core.public_dataset_entry(
+                meta,
+                name=name,
+                description=description,
+                image_count=image_count,
             )
-        return entries
+
+        # Bounded concurrency, and the ORDER IS PRESERVED: `gather` returns
+        # results positionally, so the stable order `iter_public_metadata`
+        # guarantees survives. A gallery that reshuffled itself between visits
+        # would be a worse change than the one it fixed.
+        gate = asyncio.Semaphore(PUBLIC_CARD_FILL_CONCURRENCY)
+
+        async def _guarded(meta):
+            async with gate:
+                return await _card(meta)
+
+        return list(await asyncio.gather(*(_guarded(m) for m in metas)))
 
     @bioengine.method(context=True)
     async def set_public(
@@ -1546,6 +1719,11 @@ class AnnotationBroker:
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         meta["public"] = bool(is_public)
         meta = core.write_metadata(meta, root=STATE_ROOT)
+        # The gallery card is dropped here, so publishing, unpublishing or
+        # republishing a renamed dataset shows up at once instead of after
+        # PUBLIC_CARD_CACHE_TTL_S. Only this dataset's entry: a publish must not
+        # cost every other card its cache.
+        self._public_card_cache.pop(artifact_id, None)
         await self._apply_permissions(artifact_id, meta)
         return meta
 
@@ -1573,7 +1751,19 @@ class AnnotationBroker:
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
-            listing = await self._list_files_safe(artifact_id, "images")
+            # THE LISTING IS PAGED AND A SHORT ONE SKIPS THE WRITE, for the
+            # same reason as the withheld set below and with a worse
+            # consequence. This writer PRUNES: it drops a stored entry whose
+            # file it cannot see in the listing. `list_files` answers at most
+            # its default page of 1000 entries, so on a dataset above that,
+            # every image from page two onwards looked like an entry whose file
+            # had gone -- and this call would have deleted their manifest
+            # entries and committed. The images themselves survive (reads union
+            # the manifest with the listing), but their stored metadata does
+            # not, and a commit cannot be taken back.
+            listing, listing_complete = await self._list_files_all(
+                artifact_id, "images"
+            )
             # THE WITHHELD SET IS PASSED HERE TOO, and omitting it was a
             # measured data-loss hole rather than an oversight about style.
             # This writes the stored manifest and COMMITS, so an unfinished
@@ -1596,13 +1786,30 @@ class AnnotationBroker:
             # never their visibility, since reads union the manifest with the
             # listing anyway.
             withheld, complete = await self._withheld_upload_paths(artifact_id)
+            # ONE SKIP, TWO REASONS, and each names itself. A single `if not
+            # (complete and listing_complete)` would report "the markers could
+            # not be read" for a short image listing, which sends whoever reads
+            # the result to the wrong store.
+            skipped = None
             if not complete:
+                skipped = "the upload markers could not be read in full"
+                detail = (
+                    "writing on a short marker set would record an unfinished "
+                    "upload as an image permanently"
+                )
+            elif not listing_complete:
+                skipped = "the images directory could not be read in full"
+                detail = (
+                    "this call PRUNES, and on a short listing an image whose "
+                    "file is simply on a later page looks like one whose file "
+                    "has gone, so its stored entry would be dropped and "
+                    "committed"
+                )
+            if skipped:
                 logger.warning(
-                    f"skipping the manifest write for {artifact_id}: the upload "
-                    "markers could not be read in full, and writing on a short "
-                    "set would record an unfinished upload as an image "
-                    "permanently. Nothing was changed; run this again once the "
-                    "store is healthy."
+                    f"skipping the manifest write for {artifact_id}: {skipped}, "
+                    f"and {detail}. Nothing was changed; run this again once "
+                    "the store is healthy."
                 )
                 entries = core.parse_image_manifest(doc)
                 return {
@@ -1613,7 +1820,7 @@ class AnnotationBroker:
                         for e in entries.values()
                         if e.get("state") == core.IMAGE_STATE_REMOTE
                     ),
-                    "skipped": "the upload markers could not be read in full",
+                    "skipped": skipped,
                 }
             entries, changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
@@ -1985,7 +2192,27 @@ class AnnotationBroker:
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
-            listing = await self._list_files_safe(artifact_id, "images")
+            # THE LISTING IS PAGED, AND A SHORT ONE MAKES THE CHECK BELOW
+            # LOOSER -- which is the opposite of the withheld set's direction
+            # and is why this needs its own refusal. Fewer listed names means
+            # fewer names look taken, so on a dataset above `list_files`'s
+            # default page of 1000 a remote import could take a stem whose local
+            # FILE sits on a later page. The write is the stored manifest plus
+            # this one entry, so that file is not deleted -- it is shadowed: the
+            # stem now resolves to a remote source, and the local object at
+            # `images/<stem><ext>` is unreachable through the manifest while
+            # still occupying the path.
+            listing, listing_complete = await self._list_files_all(
+                artifact_id, "images"
+            )
+            if not listing_complete:
+                raise RuntimeError(
+                    f"The images in '{artifact_id}' could not be listed in "
+                    f"full, so whether '{stem}' is already an image in this "
+                    "dataset cannot be decided. NOTHING was imported. Try "
+                    "again in a moment; if this repeats, the dataset's storage "
+                    "is not answering and a manager should look at it."
+                )
             # THE CHECK AND THE WRITE USE DIFFERENT SETS, deliberately, and
             # separating them is what makes this writer safe without a
             # fail-closed branch of its own.
@@ -2635,7 +2862,35 @@ class AnnotationBroker:
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
-            listing = await self._list_files_safe(artifact_id, "images")
+            # AN INCOMPLETE LISTING REFUSES THE MINT, and this is the direction
+            # the paged read matters most. `list_files` answers at most its
+            # default page of 1000, and a name missing from the answer looks
+            # free: on a dataset above 1000 images this check handed out an
+            # upload URL for a stem that ALREADY HAD AN IMAGE on a later page,
+            # the PUT overwrote that object at `images/<stem><ext>`, and the
+            # marker then recorded "not a pre-existing image" -- which is the
+            # whole warrant for the finish's discard. So a short listing here
+            # does not merely under-report, it loses an image and takes the
+            # justification for the deletion with it.
+            #
+            # Refusing is safe in a way answering is not. `already: True` on a
+            # short read would be the cautious answer for the stem it names, but
+            # it is the wrong statement -- it tells the caller an image exists
+            # when nothing here knows that -- and it cannot be given for a stem
+            # the short answer did not mention at all, which is every stem on a
+            # later page. A refusal names the condition and the caller retries.
+            listing, listing_complete = await self._list_files_all(
+                artifact_id, "images"
+            )
+            if not listing_complete:
+                raise RuntimeError(
+                    f"The images in '{artifact_id}' could not be listed in "
+                    f"full, so whether '{name}' would overwrite an existing "
+                    "image cannot be decided. NOTHING was changed and no "
+                    "upload URL was handed out. Try again in a moment; if this "
+                    "repeats, the dataset's storage is not answering and a "
+                    "manager should look at it."
+                )
             # A WITHHELD PATH IS NOT TAKEN, and omitting this made a refusal's
             # own instructions false. The refusals that leave the object staged
             # -- the marker removal failing, and before it the incomplete
@@ -2784,12 +3039,43 @@ class AnnotationBroker:
                 "and finish with the 'mint_id' from that answer."
             )
 
-        listing = await self._list_files_safe(artifact_id, "images")
-        refusal = core.oversized_image_refusal(
-            name,
-            core.file_size_from_listing(listing, name),
-            core.MAX_LOCAL_IMAGE_BYTES,
-        )
+        # THE LISTING IS PAGED, AND HERE A SHORT ONE ALREADY FAILED CLOSED --
+        # which is worth saying plainly, because the obvious guess is that this
+        # was a size-ceiling bypass and it was not. `file_size_from_listing`
+        # returns None for a name it does not find, and
+        # `oversized_image_refusal` refuses on None by design. So before this
+        # change, finishing an upload into a dataset of more than 1000 images
+        # refused every time the just-PUT object landed past the first page,
+        # with a message blaming the store for not reporting sizes. Wrong, and
+        # a dead end for the user, but never a way past the ceiling.
+        #
+        # Paging fixes the false refusal. The completeness flag is still
+        # checked, so that the one refusal left names the real condition
+        # instead of the store's size reporting.
+        listing, listing_complete = await self._list_files_all(artifact_id, "images")
+        if not listing_complete:
+            # A REFUSAL STRING, NOT A `raise` HERE, and the difference is the
+            # staged object. Raising at this point would skip the discard below,
+            # which the comment there explains is the whole reason the refusal
+            # is safe: an object left at `images/<stem><ext>` becomes a dataset
+            # image anyway, because the image list is built from the staged
+            # listing and the next commit from any route commits the stage. So
+            # this joins the existing path instead, and the ceiling's own
+            # unreadable-size branch is the precedent -- it also removes.
+            refusal = (
+                f"The images in '{artifact_id}' could not be listed in full, "
+                f"so the size of '{name}' could not be checked against the "
+                f"{core.MAX_LOCAL_IMAGE_BYTES}-byte limit. The upload was NOT "
+                "accepted and the file has been removed. Start again with "
+                "done=false once the dataset's storage is answering; if this "
+                "repeats, a manager should look at it."
+            )
+        else:
+            refusal = core.oversized_image_refusal(
+                name,
+                core.file_size_from_listing(listing, name),
+                core.MAX_LOCAL_IMAGE_BYTES,
+            )
         if refusal:
             # THE STAGED OBJECT IS REMOVED, and raising without removing it was
             # a defect rather than an omission: a review measured that the
@@ -3200,11 +3486,27 @@ class AnnotationBroker:
         image_read_url = await self._am.get_file(
             artifact_id=artifact_id, file_path=image_file_path, stage=True
         )
-        embedding_put_url = await self._am.put_file(artifact_id, file_path=emb_path)
+
+        # THE SAME BUG AS `get_save_urls`, and found by the review of that fix.
+        # `put_file` asserts the artifact is staged, so a bare call here raised
+        # on any artifact that had been committed -- and adding an image commits
+        # one. The first embedding request for a freshly uploaded image
+        # therefore failed with "Artifact must be in staging mode.", on the same
+        # path a user walks straight after adding their image.
+        #
+        # Fixing it here rather than filing it: the two are one defect, and the
+        # browser check that would have caught it comes after a release.
+        minted: Dict[str, str] = {}
+
+        async def _mint_embedding_url():
+            minted["url"] = await self._am.put_file(artifact_id, file_path=emb_path)
+
+        await self._ensure_staged(artifact_id, _mint_embedding_url)
+
         return {
             "exists": False,
             "image_read_url": image_read_url,
-            "embedding_put_url": embedding_put_url,
+            "embedding_put_url": minted["url"],
         }
 
     @bioengine.method(context=True)
@@ -3269,27 +3571,49 @@ class AnnotationBroker:
 
         timestamp = core.new_timestamp()
         paths = core.annotation_save_paths(label, caller["id"], image_stem, timestamp)
-        png_put_url = await self._am.put_file(artifact_id, file_path=paths["png"])
-        geojson_put_url = await self._am.put_file(
-            artifact_id, file_path=paths["geojson"]
-        )
 
         safe_user = core.sanitize_user_id(caller["id"])
         users_path = core.label_users_path(label)
+        minted: Dict[str, str] = {}
 
-        async def _upsert_users():
+        # THE MINT IS INSIDE THE STAGED BLOCK, and that placement is the whole
+        # fix. `put_file` asserts the artifact is staged, so when these two
+        # calls ran ahead of `_ensure_staged` the FIRST of them raised on any
+        # artifact that had been committed -- and the restage-and-retry that
+        # exists to repair exactly that never ran, because it was still three
+        # lines away. Committing is routine (the upload finish commits, and
+        # `_commit_tolerating_pending_uploads` has many call sites), so this was
+        # not a rare state: adding an image to a dataset guaranteed it, and
+        # every subsequent annotation save on that dataset was refused with
+        # "Artifact must be in staging mode." The annotation the user had just
+        # drawn was lost with it.
+        #
+        # Minting and the users upsert go in ONE block rather than two so a
+        # single restage covers both. A retry is safe because it reuses the
+        # SAME paths -- not because an unused mint is free. It is not:
+        # `_commit_tolerating_pending_uploads` exists precisely because
+        # `put_file` registers the file in the staged manifest immediately, and
+        # a staged entry that never arrives in S3 blocks later commits until it
+        # is pruned. An earlier version of this comment said such a URL "has no
+        # effect", which contradicted that docstring; the conclusion held but
+        # the reason was wrong.
+        async def _mint_and_record_user():
+            minted["png"] = await self._am.put_file(artifact_id, file_path=paths["png"])
+            minted["geojson"] = await self._am.put_file(
+                artifact_id, file_path=paths["geojson"]
+            )
             current = await self._read_json_file(artifact_id, users_path, default={})
             updated = core.upsert_label_user(
                 current, safe_user, caller["id"], caller["email"]
             )
             await self._write_json_file(artifact_id, users_path, updated)
 
-        await self._ensure_staged(artifact_id, _upsert_users)
+        await self._ensure_staged(artifact_id, _mint_and_record_user)
 
         return {
             "timestamp": timestamp,
-            "png_put_url": png_put_url,
-            "geojson_put_url": geojson_put_url,
+            "png_put_url": minted["png"],
+            "geojson_put_url": minted["geojson"],
         }
 
     @bioengine.method(context=True)
