@@ -33,15 +33,30 @@ ENTRY = pathlib.Path(__file__).with_name("entry.py")
 SOURCE = ENTRY.read_text()
 TREE = ast.parse(SOURCE)
 
-# TWO gates, not one, and conflating them is what this file got wrong when the
-# co-manager rule shipped. `require_caller_may_mutate` is owner-or-admin and
-# governs acting on somebody's run. `require_caller_may_resume_run` is wider by
-# design -- owner, a MANAGER of the run's dataset, or an admin -- and governs
-# deriving a new model from somebody's checkpoint. A single `GATE` constant made
-# "is it gated" the question; the question is "by WHICH rule", because the two
-# admit different people.
+# THREE gates, and the number is not the point -- the point is that this file
+# must not carry a FIXED LIST of them. Each admits a different set of people:
+# `require_caller_may_mutate` is owner-or-admin and governs acting on somebody's
+# run; `require_caller_may_resume_run` also admits a MANAGER of the run's
+# dataset and governs deriving a model from their checkpoint; and
+# `require_caller_may_use_export` binds an export handle to the identity that
+# created it.
+#
+# **A fixed list is how this file produced a VACUOUS PASS, twice.** First it had
+# one `GATE` constant, so "is it gated" was the question when the question is
+# "by WHICH rule". Then it had two, and a third shipped -- and because the
+# detector only knew the two, it answered "not gated" for two methods that had
+# just been gated, which is the precise failure this file exists to prevent. The
+# detector below therefore DISCOVERS gates by prefix instead of being told them,
+# and `test_the_FILE_ACCOUNTS_FOR_EVERY_GATE_THE_APP_DEFINES` fails if the app
+# grows a fourth that the classification does not name.
 MUTATE_GATE = "require_caller_may_mutate"
 RESUME_GATE = "require_caller_may_resume_run"
+EXPORT_GATE = "require_caller_may_use_export"
+
+# Any callable whose name starts with this is a caller gate. Matching by PREFIX
+# rather than by membership is what makes a new gate visible to the open-set
+# check on the day it lands, instead of invisible until somebody notices.
+GATE_PREFIX = "require_caller_"
 
 # The parameter names by which a call is keyed to somebody's run. `export_id` is
 # included because an export handle is minted by `export_model`, which is itself
@@ -56,24 +71,18 @@ OPEN_TO_ANY_HOLDER = frozenset(
     }
 )
 
-# NOT a third opinion, a third STATE: ungated today, and SCHEDULED to be
-# restricted. The ruling exists -- these two are to be bound to the export's
-# creator, in a change of their own -- so this set records work that has not
-# shipped, not a question nobody has answered.
+# Bound to the identity that MINTED the handle, which is a third rule and not a
+# third opinion. `get_export_status` returns the whole export record, and a
+# READY record carries `download_url` -- a six-hour presigned link to the
+# packaged weights -- plus `resume_checkpoint_file`; `push_export` streams the
+# package to any presigned URL the caller supplies. So an export handle hands
+# over the weights.
 #
-# An earlier version of this file put these two in OPEN_TO_ANY_HOLDER and
-# described an export handle as safe to pass around. That was wrong on the
-# facts. `get_export_status` returns the whole export record, and a READY record
-# carries `download_url` -- a six-hour presigned link to the packaged weights --
-# plus `resume_checkpoint_file`. `push_export` streams the package to any
-# presigned URL the caller supplies. So an export handle hands over the
-# weights, which is the thing the restricted set exists to protect, and
-# freezing it as "open" asserted a decision nobody had taken.
-#
-# They stay here, matching what the code does today, until that change ships.
-# Restricting them alters behaviour on a surface the page polls, so it belongs
-# in its own change rather than in a documentation one.
-UNGATED_UNTIL_RESTRICTED = frozenset({"get_export_status", "push_export"})
+# These two spent a while in a set called UNGATED_UNTIL_RESTRICTED, recording
+# that the restriction was ruled on but unshipped. It has since shipped, and
+# that set is gone: a "not yet" category outlives the thing it describes and
+# then quietly asserts something false.
+CREATOR_OR_ADMIN = frozenset({"get_export_status", "push_export"})
 
 OWNER_OR_ADMIN = frozenset(
     {
@@ -107,20 +116,29 @@ def _public_methods():
     return out
 
 
-def _calls_the_gate(node, gate: str = MUTATE_GATE) -> bool:
-    """Does *node* call *gate* anywhere in its body?
+def _gates_called(node) -> frozenset:
+    """EVERY caller gate *node* invokes, DISCOVERED by prefix.
 
-    Parameterised rather than closed over one constant: an open method must
-    carry NEITHER gate, and that cannot be asked of a function that only knows
-    about one of them.
+    Discovered rather than enumerated, and that is the whole repair. A version
+    of this that took the gate names as arguments could only see the gates it
+    was handed, so when a third one shipped it reported two freshly-gated
+    methods as ungated. Matching `require_caller_*` means a gate nobody has
+    told this file about is still visible to the open-set check.
     """
+    found = set()
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
             fn = sub.func
             name = getattr(fn, "attr", None) or getattr(fn, "id", None)
-            if name == gate:
-                return True
-    return False
+            if isinstance(name, str) and name.startswith(GATE_PREFIX):
+                found.add(name)
+    return frozenset(found)
+
+
+def _calls_the_gate(node, gate: str = MUTATE_GATE) -> bool:
+    """Does *node* call this specific gate? Built on the discovery above, so
+    the two cannot disagree about what counts as a gate."""
+    return gate in _gates_called(node)
 
 
 METHODS = _public_methods()
@@ -144,38 +162,63 @@ def test_the_PARSE_FOUND_SOMETHING_to_begin_with():
         f"only {len(RUN_KEYED)} run-keyed methods found: {sorted(RUN_KEYED)}. "
         "Either the signatures changed or RUN_KEY_PARAMS is wrong."
     )
-    # BOTH gate names must exist in the source. A renamed gate would otherwise
-    # make every `_calls_the_gate` check answer False and the open-set tests
-    # pass for the wrong reason -- the gate would be gone and the file would
-    # report everything correctly ungated.
-    for gate in (MUTATE_GATE, RESUME_GATE):
+    for gate in (MUTATE_GATE, RESUME_GATE, EXPORT_GATE):
         assert gate in SOURCE, f"{gate} is not in entry.py at all; it was renamed"
 
 
-def test_EVERY_run_keyed_method_is_on_exactly_one_side():
-    """The reason this file exists: no third, undecided category.
+def test_the_FILE_ACCOUNTS_FOR_EVERY_GATE_THE_APP_DEFINES():
+    """THE CONTROL FOR THE CLASSIFICATION ITSELF, and the repair for a measured
+    vacuous pass.
 
-    A method that takes a run identifier either is open to any holder of that
-    identifier or requires the owner. Adding one without saying which fails
-    here, which is the only moment anybody is reliably forced to decide.
+    This file twice reported freshly-gated methods as ungated, because it held a
+    FIXED LIST of gate names and the app had grown one it did not know about.
+    The detector now discovers gates by prefix, which fixes the open-set check;
+    this fixes the other half, the named sets. It reads the gates the app
+    DEFINES out of `training.py` and fails if any is not accounted for here.
+    So adding a fourth gate breaks this test on the day it lands, and the
+    breakage names the gate.
+    """
+    import re as _re
+
+    training = (pathlib.Path(__file__).with_name("training.py")).read_text()
+    defined = set(_re.findall(r"^def (require_caller_\w+)", training, _re.M))
+    assert defined, "no caller gates found in training.py; the pattern is wrong"
+    accounted = {MUTATE_GATE, RESUME_GATE, EXPORT_GATE}
+    assert defined == accounted, (
+        f"the app defines {sorted(defined)} but this file accounts for "
+        f"{sorted(accounted)}. Unaccounted: {sorted(defined - accounted)}; "
+        f"stale: {sorted(accounted - defined)}. Every gate needs a named set, "
+        "or a method it guards can be classified as open."
+    )
+
+
+def test_EVERY_run_keyed_method_is_on_exactly_one_side():
+    """The reason this file exists: no UNDECIDED category.
+
+    There are four named ones, because the code gives four answers: open to any
+    holder of the identifier, owner-or-admin, owner-or-dataset-manager-or-admin,
+    and bound to the export's creator. The COUNT is not the rule -- the rule is
+    that a method taking a run identifier sits in exactly one of them.
+
+    An earlier version of this docstring said "no third, undecided category"
+    while the file carried a set named UNGATED_UNTIL_RESTRICTED. A "not yet"
+    category outlives the thing it describes and then asserts something false,
+    which is what happened: the restriction shipped and the set did not move.
     """
     declared = (
-        OPEN_TO_ANY_HOLDER
-        | OWNER_OR_ADMIN
-        | OWNER_MANAGER_OR_ADMIN
-        | UNGATED_UNTIL_RESTRICTED
+        OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | OWNER_MANAGER_OR_ADMIN | CREATOR_OR_ADMIN
     )
     undeclared = set(RUN_KEYED) - declared
     assert undeclared == set(), (
         f"these methods take a run identifier and are on neither side: "
         f"{sorted(undeclared)}. Decide, then add each to OPEN_TO_ANY_HOLDER, "
-        "OWNER_OR_ADMIN or OWNER_MANAGER_OR_ADMIN above."
+        "OWNER_OR_ADMIN, OWNER_MANAGER_OR_ADMIN or CREATOR_OR_ADMIN above."
     )
     sets = {
         "OPEN_TO_ANY_HOLDER": OPEN_TO_ANY_HOLDER,
         "OWNER_OR_ADMIN": OWNER_OR_ADMIN,
         "OWNER_MANAGER_OR_ADMIN": OWNER_MANAGER_OR_ADMIN,
-        "UNGATED_UNTIL_RESTRICTED": UNGATED_UNTIL_RESTRICTED,
+        "CREATOR_OR_ADMIN": CREATOR_OR_ADMIN,
     }
     for a_name, a in sets.items():
         for b_name, b in sets.items():
@@ -189,10 +232,7 @@ def test_EVERY_run_keyed_method_is_on_exactly_one_side():
 def test_the_declared_sets_do_not_name_methods_that_no_longer_EXIST():
     """The other direction, so a rename cannot leave a set asserting nothing."""
     missing = (
-        OPEN_TO_ANY_HOLDER
-        | OWNER_OR_ADMIN
-        | OWNER_MANAGER_OR_ADMIN
-        | UNGATED_UNTIL_RESTRICTED
+        OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | OWNER_MANAGER_OR_ADMIN | CREATOR_OR_ADMIN
     ) - set(METHODS)
     assert (
         missing == set()
@@ -235,13 +275,14 @@ def test_an_OPEN_method_does_NOT_carry_the_gate(name):
     would otherwise be an easy thing to add while fixing something else.
     """
     node, _params = METHODS[name]
-    for gate in (MUTATE_GATE, RESUME_GATE):
-        assert not _calls_the_gate(node, gate), (
-            f"{name} is open to any holder of the run identifier, but it now "
-            f"calls {gate}. Several people are meant to be able to try one "
-            "run's model. BOTH gates are checked, because a tightening is a "
-            "tightening whichever rule it uses."
-        )
+    gates = _gates_called(node)
+    assert gates == frozenset(), (
+        f"{name} is open to any holder of the run identifier, but it now calls "
+        f"{sorted(gates)}. Several people are meant to be able to try one run's "
+        "model. EVERY require_caller_* call counts, not a fixed list of them: a "
+        "tightening is a tightening whichever rule it uses, including one this "
+        "file has never heard of."
+    )
 
 
 def test_INFERENCE_is_open_which_is_the_decision_that_was_actually_taken():
@@ -255,10 +296,10 @@ def test_INFERENCE_is_open_which_is_the_decision_that_was_actually_taken():
     assert {"infer", "compute_embedding"} <= OPEN_TO_ANY_HOLDER
     for name in ("infer", "compute_embedding"):
         node, _params = METHODS[name]
-        for gate in (MUTATE_GATE, RESUME_GATE):
-            assert not _calls_the_gate(
-                node, gate
-            ), f"{name} must not require the owner (it calls {gate})"
+        gates = _gates_called(node)
+        assert (
+            gates == frozenset()
+        ), f"{name} must not require the owner (it calls {sorted(gates)})"
 
 
 def test_the_WEIGHT_HANDING_methods_are_the_gated_ones():
@@ -321,19 +362,22 @@ def test_the_TUTORIAL_says_it_too_where_the_id_is_first_obtained():
     )
 
 
-@pytest.mark.parametrize("name", sorted(UNGATED_UNTIL_RESTRICTED))
-def test_the_UNRULED_methods_are_in_fact_ungated_today(name):
-    """Records the state, not an endorsement of it.
+@pytest.mark.parametrize("name", sorted(CREATOR_OR_ADMIN))
+def test_a_CREATOR_OR_ADMIN_method_carries_the_EXPORT_gate(name):
+    """An export handle is bound to the identity that minted it.
 
-    When the change that restricts these lands, this test fails -- and the fix
-    is to move the method into OWNER_OR_ADMIN and update the README with it,
-    not to delete the assertion. Failing at that moment is the point: it is
-    what stops the documentation and the behaviour drifting apart.
+    This replaces a test that asserted these two were UNGATED, which passed for
+    a while after they had been gated: the detector it used knew two gate names
+    and the export gate was a third, so "not gated" was answered True about
+    gated code. The predecessor was written to fail on the day the restriction
+    shipped, and it did not. Hence this assertion names the gate, and
+    `test_the_FILE_ACCOUNTS_FOR_EVERY_GATE_THE_APP_DEFINES` makes the next new
+    gate impossible to miss the same way.
     """
     node, _params = METHODS[name]
-    assert not _calls_the_gate(node), (
-        f"{name} is now gated. Move it to OWNER_OR_ADMIN and correct the "
-        "README, which currently tells readers it is not."
+    assert _calls_the_gate(node, EXPORT_GATE), (
+        f"{name} hands over an export record, which carries a link to the "
+        f"weights, so it must call {EXPORT_GATE}"
     )
 
 
@@ -416,13 +460,27 @@ def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
 def test_the_README_warns_that_an_EXPORT_HANDLE_is_the_weights():
     readme = pathlib.Path(__file__).with_name("README.md").read_text().lower()
     assert "download_url" in readme, "the README does not name download_url"
-    for phrase in ("export handle", "will be restricted"):
+    for phrase in ("export handle", "bound to the identity that created it"):
         assert phrase in readme, f"the README does not say {phrase!r}"
-    assert "not yet decided" not in readme, (
-        "the README still calls the export-handle policy undecided. It was "
-        "decided -- restrict them -- and a test that pins the older wording "
-        "freezes a statement nobody ratified, which is the failure this file "
-        "exists to prevent."
+
+    # THE RETIRED WORDINGS, each of which was true once and is now false. A
+    # pinning test is only as good as its pin: this file previously required
+    # "will be restricted", so when the restriction SHIPPED the README kept
+    # promising a future change that had already happened, and the test held it
+    # there. Both the undecided phrasing and the not-yet phrasing are now
+    # forbidden, so the documentation cannot drift back to describing the
+    # restriction as pending.
+    for retired in ("not yet decided", "will be restricted", "until that ships"):
+        assert retired not in readme, (
+            f"the README still says {retired!r}. The restriction has SHIPPED: "
+            "get_export_status and push_export are bound to the export's "
+            "creator. A test that pins a pending-change wording freezes a "
+            "statement that is no longer true, which is the failure this file "
+            "exists to prevent."
+        )
+    assert "anyone holding the handle" not in readme, (
+        "the README table still says an export handle is open to anyone "
+        "holding it, which the shipped gate contradicts"
     )
 
 
@@ -440,6 +498,14 @@ def test_the_TUTORIAL_warns_about_the_export_handle_too():
     assert (
         "not a progress token" in text
     ), "the tutorial hands the reader an export_id without saying what it grants"
+    assert "bound to the identity that created it" in text, (
+        "the tutorial does not tell the reader that an export handle is bound "
+        "to its creator, so a reader still believes passing one works"
+    )
+    assert "to any caller holding the id" not in text, (
+        "the tutorial still says the export record goes to any caller holding "
+        "the id, which the shipped gate contradicts"
+    )
 
 
 def test_the_README_TABLE_ROW_itself_names_the_weights():
