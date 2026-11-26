@@ -366,11 +366,37 @@ def test_a_second_replica_uses_the_winners_tree_instead_of_re_downloading(
     monkeypatch, tmp_path
 ):
     """The marker is only written after a completed sync, so trusting it inside the claim
-    is safe — and it is what makes the loser cheap rather than a duplicate download."""
+    is safe — and it is what makes the LOSER cheap rather than a duplicate download.
+
+    The loser is the point, so the loser is what this simulates: a claim is already held
+    when we arrive, and it is released (with the winner's tree and marker published) on
+    the first poll. Asserting this with two plain sequential calls instead would describe
+    an ordinary restart, where skipping the sync is wrong — reconciliation is this
+    module's contract on every start, and `test_missing_local_file_redownloaded`,
+    `test_changed_timestamp_redownloads_only_that_file` and
+    `test_removed_file_deleted_locally` all pin it.
+    """
     app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+
+    # The winner: materialises, publishes its marker, and leaves its claim in place.
+    app_dir.mkdir(parents=True, exist_ok=True)
+    claim = app_dir / ".claim"
+    claim.mkdir()
+    (app_dir / "source").mkdir(parents=True, exist_ok=True)
+    (app_dir / ".version").write_text("ws-test/my-app@1.2.3")
+
+    # The winner finishes while we are waiting: its claim disappears on the first poll.
+    def release_on_first_poll(_seconds):
+        try:
+            claim.rmdir()
+        except OSError:
+            pass
+
+    monkeypatch.setattr(replica_init.time, "sleep", release_on_first_poll)
+
     replica_init.setup_replica_environment()
-    replica_init.setup_replica_environment()
-    assert calls == ["1.2.3"], f"the source was re-synced: {calls}"
+
+    assert calls == [], f"the loser re-synced the winner's tree: {calls}"
 
 
 def test_an_abandoned_claim_is_broken(monkeypatch, tmp_path):

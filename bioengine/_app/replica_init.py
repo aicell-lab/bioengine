@@ -36,7 +36,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 #: Excludes mirror v0.11.3's ``AppBuilder._PY_MODULES_EXCLUDES`` with one
 #: addition (``.dotfiles`` per user request) — the artifact carries everything,
@@ -242,8 +242,12 @@ def _store_now(app_dir: Path) -> float:
             pass
 
 
-def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Path:
+def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
     """Serialise same-store source materialisation with an atomic directory create.
+
+    Returns ``(claim, waited)``. ``waited`` is True when another replica held the claim
+    at any point before we got it, which is the *only* situation in which the caller may
+    trust the version marker instead of reconciling — see :func:`_ensure_source`.
 
     ``fcntl.flock`` used to do this and **cannot** on the production store: the de.NBI
     app directory is an NFS mount with no lock manager, so ``flock(LOCK_EX)`` raises
@@ -262,13 +266,16 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Path:
     """
     claim = app_dir / ".claim"
     deadline = time.monotonic() + _CLAIM_WAIT_S
+    waited = False
     while True:
         try:
             # NOT exist_ok=True: the collision IS the signal being waited on.
             claim.mkdir()
-            return claim
+            return claim, waited
         except FileExistsError:
-            pass
+            # Someone else holds it. Record that, because it changes what the caller
+            # is allowed to conclude from the version marker afterwards.
+            waited = True
         except OSError as exc:
             raise RuntimeError(
                 f"BioEngine: cannot create the source claim directory {claim}: {exc}. "
@@ -340,13 +347,23 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             logger.info(f"BioEngine: source mirrored from local path {candidate}")
             return source
 
-    claim = _acquire_claim(app_dir, logger)
+    claim, waited = _acquire_claim(app_dir, logger)
     try:
-        # Inside the claim it is safe to trust the marker: it is written only after a
-        # sync has completed, so a racing replica that waited here finds the winner's
-        # tree already correct and uses it instead of re-downloading the same bytes.
+        # Trust the marker ONLY when we actually waited for another replica's claim.
+        # It is written only after a completed sync, so a replica that queued behind the
+        # winner finds the winner's tree already correct and skips re-downloading the
+        # same bytes — that is what makes the loser of a race cheap.
+        #
+        # It must NOT short-circuit a replica that took the claim uncontended, which is
+        # every ordinary (re)start. This module's contract is to RECONCILE on each start:
+        # the snapshot makes that cheap (unchanged files are not re-fetched) but the pass
+        # is what re-downloads a file that changed under the same version, restores one
+        # lost from the shared store, and deletes one the artifact no longer lists. An
+        # unconditional short-circuit silently retired all three, which the pre-existing
+        # `test_{missing_local_file,changed_timestamp,removed_file}` cases caught.
         if (
-            source.is_dir()
+            waited
+            and source.is_dir()
             and version_marker.is_file()
             and version_marker.read_text().strip() == identity
         ):
