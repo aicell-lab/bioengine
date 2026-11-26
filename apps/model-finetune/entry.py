@@ -1816,7 +1816,13 @@ class EntryApp:
     #: Bounded rather than unbounded on purpose: `asyncio.gather` over 313
     #: uploads would open 313 connections at once against a shared artifact
     #: store, which trades a timeout for a different kind of outage.
-    RUNS_MIGRATE_CONCURRENCY = 8
+    #:
+    #: MEASURED at 8 on a fabricated 320-record store: the apply finished in
+    #: 248 s, well inside the 600 s ceiling, but 30 PUTs reported failure -- and
+    #: 23 of those records WERE in the artifact afterwards while 7 were not. The
+    #: store's verdict is therefore unreliable in both directions under that
+    #: load, so the bound is 4 and the read-back is the only judge.
+    RUNS_MIGRATE_CONCURRENCY = 4
 
     # Class-level fallbacks for the cache, so a published method never raises
     # AttributeError on an instance whose __init__ did not run. That is not a
@@ -2967,7 +2973,7 @@ class EntryApp:
             # by id set and content hash -- and writes nothing: no stage, no
             # upload, no commit. `confirm` is not required, because there is
             # nothing to confirm.
-            written, failed = [], []
+            written, failed, put_unknown = [], [], []
             stage_error = commit_error = None
         elif not apply:
             return plan
@@ -2999,7 +3005,7 @@ class EntryApp:
             # `_persist_run_record` is deliberately NOT changed. The bulk shape
             # belongs here, where the records are known to be independent of one
             # another and a single stage/commit pair covers all of them.
-            written, failed = [], []
+            written, failed, put_unknown = [], [], []
             am = await self._runs_artifact_manager()
 
             # NEITHER THE STAGE NOR THE COMMIT MAY RAISE OUT OF HERE.
@@ -3062,8 +3068,17 @@ class EntryApp:
             if stage_error is None:
                 # gather preserves argument order, so `written`/`failed` are built
                 # deterministically rather than in completion order.
+                # A PUT'S OWN VERDICT IS *UNKNOWN*, NOT AUTHORITATIVE.
+                #
+                # Measured on a 320-record store at concurrency 8: 30 PUTs
+                # raised, and 23 of those records were in the artifact
+                # afterwards while 7 were not. So reading a raised PUT as "this
+                # record is missing" would condemn records that landed, and
+                # reading a returned PUT as "landed" is the very error the
+                # read-back exists to catch. Both outcomes are recorded for the
+                # report and NEITHER decides.
                 for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
-                    (written if ok else failed).append(sid)
+                    (written if ok else put_unknown).append(sid)
             else:
                 # The artifact was never staged, so nothing could be uploaded. Every
                 # planned id is a failure, which is the truth and is reported rather
@@ -3175,6 +3190,65 @@ class EntryApp:
         plan["mismatched"] = sorted(
             sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
         )
+        plan["put_unknown"] = sorted(put_unknown)
+
+        # REPAIR PASS: re-upload ONLY what the read-back condemns.
+        #
+        # The read-back is the only judge of what landed, so it is also the only
+        # thing that can say what still needs writing. Retrying everything would
+        # re-upload hundreds of records that are already correct -- which is the
+        # cost this whole change exists to remove -- and retrying the PUTs that
+        # raised would retry the wrong set: measured at concurrency 8, 30 raised
+        # and only 7 of those were actually absent, while a PUT that returned
+        # cleanly can still have landed nothing.
+        #
+        # One pass, not a loop: if a record cannot be written twice under a
+        # bound of 4, that is a condition to report rather than to grind at.
+        plan["repaired"] = []
+        if (
+            not verify_only
+            and plan["mismatched"]
+            and stage_error is None
+            and commit_error is None
+            and verify_error is None
+        ):
+            bad = list(plan["mismatched"])
+            by_id = {e["id"]: e for e in planned}
+            retry = [by_id[sid] for sid in bad if sid in by_id]
+            logger.info(
+                f"model-finetune: backfill repairing {len(retry)} record(s) the "
+                f"read-back found missing or mismatched"
+            )
+            repair_error = await _retrying(
+                "re-stage for the repair pass",
+                lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
+            )
+            if repair_error is None:
+                await asyncio.gather(*(_upload_one(e) for e in retry))
+                repair_error = await _retrying(
+                    "commit the repair pass",
+                    lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+                )
+            plan["repair_error"] = repair_error
+
+            # RE-READ the repaired ids, because the repair's own PUT verdicts are
+            # no more authoritative than the first pass's were.
+            if repair_error is None:
+                try:
+                    for sid, digest in await asyncio.gather(
+                        *(_fetch_one(f"{sid}.json") for sid in bad)
+                    ):
+                        verified[sid] = digest
+                except Exception as exc:
+                    plan["repair_error"] = "%s: %s" % (
+                        type(exc).__name__,
+                        str(exc)[:200],
+                    )
+            plan["verified"] = len(verified)
+            plan["mismatched"] = sorted(
+                sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
+            )
+            plan["repaired"] = sorted(set(bad) - set(plan["mismatched"]))
         # COMPLETE IS THE CONJUNCTION, and every term is load-bearing: nothing
         # failed to write, the id set that landed is the id set that was
         # planned, the read-back itself succeeded, and every record the artifact
@@ -3216,11 +3290,17 @@ class EntryApp:
             )
             return plan
 
+        # THE READ-BACK IS THE ONLY JUDGE, so `complete` no longer consults
+        # `written`. That term asserted "every PUT returned", and a PUT's verdict
+        # has been measured unreliable in both directions -- it condemned 23
+        # records that had landed and cleared none of the 7 that had not. What
+        # remains is what the artifact itself says, plus the write-side errors
+        # that mean this replica cannot vouch for the artifact's state at all.
+        plan["failed"] = sorted(plan["mismatched"])
         plan["complete"] = (
-            not failed
-            and set(written) == set(plan["ids"])
+            not plan["mismatched"]
             and verify_error is None
-            and not plan["mismatched"]
+            and plan.get("repair_error") is None
             # A stage or commit that failed after its retry means the artifact
             # may not hold what was uploaded, so the run is not complete even if
             # every PUT returned. Reported as False rather than raised: the

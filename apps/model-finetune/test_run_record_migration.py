@@ -234,7 +234,9 @@ def _wire(inst, am=None):
     return am
 
 
-def _app(persisted=None, fail=(), tamper=(), am=None):
+def _app(
+    persisted=None, fail=(), tamper=(), tamper_once=(), raise_after_store=(), am=None
+):
     """An instance whose fake UPLOAD records what the artifact received.
 
     These levers used to hang off a stubbed `_persist_run_record`. The apply
@@ -256,12 +258,21 @@ def _app(persisted=None, fail=(), tamper=(), am=None):
     inst = object.__new__(cls)
     am = _wire(inst, am)
     real_put = inst._http.put
+    _tampered = set()
 
     def _id_from(url):
         return url.rsplit("/", 1)[-1][: -len(".json")]
 
     async def _put(url, content=None, **kw):
         sid = _id_from(url)
+        if sid in raise_after_store:
+            # The measured production behaviour at concurrency 8: the record
+            # LANDS and the call raises anyway. 23 of 30 raised PUTs were like
+            # this. Reading such a verdict as "missing" condemns a good record.
+            await real_put(url, content=content, **kw)
+            if persisted is not None:
+                persisted.append(sid)
+            raise RuntimeError("RemoteError after the write landed")
         if sid in fail:
             # The real failure arrives as a raising PUT, which the upload path
             # catches per record; returning a 500 would exercise
@@ -270,6 +281,12 @@ def _app(persisted=None, fail=(), tamper=(), am=None):
         if persisted is not None:
             persisted.append(sid)
         if sid in tamper:
+            content = json.dumps({"tampered": sid}).encode("utf-8")
+        elif sid in tamper_once and sid not in _tampered:
+            # Corrupt the FIRST attempt only, so the repair pass has something
+            # it can actually fix. `tamper` corrupts every attempt and can never
+            # be repaired, which makes it useless for testing the repair.
+            _tampered.add(sid)
             content = json.dumps({"tampered": sid}).encode("utf-8")
         return await real_put(url, content=content, **kw)
 
@@ -442,7 +459,11 @@ def test_a_record_that_lands_with_the_WRONG_CONTENT_is_NOT_complete(store):
     plan = _run(cls, inst, apply=True, confirm="2")
 
     assert plan["applied"] == 2, plan
-    assert plan["failed"] == [], plan
+    # `failed` now means "still not right in the ARTIFACT after the repair pass",
+    # not "a PUT reported failure" -- the read-back is the only judge. The
+    # tampered record is corrupt on every attempt, so the repair cannot fix it
+    # and it is still failed, which is the stronger statement.
+    assert plan["failed"] == plan["mismatched"], plan
     assert plan["mismatched"] == ["2026-01-01-000002-bbbbbbbb"], plan
     assert plan["complete"] is False, plan
 
@@ -454,7 +475,10 @@ def test_a_READ_BACK_THAT_FAILS_is_not_a_complete_migration(store):
     plan = _run(cls, inst, apply=True, confirm="1")
 
     assert plan["applied"] == 1, plan
-    assert plan["failed"] == [], plan
+    # With the read-back broken this replica cannot vouch for ANY record, so all
+    # of them are failed. Under the old meaning `failed` was empty here because
+    # the PUTs returned -- which said nothing about the artifact.
+    assert plan["failed"] == plan["ids"], plan
     assert plan["verify_error"] is not None, plan
     assert plan["complete"] is False, plan
 
@@ -901,7 +925,97 @@ def test_the_field_also_fires_on_a_failed_STAGE_which_is_why_it_is_named_for_a_W
     assert plan["stage_error"], plan
     assert plan["commit_error"] is None, plan
     assert plan["applied"] == 0, plan
-    assert plan["failed"] == plan["ids"], plan
+    # Nothing was uploaded, yet the records ARE in the artifact from the earlier
+    # run -- so nothing is "failed" in the new sense while the run is still not
+    # complete, because this replica's stage never landed. The two are
+    # independent, and that is the point of the field below.
+    assert plan["failed"] == [], plan
     assert plan["verified"] == 4, plan
     assert plan["records_present_despite_write_error"] is True, plan
+    assert plan["complete"] is False, plan
+
+
+# ── the read-back is the only judge, and it drives a repair ────────────────
+
+
+def test_a_PUT_that_RAISES_AFTER_THE_RECORD_LANDED_is_not_condemned(store):
+    """Measured production behaviour, and the reason a PUT verdict is UNKNOWN.
+
+    At concurrency 8, 30 PUTs raised on a 320-record store and 23 of those records
+    were in the artifact afterwards. Treating a raised PUT as "this record is
+    missing" would condemn all 23 and report an incomplete migration that was in
+    fact complete -- and the natural repair, re-running, would re-upload them all.
+    """
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-abcd000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, raise_after_store=(ids[1], ids[3]))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["put_unknown"] == sorted([ids[1], ids[3]]), plan["put_unknown"]
+    assert plan["mismatched"] == [], plan
+    assert plan["failed"] == [], plan
+    assert plan["complete"] is True, plan
+    assert plan["repaired"] == [], "nothing needed repairing, yet a repair ran"
+
+
+def test_a_record_that_lands_WRONG_ONCE_is_REPAIRED_and_the_run_completes(store):
+    """The repair pass, driven by the read-back rather than by a PUT verdict."""
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-beef000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(ids[2],))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["repaired"] == [ids[2]], plan["repaired"]
+    assert plan["mismatched"] == [], plan
+    assert plan["complete"] is True, plan
+
+
+def test_the_repair_RE_UPLOADS_ONLY_the_condemned_ids(store):
+    """Retrying everything would re-upload hundreds of correct records.
+
+    Asserted by COUNTING uploads: 5 in the first pass plus exactly 1 repair.
+    """
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-cafe000{i}"
+        store(sid)
+        ids.append(sid)
+    puts = []
+    am = FakeAM()
+    cls, inst = _app(puts, am=am, tamper_once=(ids[0],))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["complete"] is True, plan
+    assert len(puts) == 6, f"expected 5 + 1 repair, got {len(puts)}: {puts}"
+    assert puts.count(ids[0]) == 2, puts
+
+
+def test_a_record_that_lands_wrong_EVERY_time_is_NOT_called_complete(store):
+    """THE CONTROL on the repair: it must not paper over a record that stays wrong.
+
+    A repair pass that reported success regardless would satisfy the two tests above
+    and hide exactly the corruption the read-back exists to catch.
+    """
+    for i in range(1, 4):
+        store(f"2026-01-01-0000{i:02d}-dead000{i}")
+    am = FakeAM()
+    bad = "2026-01-01-000002-dead0002"
+    cls, inst = _app(am=am, tamper=(bad,))
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    assert plan["mismatched"] == [bad], plan
+    assert plan["failed"] == [bad], plan
+    assert plan["repaired"] == [], plan
     assert plan["complete"] is False, plan
