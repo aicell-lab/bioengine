@@ -177,9 +177,9 @@ async def test_an_ALREADY_STAGED_artifact_needs_NO_restage(monkeypatch):
     res = await _save(b)
 
     assert res["png_put_url"]
-    assert "edit:stage=True" not in am.calls, (
-        f"a staged artifact was restaged anyway: {am.calls}"
-    )
+    assert (
+        "edit:stage=True" not in am.calls
+    ), f"a staged artifact was restaged anyway: {am.calls}"
 
 
 @pytest.mark.asyncio
@@ -207,9 +207,9 @@ async def test_a_NON_STAGE_error_is_NOT_retried(monkeypatch):
 
     with pytest.raises(RuntimeError):
         await _save(b)
-    assert "edit:stage=True" not in am.calls, (
-        f"a non-staging failure triggered a restage: {am.calls}"
-    )
+    assert (
+        "edit:stage=True" not in am.calls
+    ), f"a non-staging failure triggered a restage: {am.calls}"
 
 
 # ── the sibling: embeddings mint an upload URL the same way ─────────────────
@@ -220,7 +220,7 @@ def _embedding_broker(monkeypatch, *, staged: bool):
     b, am, docs = _broker(monkeypatch, staged=staged)
 
     async def _file_exists(_a, _path):
-        return False          # no embedding yet, so it takes the minting branch
+        return False  # no embedding yet, so it takes the minting branch
 
     async def _image_file_path(_a, stem):
         return "images/%s.png" % stem
@@ -264,7 +264,7 @@ async def test_the_EMBEDDING_mint_RESTAGES_before_it_succeeds(monkeypatch):
     first_put = next(i for i, c in enumerate(am.calls) if c.startswith("put_file"))
     restage = next(i for i, c in enumerate(am.calls) if c == "edit:stage=True")
     assert first_put < restage, am.calls
-    assert any(c.startswith("put_file") for c in am.calls[restage + 1:]), am.calls
+    assert any(c.startswith("put_file") for c in am.calls[restage + 1 :]), am.calls
 
 
 @pytest.mark.asyncio

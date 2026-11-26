@@ -3590,9 +3590,7 @@ class AnnotationBroker:
         # effect", which contradicted that docstring; the conclusion held but
         # the reason was wrong.
         async def _mint_and_record_user():
-            minted["png"] = await self._am.put_file(
-                artifact_id, file_path=paths["png"]
-            )
+            minted["png"] = await self._am.put_file(artifact_id, file_path=paths["png"])
             minted["geojson"] = await self._am.put_file(
                 artifact_id, file_path=paths["geojson"]
             )
