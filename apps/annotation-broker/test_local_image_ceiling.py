@@ -84,6 +84,189 @@ def test_an_UNREADABLE_size_is_refused_and_says_which_case_it_is():
     assert "could not be read" in msg, msg
 
 
+# ── a store that DERIVES the size from the bytes that were PUT ─────────────
+#
+# The row names the shortcut this avoids: "drive the check with a fabricated
+# size rather than a real oversized object". Every size below comes from a body
+# this test actually uploaded through the URL the route minted -- the fake
+# store measures it the way a real one does. The ceiling is monkeypatched DOWN
+# so a "real oversized object" costs a few bytes rather than 64 MiB.
+
+
+class _Store:
+    """A tiny object store: PUT records bytes, the listing reports lengths."""
+
+    def __init__(self):
+        self.objects: dict = {}
+        self.removed: list = []
+        self.committed = 0
+
+    # -- the artifact-manager surface the route uses -------------------
+    async def put_file(self, _artifact_id, file_path=None):
+        return f"https://store.invalid/{file_path}"
+
+    async def remove_file(self, artifact_id=None, file_path=None):
+        self.removed.append(file_path)
+        self.objects.pop(file_path, None)
+
+    # -- what a client does with the minted URL ------------------------
+    def put(self, url: str, body: bytes):
+        self.objects[url.split("://", 1)[1].split("/", 1)[1]] = body
+
+    # -- what the broker reads back ------------------------------------
+    def listing(self, dir_path: str):
+        out = []
+        for path, body in sorted(self.objects.items()):
+            head, _, nm = path.rpartition("/")
+            if head != dir_path:
+                continue
+            out.append({"name": nm, "type": "file", "size": len(body)})
+        return out
+
+
+def _store_broker(monkeypatch, store, *, ceiling):
+    """A real broker over `_Store`, with the ceiling lowered."""
+    b = bk.AnnotationBroker()
+    monkeypatch.setattr(core, "MAX_LOCAL_IMAGE_BYTES", ceiling)
+    monkeypatch.setattr(b, "_canonical_id", lambda a: a)
+    monkeypatch.setattr(
+        b,
+        "_require_role",
+        lambda context, artifact_id, minimum: ({}, {"id": "u1"}, "manager"),
+    )
+
+    async def _read_json_file(_a, _path, _default=None):
+        return {"manifest_version": core.IMAGE_MANIFEST_VERSION, "images": {}}
+
+    async def _list_files_safe(_a, dir_path):
+        return store.listing(dir_path)
+
+    async def _ensure_staged(_a, fn):
+        return await fn()
+
+    async def _commit(_a):
+        store.committed += 1
+
+    async def _object_head(_a, path, n):
+        return store.objects.get(path, b"")[:n]
+
+    monkeypatch.setattr(b, "_read_json_file", _read_json_file)
+    monkeypatch.setattr(b, "_list_files_safe", _list_files_safe)
+    monkeypatch.setattr(b, "_am", store)
+    monkeypatch.setattr(b, "_ensure_staged", _ensure_staged)
+    monkeypatch.setattr(b, "_commit_tolerating_pending_uploads", _commit)
+    monkeypatch.setattr(b, "_object_head", _object_head)
+    return b
+
+
+def _png(nbytes: int) -> bytes:
+    """A body that really starts like a PNG, padded to *nbytes*."""
+    assert nbytes >= len(core.PNG_SIGNATURE)
+    return core.PNG_SIGNATURE + b"\0" * (nbytes - len(core.PNG_SIGNATURE))
+
+
+@pytest.mark.asyncio
+async def test_a_REAL_oversized_body_is_refused_AND_does_not_become_an_image(
+    monkeypatch,
+):
+    """Clause 1, end to end, with no fabricated size anywhere.
+
+    The body is PUT through the URL the route minted; the size the check reads
+    is the length the store derived from those bytes.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    assert mint["already"] is False and mint["max_bytes"] == 64
+    store.put(mint["put_url"], _png(65))  # one byte over
+
+    with pytest.raises(ValueError) as exc:
+        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    assert "65" in str(exc.value) and "64" in str(exc.value), str(exc.value)
+
+    assert store.committed == 0, "the oversized object was committed"
+    # THE FINDING round 1 made: refusing is not enough. The dataset's image
+    # list is built from the STAGED listing, so an object left in place
+    # becomes an image regardless of this route's commit.
+    assert "images/scan01.png" in store.removed, "the refused object was left staged"
+    manifest = await b._image_manifest(ARTIFACT)
+    assert "scan01" not in manifest, f"the refused object is still an image: {manifest}"
+
+
+@pytest.mark.asyncio
+async def test_after_a_refusal_the_SAME_NAME_can_be_RETRIED(monkeypatch):
+    """The other half of that finding. With the object left staged, a re-mint
+    answered `already: True` and the user could never retry that name with a
+    correct file."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(65))
+    with pytest.raises(ValueError):
+        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+
+    again = await b.upload_local_image(ARTIFACT, "scan01.png")
+    assert again["already"] is False, f"the name is still taken: {again}"
+    assert "put_url" in again
+
+    # And the retry with a body that fits completes.
+    store.put(again["put_url"], _png(32))
+    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    assert out["committed"] is True
+    assert store.committed == 1
+
+
+@pytest.mark.asyncio
+async def test_a_FAILED_DISCARD_does_not_replace_the_refusal(monkeypatch):
+    """The caller must still hear WHY the upload was rejected.
+
+    The discard is cleanup; the refusal is the answer. If `remove_file` raises,
+    swallowing the ValueError would tell the caller their oversized upload
+    failed for some storage reason, and reporting the storage error instead
+    would hide the ceiling. Neither: the refusal survives, and the failure to
+    clean up is logged -- because an object that could not be removed is still
+    staged and the next commit on that artifact would publish it.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(65))
+
+    async def _boom(artifact_id=None, file_path=None):
+        raise RuntimeError("the store refused the delete")
+
+    monkeypatch.setattr(store, "remove_file", _boom)
+
+    with pytest.raises(ValueError) as exc:
+        await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    msg = str(exc.value)
+    assert "65" in msg and "64" in msg, msg
+    assert "refused the delete" not in msg, "the cleanup error replaced the refusal"
+    assert store.committed == 0
+
+
+@pytest.mark.asyncio
+async def test_a_REAL_body_AT_the_ceiling_becomes_a_LOCAL_manifest_entry(monkeypatch):
+    """Clause 2, as the row words it: not merely "it committed" but that a
+    `local` entry results. Round 1 was right that the earlier test asserted
+    only the commit count."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(64))  # exactly at the ceiling
+
+    out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
+    assert out["committed"] is True
+    assert store.removed == [], f"a good upload was discarded: {store.removed}"
+
+    manifest = await b._image_manifest(ARTIFACT)
+    entry = manifest.get("scan01")
+    assert entry, f"no manifest entry for the uploaded image: {manifest}"
+    assert entry.get("state") == "local", entry
+    assert entry.get("path") == "images/scan01.png", entry
+
+
 # ── the route, called for real ──────────────────────────────────────────────
 
 

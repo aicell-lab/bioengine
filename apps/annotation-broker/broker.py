@@ -1928,6 +1928,26 @@ class AnnotationBroker:
 
         return {"already": False, "stem": stem, **entries[stem]}
 
+    async def _discard_staged_upload(self, artifact_id: str, path: str) -> bool:
+        """Remove a staged object this app has just refused. True if it went.
+
+        Never raises: every caller is already refusing a request for a reason
+        the caller needs to hear, and a failure to clean up must not replace
+        that reason with a different error. It is logged instead, because an
+        object that could not be removed is still staged and the next commit
+        from any route would publish it.
+        """
+        try:
+            await self._am.remove_file(artifact_id=artifact_id, file_path=path)
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"could not remove the refused upload at {path}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}. It is still staged, "
+                "so the next commit on this artifact would publish it."
+            )
+            return False
+
     @bioengine.method(context=True)
     async def upload_local_image(
         self,
@@ -2070,6 +2090,24 @@ class AnnotationBroker:
             core.MAX_LOCAL_IMAGE_BYTES,
         )
         if refusal:
+            # THE STAGED OBJECT IS REMOVED, and raising without removing it was
+            # a defect rather than an omission: a review measured that the
+            # dataset's image list is built from the STAGED listing, so an
+            # object left at `images/<stem><ext>` becomes an image anyway --
+            # the refusal would have stopped only THIS route's commit. Three
+            # consequences, all measured: the stem appeared in the image
+            # manifest after the refusal; a re-mint answered `already: True`,
+            # so the user could not retry that name with a correct file; and
+            # the next commit from any route, which commits the whole stage,
+            # would have made the oversized object permanent.
+            #
+            # Removed on the unreadable-size refusal too, deliberately. That
+            # message also covers "the object is not there", and removing
+            # something absent is a no-op -- while leaving something present
+            # whose size cannot be read is exactly the case the ceiling exists
+            # for. A removal that fails is logged and does not replace the
+            # refusal: the caller must still hear why the upload was rejected.
+            await self._discard_staged_upload(artifact_id, path)
             raise ValueError(refusal)
 
         # A presigned PUT reports success from S3, not from the artifact
