@@ -737,7 +737,9 @@ class EntryApp:
             # guard's to convert into a training refusal.
             self.logger.warning(
                 "could not read runtime capabilities (%s); skipping the "
-                "base-checkpoint preflight for %s", exc, model_type
+                "base-checkpoint preflight for %s",
+                exc,
+                model_type,
             )
             return
         caps = (pong or {}).get("capabilities") or []
@@ -746,7 +748,8 @@ class EntryApp:
                 "this runtime does not advertise base_checkpoint_status "
                 "(capabilities=%s); skipping the base-checkpoint preflight for "
                 "%s, so a run with unfetchable weights fails late as before",
-                list(caps), model_type,
+                list(caps),
+                model_type,
             )
             return
 
@@ -783,8 +786,11 @@ class EntryApp:
                 "probe_error": None,
             }
         except Exception as exc:
-            status = {"model_type": model_type, "parts": {},
-                      "probe_error": "%s: %s" % (type(exc).__name__, exc)}
+            status = {
+                "model_type": model_type,
+                "parts": {},
+                "probe_error": "%s: %s" % (type(exc).__name__, exc),
+            }
         refusal = training.base_checkpoint_refusal(model_type, status)
         if refusal:
             raise ValueError(refusal)

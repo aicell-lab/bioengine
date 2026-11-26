@@ -114,7 +114,7 @@ def test_a_type_this_site_CAN_produce_is_ADMITTED(parts):
     ids=["probe-error", "no-parts", "none", "not-a-dict", "part-not-a-dict"],
 )
 def test_an_UNANSWERABLE_probe_REFUSES_rather_than_admitting(bad):
-    """"I could not tell" has to behave like "not available here".
+    """ "I could not tell" has to behave like "not available here".
 
     Admitting the run when the check could not answer restores exactly the
     behaviour being removed: the caller waits for a slot and finds out later.
@@ -166,7 +166,9 @@ def test_the_preflight_is_SKIPPED_when_the_caller_brings_their_own_weights():
     """A caller supplying a checkpoint is not waiting on micro-sam's registry,
     so refusing them would refuse a run this site can actually do."""
     src = _start_training_source()
-    assert "if not init_checkpoint and model_type not in CELLPOSE_MODEL_TYPES:" in src, (
+    assert (
+        "if not init_checkpoint and model_type not in CELLPOSE_MODEL_TYPES:" in src
+    ), (
         "the preflight is no longer conditioned on the caller NOT supplying "
         "weights and on the model type being a micro-sam one"
     )
@@ -175,9 +177,7 @@ def test_the_preflight_is_SKIPPED_when_the_caller_brings_their_own_weights():
 def test_the_runtime_probe_NEVER_DOWNLOADS():
     """The cost this guard removes is a long wait, so a probe that downloaded
     the weights to find out would reproduce it."""
-    src = pathlib.Path(
-        pathlib.Path(__file__).parent / "runtime.py"
-    ).read_text()
+    src = pathlib.Path(pathlib.Path(__file__).parent / "runtime.py").read_text()
     i = src.index("async def base_checkpoint_status")
     body = src[i : src.index("\n    def _device", i)]
     for forbidden in ("pooch.retrieve", "fetch(", "urlretrieve", "get_sam_model"):
@@ -218,8 +218,9 @@ def _stub_micro_sam(monkeypatch, cache_root, urls, keys):
     probe reads. Injected through sys.modules because micro-sam is a RUNTIME
     dependency and is not importable here at all.
     """
-    reg = types.SimpleNamespace(path=str(cache_root), urls=dict(urls),
-                                registry={k: "xxh128:0" for k in keys})
+    reg = types.SimpleNamespace(
+        path=str(cache_root), urls=dict(urls), registry={k: "xxh128:0" for k in keys}
+    )
     mod = types.ModuleType("micro_sam.util")
     mod.models = lambda: reg
     pkg = types.ModuleType("micro_sam")
@@ -229,7 +230,9 @@ def _stub_micro_sam(monkeypatch, cache_root, urls, keys):
     return reg
 
 
-def test_a_CACHED_type_is_admitted_and_the_probe_TOUCHES_NO_NETWORK(tmp_path, monkeypatch):
+def test_a_CACHED_type_is_admitted_and_the_probe_TOUCHES_NO_NETWORK(
+    tmp_path, monkeypatch
+):
     """(a) Both parts on disk must admit, and must not ask the network at all —
     a cached model is the common case and paying a round trip for it would be
     a cost this guard is supposed to remove, not add."""
@@ -279,7 +282,8 @@ def test_a_store_that_answers_HEAD_with_405_is_still_ADMITTED(tmp_path, monkeypa
         models = tmp_path / "models"
         models.mkdir()
         _stub_micro_sam(
-            monkeypatch, models,
+            monkeypatch,
+            models,
             {"vit_b_lm": base + "/enc", "vit_b_lm_decoder": base + "/dec"},
             ("vit_b_lm", "vit_b_lm_decoder"),
         )
@@ -291,7 +295,9 @@ def test_a_store_that_answers_HEAD_with_405_is_still_ADMITTED(tmp_path, monkeypa
     assert training.base_checkpoint_refusal("vit_b_lm", st) is None, st
 
 
-def test_an_UNREACHABLE_store_is_REFUSED_with_the_unavailable_text(tmp_path, monkeypatch):
+def test_an_UNREACHABLE_store_is_REFUSED_with_the_unavailable_text(
+    tmp_path, monkeypatch
+):
     """(c) The case the row was filed for. A refused connection is used rather
     than a black hole so the test is fast and deterministic; the BUDGET under a
     black hole is the next test."""
@@ -304,9 +310,12 @@ def test_an_UNREACHABLE_store_is_REFUSED_with_the_unavailable_text(tmp_path, mon
     models.mkdir()
     base = f"http://127.0.0.1:{dead}"
     _stub_micro_sam(
-        monkeypatch, models,
-        {"vit_t_em_organelles": base + "/enc",
-         "vit_t_em_organelles_decoder": base + "/dec"},
+        monkeypatch,
+        models,
+        {
+            "vit_t_em_organelles": base + "/enc",
+            "vit_t_em_organelles_decoder": base + "/dec",
+        },
         ("vit_t_em_organelles", "vit_t_em_organelles_decoder"),
     )
     st = asyncio.run(
@@ -334,9 +343,12 @@ def test_the_probe_FITS_the_entry_budget_against_a_BLACK_HOLE(tmp_path, monkeypa
     # 10.255.255.1 is unroutable: packets are dropped, not refused, so each
     # attempt costs its full timeout rather than failing fast.
     _stub_micro_sam(
-        monkeypatch, models,
-        {"vit_t_em_organelles": "http://10.255.255.1/enc",
-         "vit_t_em_organelles_decoder": "http://10.255.255.1/dec"},
+        monkeypatch,
+        models,
+        {
+            "vit_t_em_organelles": "http://10.255.255.1/enc",
+            "vit_t_em_organelles_decoder": "http://10.255.255.1/dec",
+        },
         ("vit_t_em_organelles", "vit_t_em_organelles_decoder"),
     )
     t0 = time.monotonic()
@@ -381,9 +393,7 @@ class _FakeRuntime:
 
         async def _call(*a, **k):
             if self._probe is None:
-                raise AttributeError(
-                    "'RuntimeApp' object has no attribute %r" % name
-                )
+                raise AttributeError("'RuntimeApp' object has no attribute %r" % name)
             return self._probe(*a, **k)
 
         return _call
@@ -494,9 +504,9 @@ def test_every_ADVERTISED_capability_is_a_REAL_method():
     import runtime
 
     for name in runtime.RUNTIME_CAPABILITIES:
-        assert callable(getattr(cls, name, None)), (
-            f"ping advertises {name!r}, which is not a method on the runtime"
-        )
+        assert callable(
+            getattr(cls, name, None)
+        ), f"ping advertises {name!r}, which is not a method on the runtime"
 
 
 def test_a_TIMED_OUT_probe_does_NOT_blame_micro_sam(monkeypatch):

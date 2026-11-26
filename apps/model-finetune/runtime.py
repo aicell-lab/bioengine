@@ -91,6 +91,7 @@ def _url_reachable(url: str, timeout_s: float) -> bool:
             continue
     return False
 
+
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
 # runtime_env install did not take fails instead of being advertised as ready.
@@ -285,7 +286,11 @@ class RuntimeApp:
         """
         import os
 
-        out: Dict[str, Any] = {"model_type": model_type, "parts": {}, "probe_error": None}
+        out: Dict[str, Any] = {
+            "model_type": model_type,
+            "parts": {},
+            "probe_error": None,
+        }
         try:
             from micro_sam.util import models as _models
 
@@ -310,12 +315,18 @@ class RuntimeApp:
         # are unavailable here. That is the wrong sentence for the one case
         # this probe exists for: a host that silently drops packets.
         pending = []
-        for part, key in (("encoder", model_type), ("decoder", f"{model_type}_decoder")):
+        for part, key in (
+            ("encoder", model_type),
+            ("decoder", f"{model_type}_decoder"),
+        ):
             if key not in known:
                 continue  # micro-sam does not publish this part for this type
             cached = os.path.exists(os.path.join(root, key))
-            info: Dict[str, Any] = {"cached": cached, "reachable": None,
-                                    "url": urls.get(key)}
+            info: Dict[str, Any] = {
+                "cached": cached,
+                "reachable": None,
+                "url": urls.get(key),
+            }
             out["parts"][part] = info
             if not cached and info["url"]:
                 pending.append((info, info["url"]))
