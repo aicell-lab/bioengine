@@ -31,10 +31,78 @@ STATUS_STALE_SECONDS = 600
 # === session paths + file-backed status ===
 
 
+class SessionsRootUnavailable(RuntimeError):
+    """This replica cannot create, or cannot write, the directory runs are kept in.
+
+    Raised from two places, because they are two different facts: `sessions_root`
+    raises it when the store cannot be CREATED, and `assert_sessions_root_writable`
+    when the store exists but refuses a WRITE. A store that exists read-only
+    satisfies the first and fails the second.
+
+    A ``RuntimeError`` and not a ``ValueError``: nothing the caller asked for is
+    wrong. The replica cannot serve ANY run operation, and that is a property of
+    where it is running rather than of the request.
+
+    Measured 2026-11-25 on a de.NBI replica whose ``Path.home()`` was
+    ``/home/ray`` on a read-only filesystem: `start_training`,
+    `list_training_sessions` and `get_training_status` all raised an identical
+    bare ``OSError`` from the ``mkdir`` below, while the app reported RUNNING
+    and every deployment HEALTHY. Nothing said which of those failures was the
+    same failure, or that the replica could never serve a run at all.
+    """
+
+
 def sessions_root() -> Path:
     # Under the container's mounted ~/.bioengine so sessions survive restarts.
     root = Path.home() / ".bioengine" / "micro_sam_sessions"
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # NAMED, and says what it means for the app rather than for the syscall.
+        # Every run-touching path funnels through here, so a bare mkdir error
+        # surfaces identically at a dozen call sites with nothing tying them
+        # together -- which is exactly how a replica came to look healthy while
+        # being unable to do anything with runs. `_health` in entry.py calls
+        # this so the condition reports as UNHEALTHY and Serve replaces the
+        # replica, rather than it staying in the routing table forever.
+        raise SessionsRootUnavailable(
+            f"cannot create the training-run store at {root}: {exc}. This "
+            "replica cannot serve any training-run operation while that path "
+            "cannot be created."
+        ) from exc
+    return root
+
+
+def assert_sessions_root_writable() -> Path:
+    """Prove the run store accepts a WRITE, not merely that it exists.
+
+    `sessions_root` only establishes that the directory could be CREATED, and
+    `mkdir(exist_ok=True)` succeeds on a directory that already exists however
+    read-only it is: Linux reports EEXIST before EROFS and `exist_ok` swallows
+    it. So a store that exists and refuses every write left this replica
+    HEALTHY while every run write failed -- the precise symptom this check was
+    added for. Measured two ways: a pre-created store chmod'ed 0o555, where
+    `sessions_root()` returns the path and writing into it raises EACCES; and a
+    real read-only mount, where `mkdir(exist_ok=True)` on the existing
+    directory succeeds while creating anything inside it raises EROFS.
+
+    So write something. A create-and-unlink is the cheapest probe that cannot
+    be satisfied by a path that merely exists.
+    """
+    root = sessions_root()
+    probe = root / f".writable-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        probe.write_text("")
+    except OSError as exc:
+        raise SessionsRootUnavailable(
+            f"the training-run store at {root} exists but refuses writes: "
+            f"{exc}. This replica cannot serve any training-run operation."
+        ) from exc
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
     return root
 
 
