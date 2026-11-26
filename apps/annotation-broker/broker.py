@@ -2049,6 +2049,29 @@ class AnnotationBroker:
                 "max_bytes": core.MAX_LOCAL_IMAGE_BYTES,
             }
 
+        # THE CEILING, enforced here rather than advertised and forgotten. The
+        # minting call above hands the client `max_bytes`, and until this check
+        # existed nothing compared anything to it: an object of any size whose
+        # first bytes matched the declared format became a dataset image.
+        #
+        # Read from the staged LISTING, not by fetching the object: a staged
+        # listing already reports the size of what was just PUT (measured --
+        # `{"type": "file", "name": ..., "size": 12345, ...}` for a
+        # 12345-byte body), so enforcing the limit costs one listing and never
+        # a download of the very object that is too big to want.
+        #
+        # Checked BEFORE the signature, deliberately: the signature check
+        # fetches the first bytes of the object, and there is no reason to
+        # reach into something already known to be over the limit.
+        listing = await self._list_files_safe(artifact_id, "images")
+        refusal = core.oversized_image_refusal(
+            name,
+            core.file_size_from_listing(listing, name),
+            core.MAX_LOCAL_IMAGE_BYTES,
+        )
+        if refusal:
+            raise ValueError(refusal)
+
         # A presigned PUT reports success from S3, not from the artifact
         # manager, so the client saying it uploaded an image is not evidence
         # that an image is there. Check the signature against the extension

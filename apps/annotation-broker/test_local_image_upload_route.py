@@ -191,7 +191,17 @@ async def test_FINISHING_an_upload_drops_the_cached_image_list(monkeypatch):
     one did not, so `get_dataset_index` could serve a list computed up to
     `MANIFEST_CACHE_TTL_S` ago — without the image just uploaded.
     """
-    b = _broker(monkeypatch, manifest={}, listing=[])
+    # The listing carries the uploaded object WITH its size, which is what a
+    # staged listing really looks like after a PUT lands (measured: a staged
+    # listing reports `{"type": "file", "name": ..., "size": N, ...}`). It used
+    # to be `[]` here, which says the opposite -- that nothing was uploaded --
+    # and the finishing call now refuses that, correctly: see
+    # test_finishing_with_NOTHING_IN_THE_LISTING_is_refused below.
+    b = _broker(
+        monkeypatch,
+        manifest={},
+        listing=[{"name": "scan01.png", "type": "file", "size": 2048}],
+    )
     b._image_manifest_cache[ARTIFACT] = (time.time(), {"stale": {}})
 
     out = await b.upload_local_image(ARTIFACT, "scan01.png", done=True)
@@ -205,7 +215,13 @@ async def test_finishing_still_REFUSES_bytes_that_are_not_the_declared_format(
     monkeypatch,
 ):
     """The signature check must survive the cache fix, not be traded for it."""
-    b = _broker(monkeypatch, manifest={}, listing=[])
+    # A listing with a plausible size, so this test measures the SIGNATURE
+    # check rather than tripping the size check that now runs before it.
+    b = _broker(
+        monkeypatch,
+        manifest={},
+        listing=[{"name": "scan01.png", "type": "file", "size": 2048}],
+    )
 
     async def _bad_head(_a, _path, _n):
         return b"<!DOCTYPE html>"[:8]

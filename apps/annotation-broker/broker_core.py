@@ -1342,6 +1342,77 @@ LOCAL_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 # bucket, read by the same viewer, and there is no reason for two numbers.
 MAX_LOCAL_IMAGE_BYTES = MAX_MATERIALISE_BYTES
 
+
+def file_size_from_listing(entries: Any, name: str) -> Optional[int]:
+    """The stored size of *name* in a ``list_files`` result, or None.
+
+    MEASURED before this was written, because the whole enforcement rests on
+    it: a STAGED listing already reports the size of an object that has just
+    been PUT, with no commit and no download. On a staged artifact,
+    `list_files(..., stage=True)` returned
+    ``[{"type": "file", "name": "probe.bin", "size": 12345,
+    "last_modified": ...}]`` for a 12345-byte body — the exact length. So the
+    size can be read where the signature check already looks, rather than by
+    fetching the object.
+
+    None means "no size for that name here", which is not the same as "zero":
+    the file may be absent, or a store may not report sizes. The caller decides
+    what to do about it, and :func:`oversized_image_refusal` refuses rather
+    than waving it through.
+    """
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") != name:
+            continue
+        if entry.get("type") == "directory" or entry.get("is_dir"):
+            continue
+        size = entry.get("size")
+        # A bool is an int in Python and `True` would compare as 1. Rejected
+        # explicitly, because a store reporting a flag where a size belongs
+        # would otherwise read as a one-byte file.
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return None
+        return size
+    return None
+
+
+def oversized_image_refusal(
+    name: str, size: Optional[int], max_bytes: int
+) -> Optional[str]:
+    """A refusal naming BOTH the ceiling and the size found, or None to allow.
+
+    The ceiling was advertised to the client by the minting call and enforced
+    nowhere, so an object of any size that merely STARTED with the declared
+    format's signature became a dataset image. This is the enforcement.
+
+    An UNREADABLE size refuses too, and that direction is deliberate: the
+    alternative admits exactly the object the ceiling exists to keep out, and
+    it would do so silently. The refusal says which case it is, so a store that
+    stops reporting sizes is a loud failure rather than a quiet hole.
+
+    The boundary is INCLUSIVE: a file of exactly *max_bytes* is allowed, since
+    the number is advertised as a maximum and a client that honours it to the
+    byte must not be refused.
+    """
+    if size is None:
+        return (
+            f"The size of '{name}' could not be read, so the {max_bytes}-byte "
+            "limit cannot be checked. The upload was not accepted. Re-run with "
+            "done=False and PUT again; if this repeats, the store is not "
+            "reporting object sizes and the limit cannot be enforced."
+        )
+    if size > max_bytes:
+        return (
+            f"'{name}' is {size} bytes, over the {max_bytes}-byte limit for a "
+            "local image upload. It was not accepted. The limit is reported as "
+            "'max_bytes' by the call that mints the upload URL."
+        )
+    return None
+
+
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SIGNATURE = b"\xff\xd8\xff"
 
