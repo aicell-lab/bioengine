@@ -39,6 +39,7 @@ import numpy as np
 import pytest
 
 import broker_core as core
+import test_broker_ngff as ngff_fixtures
 
 # ── the fixture store: a channel axis named "ch", and a SPATIAL axis named "c" ──
 
@@ -326,3 +327,70 @@ def test_NAMING_A_PLANE_ON_THE_CHANNEL_AXIS_IS_STILL_REFUSED():
     assert (
         int(np.asarray(out).reshape(-1)[0]) == 2
     ), "before the fix, planes={'ch': 1} trained on channel 1 ALONE"
+
+
+# ── the broker's own call site, end to end through the real probe ──────────
+
+
+def _typed_store():
+    """The `_store` fixture's shape, with TYPES declared and the channel axis
+    named `ch`. Built here rather than by adding a knob to `_store`, so this
+    file's store cannot be changed from under it by a test about something
+    else — and the probe driven is the shipped one either way.
+    """
+    root = ngff_fixtures.ROOT
+    shapes = ((1, 3, 600, 800), (1, 3, 300, 400))
+    zattrs = {
+        "multiscales": [
+            {
+                "version": "0.4",
+                "axes": [
+                    {"name": "c", "type": "space"},
+                    {"name": "ch", "type": "channel"},
+                    {"name": "y", "type": "space"},
+                    {"name": "x", "type": "space"},
+                ],
+                "datasets": [{"path": str(i)} for i in range(len(shapes))],
+            }
+        ]
+    }
+    objects = {
+        root + ".zattrs": (200, zattrs, {}),
+        root + ".zgroup": (200, {"zarr_format": 2}, {}),
+    }
+    for i, shape in enumerate(shapes):
+        chunks = [1] * (len(shape) - 2) + [256, 256]
+        objects[f"{root}{i}/.zarray"] = (
+            200,
+            ngff_fixtures._zarray(shape, chunks, "|u1", None),
+            {},
+        )
+        key = ".".join(["0"] * len(shape))
+        objects[f"{root}{i}/{key}"] = (200, b"\x00\x00", ngff_fixtures.CORS_OK)
+    return objects
+
+
+async def test_THE_PROBE_REPORTS_THE_TYPED_CHANNEL_AXIS():
+    """The broker's own call site, through the shipped `_probe_ngff_source`.
+
+    Every other test here calls `broker_core` directly, so none of them would
+    notice the one thing the call site can get wrong: having the types and not
+    passing them. `axis_types` is optional on `ngff_axis_roles` for
+    compatibility, which means omitting it is silent.
+    """
+    broker = ngff_fixtures._broker(_typed_store())
+
+    probe = await broker._probe_ngff_source(
+        ngff_fixtures.ROOT, None, ngff_fixtures.ORIGIN
+    )
+
+    assert probe["axes"] == ["c", "ch", "y", "x"]
+    assert probe["axis_roles"] == {"y": 2, "x": 3, "c": 1}
+    # The channel axis's LENGTH, read the way the viewer and the trainer read
+    # it: from the probe's own level0_shape at the probe's own channel index.
+    # NOT `probe["channels"]`, which is the omero channel NAMES and is None for
+    # a store with no omero block -- asserting on that would have been a test
+    # of the fixture rather than of the axis.
+    assert probe["level0_shape"][probe["axis_roles"]["c"]] == 3
+    # And the width/height came off the spatial axes, not off the `c`-named one.
+    assert (probe["width"], probe["height"]) == (800, 600)
