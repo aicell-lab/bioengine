@@ -711,6 +711,11 @@ def test_two_concurrent_replicas_NEVER_SYNC_AT_ONCE(monkeypatch, tmp_path):
 
     monkeypatch.setattr(replica_init, "_sync_source_from_hypha", slow_sync)
     monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.02)
+    # The wait MUST be bounded here. Left at the shipped value, a regression that never
+    # releases the claim makes the loser wait the full interval: the arm then measured one
+    # replica, passed, and kept a non-daemon thread alive for twenty minutes. A guard that
+    # reports PASSED for a run whose second replica never finished is worse than no guard.
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 5)
     errors = []
 
     def run():
@@ -725,7 +730,21 @@ def test_two_concurrent_replicas_NEVER_SYNC_AT_ONCE(monkeypatch, tmp_path):
     for t in threads:
         t.join(timeout=60)
 
+    # Both replicas must have FINISHED. join(timeout=...) returns whether or not the thread
+    # ended, so without this a hung loser is indistinguishable from a fast one, and the
+    # non-overlap assertion below would run over a single interval and trivially hold.
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, (
+        f"{len(alive)} replica thread(s) were still running after join: the claim was never "
+        "released, so this run measured fewer replicas than it started and proves nothing"
+    )
     assert not errors, f"a replica raised: {errors}"
+    # ONE span is legitimate and must stay allowed: `_ensure_source` trusts the version marker
+    # only for a replica that actually WAITED, so the loser reuses the winner's tree instead of
+    # re-syncing. Requiring two would assert against the design. Non-overlap is then trivially
+    # true for a single interval — which is exactly why the liveness assertion above is what
+    # carries this arm: it proves both replicas FINISHED, so one span means the loser reused
+    # the marker rather than that it hung and was never measured.
     assert len(spans) >= 1, "neither replica synced, so nothing was measured"
     overlaps = [
         (a, b)
@@ -743,12 +762,34 @@ def test_the_bootstrap_failure_message_POINTS_AT_THE_REAL_CAUSE():
     Without that sentence the traceback is read as "source missing from sys.path", and the
     read-only write that follows looks like a separate, unrelated fault — which is exactly
     how the original defect stayed unexplained. Asserted structurally because the finder
-    only runs inside a replica, so the message cannot be triggered from a unit test; the
-    guard is that the wording survives, not that it is emitted.
+    only runs inside a replica, so the message cannot be triggered from a unit test.
+
+    The guard is NOT that particular words survive. A message containing every keyword can
+    still assert the opposite of the clause, so what is required is that the message READS
+    HOME and TMPDIR at print time and keeps the direction of the claim. A reader cannot
+    check it otherwise: a Python traceback never prints environment values.
     """
     src = Path(replica_init.__file__).parent.parent.joinpath("__init__.py").read_text()
     i = src.find("replica source bootstrap failed")
     assert i != -1, "the bootstrap failure message is gone"
-    window = src[i:i + 700]
-    for needed in ("HOME", "TMPDIR", "read-only"):
-        assert needed in window, f"the message no longer mentions {needed!r}: {window[:200]}"
+    window = src[i:i + 900]
+    # Keyword presence is NOT the property. A message saying "HOME and TMPDIR may NOT be
+    # set" contains every keyword while asserting the OPPOSITE of the clause, and passed.
+    # So require the message to REPORT the values it is talking about: it cannot make a
+    # claim about HOME/TMPDIR without reading them at print time.
+    for needed in ('environ.get("HOME"', 'environ.get("TMPDIR"'):
+        assert needed in window, (
+            f"the message does not read {needed!r} at print time, so whatever it says about "
+            "HOME/TMPDIR is an assumption. A traceback never prints environment values, so a "
+            "reader cannot check the claim themselves."
+        )
+    # …and keep the DIRECTION of the claim, which is what the inverted mutant changed.
+    assert "BEFORE" in window, (
+        "the message no longer says the redirection happens BEFORE the source sync, which is "
+        "the fact that makes an unset HOME point at an earlier failure rather than at the "
+        "eventual read-only write"
+    )
+    for forbidden in ("may NOT be set", "may not be set"):
+        assert forbidden not in window, (
+            f"the message now says {forbidden!r}, the opposite of what the setup does"
+        )
