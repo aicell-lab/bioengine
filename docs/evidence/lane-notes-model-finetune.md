@@ -25,3 +25,12 @@ One line each. Measured facts only; a guess says so.
   by phrase presence, so a narrowing BY NEGATION ("…and to an administrator, not
   to anyone who owns or manages the dataset") keeps every phrase and inverts the
   meaning. Inherent to phrase pinning; closing it needs the test to parse English.
+- 2026-11-26 · annotation-broker · a remote image's channel interpretation is
+  STORED at import and no read path revisits it, so an image imported before the
+  channel-axis-by-type fix keeps being read as single-channel planes afterwards.
+  Measured in the sources rather than against a stored dataset: the probe is
+  called from exactly two places, `probe_ngff_source()` and `import_ngff_image()`,
+  and from no read path; `get_image_url()` takes the stored `layout`; and
+  `broker_core` reads `layout["axis_roles"]` rather than re-deriving it, while the
+  trainer's `region_index`/`to_hw_or_hwc` take the roles as a parameter. No
+  dataset is known to hold such an image, which is why nothing is being migrated.
