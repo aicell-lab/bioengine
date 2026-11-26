@@ -33,7 +33,15 @@ ENTRY = pathlib.Path(__file__).with_name("entry.py")
 SOURCE = ENTRY.read_text()
 TREE = ast.parse(SOURCE)
 
-GATE = "require_caller_may_mutate"
+# TWO gates, not one, and conflating them is what this file got wrong when the
+# co-manager rule shipped. `require_caller_may_mutate` is owner-or-admin and
+# governs acting on somebody's run. `require_caller_may_resume_run` is wider by
+# design -- owner, a MANAGER of the run's dataset, or an admin -- and governs
+# deriving a new model from somebody's checkpoint. A single `GATE` constant made
+# "is it gated" the question; the question is "by WHICH rule", because the two
+# admit different people.
+MUTATE_GATE = "require_caller_may_mutate"
+RESUME_GATE = "require_caller_may_resume_run"
 
 # The parameter names by which a call is keyed to somebody's run. `export_id` is
 # included because an export handle is minted by `export_model`, which is itself
@@ -69,12 +77,21 @@ UNGATED_UNTIL_RESTRICTED = frozenset({"get_export_status", "push_export"})
 
 OWNER_OR_ADMIN = frozenset(
     {
-        "start_training",  # only when resume_session_id is given: derives a model
         "stop_training",  # acts on somebody else's run
         "export_model",  # hands out the weights
         "contribute",  # publishes them into the shared pool
     }
 )
+
+# Gated, but by the WIDER rule. `start_training` with `resume_session_id`
+# derives a model from somebody else's checkpoint, and the shipped decision is
+# that a run's collaborators are its dataset's MANAGERS -- so a co-manager may
+# resume, while export, contribute and stop stay owner-or-admin. This set used
+# to be folded into OWNER_OR_ADMIN, which asserted the narrower rule and went
+# red the moment the wider one shipped. The failure was correct: the
+# classification had become untrue, and the repair is to name the second rule
+# rather than to loosen the first.
+OWNER_MANAGER_OR_ADMIN = frozenset({"start_training"})
 
 
 def _public_methods():
@@ -90,12 +107,18 @@ def _public_methods():
     return out
 
 
-def _calls_the_gate(node) -> bool:
+def _calls_the_gate(node, gate: str = MUTATE_GATE) -> bool:
+    """Does *node* call *gate* anywhere in its body?
+
+    Parameterised rather than closed over one constant: an open method must
+    carry NEITHER gate, and that cannot be asked of a function that only knows
+    about one of them.
+    """
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
             fn = sub.func
             name = getattr(fn, "attr", None) or getattr(fn, "id", None)
-            if name == GATE:
+            if name == gate:
                 return True
     return False
 
@@ -121,7 +144,12 @@ def test_the_PARSE_FOUND_SOMETHING_to_begin_with():
         f"only {len(RUN_KEYED)} run-keyed methods found: {sorted(RUN_KEYED)}. "
         "Either the signatures changed or RUN_KEY_PARAMS is wrong."
     )
-    assert GATE in SOURCE, f"{GATE} is not in entry.py at all; the gate was renamed"
+    # BOTH gate names must exist in the source. A renamed gate would otherwise
+    # make every `_calls_the_gate` check answer False and the open-set tests
+    # pass for the wrong reason -- the gate would be gone and the file would
+    # report everything correctly ungated.
+    for gate in (MUTATE_GATE, RESUME_GATE):
+        assert gate in SOURCE, f"{gate} is not in entry.py at all; it was renamed"
 
 
 def test_EVERY_run_keyed_method_is_on_exactly_one_side():
@@ -131,37 +159,71 @@ def test_EVERY_run_keyed_method_is_on_exactly_one_side():
     identifier or requires the owner. Adding one without saying which fails
     here, which is the only moment anybody is reliably forced to decide.
     """
-    declared = OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_UNTIL_RESTRICTED
+    declared = (
+        OPEN_TO_ANY_HOLDER
+        | OWNER_OR_ADMIN
+        | OWNER_MANAGER_OR_ADMIN
+        | UNGATED_UNTIL_RESTRICTED
+    )
     undeclared = set(RUN_KEYED) - declared
     assert undeclared == set(), (
         f"these methods take a run identifier and are on neither side: "
-        f"{sorted(undeclared)}. Decide, then add each to OPEN_TO_ANY_HOLDER or "
-        "OWNER_OR_ADMIN above."
+        f"{sorted(undeclared)}. Decide, then add each to OPEN_TO_ANY_HOLDER, "
+        "OWNER_OR_ADMIN or OWNER_MANAGER_OR_ADMIN above."
     )
-    for a, b in (
-        (OPEN_TO_ANY_HOLDER, OWNER_OR_ADMIN),
-        (OPEN_TO_ANY_HOLDER, UNGATED_UNTIL_RESTRICTED),
-        (OWNER_OR_ADMIN, UNGATED_UNTIL_RESTRICTED),
-    ):
-        assert not (a & b), "a method cannot be in two of the three sets"
+    sets = {
+        "OPEN_TO_ANY_HOLDER": OPEN_TO_ANY_HOLDER,
+        "OWNER_OR_ADMIN": OWNER_OR_ADMIN,
+        "OWNER_MANAGER_OR_ADMIN": OWNER_MANAGER_OR_ADMIN,
+        "UNGATED_UNTIL_RESTRICTED": UNGATED_UNTIL_RESTRICTED,
+    }
+    for a_name, a in sets.items():
+        for b_name, b in sets.items():
+            if a_name < b_name:
+                assert not (a & b), (
+                    f"a method cannot be in both {a_name} and {b_name}: "
+                    f"{sorted(a & b)}"
+                )
 
 
 def test_the_declared_sets_do_not_name_methods_that_no_longer_EXIST():
     """The other direction, so a rename cannot leave a set asserting nothing."""
-    missing = (OPEN_TO_ANY_HOLDER | OWNER_OR_ADMIN | UNGATED_UNTIL_RESTRICTED) - set(
-        METHODS
-    )
+    missing = (
+        OPEN_TO_ANY_HOLDER
+        | OWNER_OR_ADMIN
+        | OWNER_MANAGER_OR_ADMIN
+        | UNGATED_UNTIL_RESTRICTED
+    ) - set(METHODS)
     assert (
         missing == set()
     ), f"these are declared but are not public methods of the app: {sorted(missing)}"
 
 
 @pytest.mark.parametrize("name", sorted(OWNER_OR_ADMIN))
-def test_an_OWNER_OR_ADMIN_method_actually_carries_the_gate(name):
+def test_an_OWNER_OR_ADMIN_method_actually_carries_the_MUTATE_gate(name):
     node, _params = METHODS[name]
-    assert _calls_the_gate(node), (
-        f"{name} is declared owner-or-admin but never calls {GATE}. Either the "
-        "gate was dropped or this method belongs in OPEN_TO_ANY_HOLDER."
+    assert _calls_the_gate(node, MUTATE_GATE), (
+        f"{name} is declared owner-or-admin but never calls {MUTATE_GATE}. "
+        "Either the gate was dropped, or this method belongs in "
+        "OPEN_TO_ANY_HOLDER, or it is now governed by the wider resume rule and "
+        "belongs in OWNER_MANAGER_OR_ADMIN."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(OWNER_MANAGER_OR_ADMIN))
+def test_an_OWNER_MANAGER_OR_ADMIN_method_carries_the_RESUME_gate(name):
+    """The wider rule, asserted as its own thing.
+
+    **This is the delete-control for the resume gate.** Removing the call --
+    the always-allow mutant -- makes this red, and so does swapping it for the
+    narrower `require_caller_may_mutate`, because that would silently take the
+    dataset's managers back out.
+    """
+    node, _params = METHODS[name]
+    assert _calls_the_gate(node, RESUME_GATE), (
+        f"{name} is declared owner-manager-or-admin but never calls "
+        f"{RESUME_GATE}. Deriving a model from somebody else's checkpoint must "
+        "go through the rule that admits the dataset's managers."
     )
 
 
@@ -173,10 +235,13 @@ def test_an_OPEN_method_does_NOT_carry_the_gate(name):
     would otherwise be an easy thing to add while fixing something else.
     """
     node, _params = METHODS[name]
-    assert not _calls_the_gate(node), (
-        f"{name} is open to any holder of the run identifier, but it now calls "
-        f"{GATE}. Several people are meant to be able to try one run's model."
-    )
+    for gate in (MUTATE_GATE, RESUME_GATE):
+        assert not _calls_the_gate(node, gate), (
+            f"{name} is open to any holder of the run identifier, but it now "
+            f"calls {gate}. Several people are meant to be able to try one "
+            "run's model. BOTH gates are checked, because a tightening is a "
+            "tightening whichever rule it uses."
+        )
 
 
 def test_INFERENCE_is_open_which_is_the_decision_that_was_actually_taken():
@@ -190,16 +255,28 @@ def test_INFERENCE_is_open_which_is_the_decision_that_was_actually_taken():
     assert {"infer", "compute_embedding"} <= OPEN_TO_ANY_HOLDER
     for name in ("infer", "compute_embedding"):
         node, _params = METHODS[name]
-        assert not _calls_the_gate(node), f"{name} must not require the owner"
+        for gate in (MUTATE_GATE, RESUME_GATE):
+            assert not _calls_the_gate(
+                node, gate
+            ), f"{name} must not require the owner (it calls {gate})"
 
 
 def test_the_WEIGHT_HANDING_methods_are_the_gated_ones():
     """The complement of the above, stated as the rule rather than per method."""
     assert {"export_model", "contribute"} <= OWNER_OR_ADMIN
+    # start_training is gated too, by the WIDER rule: a dataset's managers may
+    # resume a colleague's checkpoint, while nobody but the owner or an admin
+    # may export or contribute it. Asserting the mutate gate here is what went
+    # red when that decision shipped.
+    assert "start_training" in OWNER_MANAGER_OR_ADMIN
     node, _params = METHODS["start_training"]
-    assert _calls_the_gate(node), (
+    assert _calls_the_gate(node, RESUME_GATE), (
         "resuming derives a new model from somebody else's checkpoint, so "
         "start_training must gate when resume_session_id is given"
+    )
+    assert not _calls_the_gate(node, MUTATE_GATE), (
+        "start_training must NOT use the owner-or-admin gate: that would "
+        "exclude the dataset managers the resume rule admits"
     )
 
 
@@ -300,16 +377,16 @@ def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
             fn = sub.func
-            if (getattr(fn, "attr", None) or getattr(fn, "id", None)) == GATE:
+            if (getattr(fn, "attr", None) or getattr(fn, "id", None)) == RESUME_GATE:
                 args_seen.append(
                     [
                         a.id if isinstance(a, ast.Name) else type(a).__name__
                         for a in sub.args
                     ]
                 )
-    assert args_seen, f"{GATE} is not called in start_training at all"
+    assert args_seen, f"{RESUME_GATE} is not called in start_training at all"
     assert any("resume_session_id" in a for a in args_seen), (
-        f"start_training calls {GATE} with {args_seen}, never with "
+        f"start_training calls {RESUME_GATE} with {args_seen}, never with "
         "resume_session_id. The gate must be applied to the run being resumed."
     )
 
@@ -326,10 +403,12 @@ def test_the_RESUME_gate_is_applied_to_the_RESUMED_run_not_the_new_one():
         for inner in ast.walk(sub):
             if isinstance(inner, ast.Call):
                 fn = inner.func
-                if (getattr(fn, "attr", None) or getattr(fn, "id", None)) == GATE:
+                if (
+                    getattr(fn, "attr", None) or getattr(fn, "id", None)
+                ) == RESUME_GATE:
                     guarded = True
     assert guarded, (
-        f"{GATE} is called in start_training but not under a branch testing "
+        f"{RESUME_GATE} is called in start_training but not under a branch testing "
         "resume_session_id, so it would gate an ordinary new run too."
     )
 
