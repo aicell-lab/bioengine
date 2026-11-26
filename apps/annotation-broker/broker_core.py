@@ -1319,6 +1319,108 @@ def looks_like_tiff(header: bytes) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Direct upload of one local image
+#
+# A browser without the File System Access API cannot mount a folder, and the
+# mounted folder is what registers the data-provider service every other
+# upload route goes through. Such a browser therefore had no way to put a
+# local image into a dataset at all. These rules exist so an image that
+# arrives by presigned PUT is indistinguishable, afterwards, from one that
+# arrived through a mount: the object lands at ``images/<stem><ext>``, and the
+# manifest entry is then produced by the ordinary listing reconciliation
+# rather than written by the upload path.
+#
+# The extension list is the one the frontend already applies when it reads a
+# mounted folder. It is restated HERE, server-side, deliberately: a presigned
+# PUT is handed to the client, so a rule that lives only in the client is a
+# suggestion. Before this there was no server-side format rule, because no
+# server-side upload route existed to need one.
+LOCAL_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+# Same ceiling as a materialisation: both end up as one object in the same
+# bucket, read by the same viewer, and there is no reason for two numbers.
+MAX_LOCAL_IMAGE_BYTES = MAX_MATERIALISE_BYTES
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+
+
+def split_local_image_filename(filename: Any) -> tuple:
+    """``(stem, ext)`` for an uploadable local image, or raise.
+
+    The extension is lowercased so ``Scan.TIF`` and ``scan.tif`` land on one
+    rule, but the STEM keeps its case: it is the manifest key and the name
+    the user sees, and silently changing it would make the uploaded image a
+    different image from the one they picked.
+    """
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("An image filename is required.")
+    # Reject a path rather than taking its basename. A caller that sent
+    # "a/b.png" has a different idea of where this goes than the broker does,
+    # and quietly flattening it would store the image somewhere they do not
+    # expect under a stem they did not choose.
+    if "/" in filename or "\\" in filename:
+        raise ValueError(
+            f"'{filename}' is a path, not a filename; send only the final "
+            f"component."
+        )
+    dot = filename.rfind(".")
+    if dot <= 0:
+        raise ValueError(
+            f"'{filename}' has no extension; one of "
+            f"{', '.join(LOCAL_IMAGE_EXTS)} is required."
+        )
+    stem, ext = filename[:dot], filename[dot:].lower()
+    if ext not in LOCAL_IMAGE_EXTS:
+        raise ValueError(
+            f"'{ext}' is not a supported image format. Supported: "
+            f"{', '.join(LOCAL_IMAGE_EXTS)}."
+        )
+    if not is_valid_image_stem(stem):
+        raise ValueError(
+            f"'{stem}' is not a usable image name. Use letters, digits, "
+            f"dot, dash or underscore only."
+        )
+    return stem, ext
+
+
+def looks_like_png(header: bytes) -> bool:
+    """True if *header* starts like a PNG file."""
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        PNG_SIGNATURE
+    )
+
+
+def looks_like_jpeg(header: bytes) -> bool:
+    """True if *header* starts like a JPEG file."""
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        JPEG_SIGNATURE
+    )
+
+
+def header_matches_ext(ext: str, header: bytes) -> bool:
+    """True if *header*'s signature agrees with the declared *ext*.
+
+    Checked because a presigned PUT reports success from S3, not from this
+    app: "the client says it uploaded a PNG" is not evidence that a PNG is
+    there. An error page or a truncated body stored under a .png name would
+    otherwise be recorded as a readable image.
+
+    An unknown extension is False rather than True. Reaching here with one
+    means ``split_local_image_filename`` has been bypassed, and the safe
+    reading of a rule that did not run is that it did not pass.
+    """
+    ext = (ext or "").lower()
+    if ext == ".png":
+        return looks_like_png(header)
+    if ext in (".jpg", ".jpeg"):
+        return looks_like_jpeg(header)
+    if ext in (".tif", ".tiff"):
+        return looks_like_tiff(header)
+    return False
+
+
 def embedding_path(stem: str, model_type: str) -> str:
     return f"embeddings/{stem}_{model_type}.npz"
 

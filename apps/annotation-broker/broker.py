@@ -1929,6 +1929,153 @@ class AnnotationBroker:
         return {"already": False, "stem": stem, **entries[stem]}
 
     @bioengine.method(context=True)
+    async def upload_local_image(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        filename: str = Field(
+            ...,
+            description=(
+                "Final filename component of the image, with extension: "
+                "'scan01.png'. Not a path."
+            ),
+        ),
+        done: bool = Field(
+            False,
+            description=(
+                "False to start (returns a presigned PUT URL), true to finish "
+                "(verifies the bytes landed and commits them)."
+            ),
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Presigned PUT for ONE local image, in two calls.
+
+        This is the only route by which an image the user holds locally can
+        enter a dataset without mounting a folder. A browser without the File
+        System Access API cannot mount one, and the mount is what registers
+        the data-provider service every other upload route goes through, so
+        without this such a browser could open and annotate somebody else's
+        data but could never contribute its own.
+
+        Call once with ``done=False``:
+
+            {"already": false, "stem", "path", "put_url", "max_bytes"}
+            {"already": true,  "stem", "path"}   # that stem is already an image
+
+        then, after the PUT lands, once with ``done=True``.
+
+        As with ``materialise_image`` the PUT must send the body **bare, with
+        no Content-Type header**: the presigned signature covers that header,
+        so setting it is a 403.
+
+        **The manifest entry is not written here.** The object lands at
+        ``images/<stem><ext>`` and the ordinary listing reconciliation turns
+        it into a ``local`` entry, which is exactly what happens to an image
+        uploaded through a mount. Writing the entry here instead would be a
+        second code path that could drift from that one; leaving it to the
+        reconciliation is what makes the two indistinguishable afterwards,
+        rather than merely similar.
+
+        Requires the manager role: this adds data to somebody's dataset, where
+        materialising only converts an image the dataset already has.
+        """
+        artifact_id = self._canonical_id(artifact_id)
+        self._require_role(context, artifact_id, "manager")
+        stem, ext = core.split_local_image_filename(filename)
+        name = f"{stem}{ext}"
+        path = f"images/{name}"
+
+        if not done:
+            # Past the TTL cache deliberately: "is this stem taken?" is
+            # exactly the question a cached answer gets wrong, and the cost of
+            # getting it wrong is overwriting an image somebody else uploaded.
+            #
+            # The manifest ALONE is not the dataset's image list, and reading
+            # only it was a real defect rather than a hypothetical one. The
+            # list is the manifest reconciled against the `images/` listing,
+            # which is exactly why this route can leave the entry to that
+            # reconciliation -- and therefore exactly why its own earlier
+            # uploads are NOT in the manifest it would have read. Two ways that
+            # bit:
+            #
+            #   * `images/scan01.png` present but not yet in the manifest read
+            #     as free, so the mint handed out a URL for that same path and
+            #     the upload replaced the image, orphaning its annotations;
+            #   * `scan01.tif` present and `scan01.png` uploaded collapsed into
+            #     ONE stem entry, so depending on the extensions either the new
+            #     image never appeared or it silently replaced the one the
+            #     annotations were drawn on.
+            #
+            # Reconciling here asks the same question the readers ask, so the
+            # answer cannot disagree with them.
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
+            listing = await self._list_files_safe(artifact_id, "images")
+            # prune=False: this is a read, and pruning is for the writer that
+            # owns the manifest. A stem whose file has gone is still "taken"
+            # for the purposes of not clobbering it here.
+            entries, _changed = core.merge_image_manifest(
+                core.parse_image_manifest(doc),
+                core.image_names_from_listing(listing),
+            )
+            existing = entries.get(stem)
+            if isinstance(existing, dict):
+                # Refused rather than overwritten, and reported as "already"
+                # rather than as an error, because the caller uploading a
+                # whole folder should be able to skip this one and carry on.
+                # A stem is the manifest key, so re-using one would replace a
+                # different image -- possibly a remote source, possibly one
+                # with annotations already drawn against it.
+                return {
+                    "already": True,
+                    "stem": stem,
+                    "path": existing.get("path"),
+                }
+
+            put_url_holder: Dict[str, str] = {}
+
+            async def _mint():
+                put_url_holder["url"] = await self._am.put_file(
+                    artifact_id, file_path=path
+                )
+
+            await self._ensure_staged(artifact_id, _mint)
+            return {
+                "already": False,
+                "stem": stem,
+                "path": path,
+                "put_url": put_url_holder["url"],
+                "max_bytes": core.MAX_LOCAL_IMAGE_BYTES,
+            }
+
+        # A presigned PUT reports success from S3, not from the artifact
+        # manager, so the client saying it uploaded an image is not evidence
+        # that an image is there. Check the signature against the extension
+        # the caller declared before anything records a readable image at this
+        # path: an error page or a truncated body stored under a .png name
+        # would otherwise become a dataset image that fails to open later,
+        # with nothing pointing back here.
+        head = await self._object_head(artifact_id, path, 8)
+        if not core.header_matches_ext(ext, head):
+            raise ValueError(
+                f"The bytes at '{path}' are not a {ext.lstrip('.').upper()} "
+                f"image. The upload did not land, or something other than the "
+                f"file was stored. Re-run with done=False and PUT again, "
+                f"sending the body with no Content-Type header."
+            )
+        await self._commit_tolerating_pending_uploads(artifact_id)
+        # Drop the cached image list. Every other route that adds or removes an
+        # image refreshes it; without this the next `get_dataset_index` can be
+        # served a list computed up to `MANIFEST_CACHE_TTL_S` ago and leave out
+        # the image that was just uploaded -- so the caller is told the upload
+        # succeeded and then cannot see it. Popped rather than rewritten
+        # because this route does not build `entries`: the reconciliation does,
+        # and the next read will do it with the new file present.
+        self._image_manifest_cache.pop(artifact_id, None)
+        return {"already": False, "stem": stem, "path": path, "committed": True}
+
+    @bioengine.method(context=True)
     async def create_label(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),

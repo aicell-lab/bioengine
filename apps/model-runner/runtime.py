@@ -210,6 +210,68 @@ def _fits_whole(descr, sample):
     return True
 
 
+def _all_space_axes_fixed(descr):
+    # True when every space axis of every input declares an INT extent.
+    #
+    # This is the half of ``_fits_whole`` for which skipping the padding is
+    # right. ``_fits_whole`` also accepts a ``ParameterizedSize`` axis that is
+    # on-grid and no larger than ``DINO_BLOCK_SIZE``, and for such a model the
+    # padding is the SPEC'S behaviour and not a defect: core pads by the
+    # declared halo, the model sees that context, and the halo is cropped back
+    # off the output. Skipping both for a parameterized model would hand back
+    # uncropped border pixels the spec marks invalid, changing results for
+    # models that already worked. A fixed extent cannot absorb a halo at all --
+    # the padded tensor is simply the wrong size and the model refuses -- which
+    # is why the two kinds are treated differently.
+    for ipt in descr.inputs:
+        for axis in getattr(ipt, "axes", None) or []:
+            if getattr(axis, "type", None) != "space":
+                continue
+            if not isinstance(axis.size, int):
+                return False
+    return True
+
+
+def _fixed_extent_too_small(descr, sample):
+    # A sentence naming the remedy when a FIXED-extent model is handed an input
+    # SMALLER than it declares, or None.
+    #
+    # NB comments, not a docstring: this whole function lives inside the
+    # ``_WARM_CHILD_SCRIPT`` raw string, and a triple-quoted docstring would
+    # terminate that string and break runtime.py's own syntax.
+    #
+    # ONLY smaller, and the direction is the whole point. An input LARGER than a
+    # fixed extent tiles correctly: bioimageio.core carves the halo OUT of the
+    # block rather than adding it to it (``block_meta.py``: inner_size =
+    # block_shape - sum(halo)), and ``get_io_sample_block_metas`` uses the
+    # model's own fixed axis sizes as the block shape. So a fixed-256 model gets
+    # 256-px tiles, which is exactly how the Cellpose path has always worked.
+    # So refusing on ANY mismatch would be wrong, not merely conservative: a
+    # fixed model CAN be tiled, and rejecting every Cellpose-SAM image over
+    # 256 px is the cost of pretending otherwise.
+    #
+    # Smaller cannot be rescued the same way: there is no way to tile up to a
+    # size the input does not have, and padding would make the tensor the wrong
+    # size for the model. That case is a refusal.
+    for ipt in descr.inputs:
+        member = sample.members.get(ipt.id)
+        if member is None:
+            continue
+        for axis in getattr(ipt, "axes", None) or []:
+            if getattr(axis, "type", None) != "space" or not isinstance(axis.size, int):
+                continue
+            extent = member.sizes.get(axis.id)
+            if extent is not None and extent < axis.size:
+                return (
+                    "this model requires a fixed {axis}={need} and the input has "
+                    "only {axis}={got}. A larger input is tiled automatically, but "
+                    "a smaller one cannot be: there is nothing to tile up to. "
+                    "Resize or pad the input to at least {need} on {axis}, or pick "
+                    "a model whose {axis} axis is parameterized."
+                ).format(axis=axis.id, need=axis.size, got=extent)
+    return None
+
+
 loaded_description = load_model_description(rdf_path)
 # Cellpose models are tile-based with a halo, so a sample that needs tiling
 # must run blocked: a plain unblocked call pads the whole sample by the halo
@@ -271,11 +333,29 @@ for line in sys.stdin:
         }
         if default_blocksize_parameter:
             result = pipeline.predict_sample_with_blocking(sample, **skips)
-        elif cellpose and _fits_whole(pipeline.model_description, sample):
-            # Nothing to tile, and blocking would still pad the outer boundary
-            # by the declared halo, which the model segments into extra cells
-            # along the border. The skip flags are a matched pair: cropping
-            # fires unconditionally and would remove a halo never added.
+        elif _fits_whole(pipeline.model_description, sample) and (
+            cellpose or _all_space_axes_fixed(pipeline.model_description)
+        ):
+            # Nothing to tile, and the default path would still pad the outer
+            # boundary by the declared halo. The skip flags are a matched pair:
+            # cropping fires unconditionally and would remove a halo never added.
+            #
+            # The guard is deliberately NARROWER than ``_fits_whole`` alone. It
+            # covers exactly the two cases where padding a sample that already
+            # fits does harm:
+            #   - Cellpose segments the padded border into extra cells.
+            #   - A FIXED space extent cannot absorb a halo: the padded tensor is
+            #     the wrong size and the model refuses outright, so a 256x256
+            #     input to a fixed-256 model became 320x320 and was rejected,
+            #     which is what made such models unreachable from every client.
+            # It must NOT cover a parameterized non-Cellpose model, even though
+            # ``_fits_whole`` accepts one that is on-grid and <= DINO_BLOCK_SIZE:
+            # there the padding is the spec's own behaviour, the model gets the
+            # halo as context and the halo is cropped back off. Skipping both for
+            # such a model would return uncropped border pixels the spec marks
+            # invalid and would silently change results for models that already
+            # worked. The 384 cut-off inside ``_fits_whole`` is a Cellpose-DINO
+            # block constant and carries no meaning for those models at all.
             result = pipeline.predict_sample_without_blocking(
                 sample,
                 skip_input_padding=True,
@@ -283,11 +363,30 @@ for line in sys.stdin:
                 **skips,
             )
         elif cellpose:
+            # Untouched on purpose. A Cellpose model that does not fit whole has
+            # always tiled here, and that includes a FIXED-extent one such as
+            # Cellpose-SAM: core carves the halo out of the block, so a fixed-256
+            # model is fed 256-px tiles. Any fixed-extent refusal must therefore
+            # sit AFTER this branch: placed before it, it rejects every
+            # Cellpose-SAM image over 256 px. A too-small input on this path
+            # still fails inside core rather than with an actionable message,
+            # which is pre-existing and out of scope here.
             result = pipeline.predict_sample_with_blocking(
                 sample,
                 ns=_block_size_ns(pipeline.model_description, sample),
                 **skips,
             )
+        elif _all_space_axes_fixed(pipeline.model_description):
+            # A non-Cellpose FIXED-extent model whose input does not fit whole.
+            # The two directions are not symmetric:
+            #   - LARGER tiles correctly, for the same reason the Cellpose path
+            #     above does, so send it to blocking instead of letting the
+            #     default path pad it and have the model refuse the padded size.
+            #   - SMALLER cannot be tiled up to a size the input does not have.
+            too_small = _fixed_extent_too_small(pipeline.model_description, sample)
+            if too_small:
+                raise ValueError(too_small)
+            result = pipeline.predict_sample_with_blocking(sample, **skips)
         else:
             result = pipeline.predict_sample_without_blocking(sample, **skips)
         members = {
