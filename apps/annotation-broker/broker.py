@@ -1482,12 +1482,18 @@ class AnnotationBroker:
         the app's own credential, and an anonymous visitor never touches the
         artifact manager directly.
 
-        **No email addresses.** The response is an allow-list of fields, and
-        every string in it is scrubbed on the way out, not just the owner --
-        a name or a description is free text somebody typed. The owner is
-        shown as an opaque id, since broker metadata holds an id and an email
-        and nothing resembling a display name; where the id is itself an
-        address there is nothing publishable and the field is null.
+        **No email addresses, and NO OWNER AT ALL.** The response is an
+        allow-list of fields and every string in it is scrubbed on the way out,
+        because a name or a description is free text somebody typed.
+
+        The card names nobody. An earlier version published the owner's account
+        id on the grounds that it is not an email address, which was true and
+        still wrong: the requirement is no emails AND no user ids, and the id
+        measured on the live gallery was a named individual's real account --
+        the same one holding the collection's `"*"` grant. No display name
+        exists to offer instead, so the choice was "an account id" or "no
+        owner". See the block comment above `public_dataset_entry` in
+        broker_core for the measurement behind that.
 
         One artifact read per public dataset, for the name, description and
         image count. That is proportional to the number of PUBLIC datasets
