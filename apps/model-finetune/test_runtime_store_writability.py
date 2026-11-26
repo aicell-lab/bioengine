@@ -591,11 +591,20 @@ async def test_a_backend_that_did_not_answer_IS_NOT_ASKED_AGAIN_immediately(
     assert hung.pings == 1, f"the hung runtime was asked again ({hung.pings} pings)"
     assert second < 0.5, f"the second poll still took {second:.2f}s"
 
-    # THE CONTROL on that window: once it lapses the backend IS asked again, so
-    # a runtime that comes up is not written off permanently.
-    inst._store_view_unreachable_at["cellpose"] = (
-        time.time() - entry._STORE_VIEW_UNREACHABLE_FOR_S - 1
+    # THE WINDOW IS BOUNDED, asserted as an absolute number. Deriving the age
+    # below from `_STORE_VIEW_UNREACHABLE_FOR_S` is what made the first version
+    # of this test useless: a mutant widening the window to effectively forever
+    # also moved the age, so the backend was still re-asked and the test passed.
+    # The same mistake as deriving a timing bound from the timeout it bounds.
+    assert entry._STORE_VIEW_UNREACHABLE_FOR_S <= 300.0, (
+        f"the unreachable window is {entry._STORE_VIEW_UNREACHABLE_FOR_S}s. A "
+        "window longer than a few minutes writes a backend off for practical "
+        "purposes, which is what this bound exists to stop."
     )
+    # THE CONTROL on that window: once it lapses the backend IS asked again, so
+    # a runtime that comes up is not written off permanently. One day of age is
+    # past any window the assertion above permits.
+    inst._store_view_unreachable_at["cellpose"] = time.time() - 86400.0
     await inst.get_training_capabilities()
     assert hung.pings == 2, (
         "the backend was never asked again after the window lapsed, so an "
@@ -607,26 +616,57 @@ async def test_a_backend_that_did_not_answer_IS_NOT_ASKED_AGAIN_immediately(
 async def test_a_runtime_that_ANSWERS_is_not_penalised_by_an_earlier_failure(
     monkeypatch,
 ):
-    """The success path clears the mark. Without this a single blip would
-    suppress the store verdict for the whole window, which is the fault this
-    row exists to report."""
-    inst = _caps_entry(monkeypatch, {"writable": True, "detail": "ok"})
-    inst._store_view_unreachable_at["cellpose"] = time.time() - 1  # inside the window
+    """A SUCCESSFUL ask clears the mark, driven through the code.
 
-    # Inside the window it is skipped, so the verdict is "could not ask" --
-    # which the method reports as `writable: None`, the same third answer an
-    # unreachable runtime gets, rather than as a verdict.
+    This is the arm a mutant taught me to write properly. The first version
+    cleared the mark itself and then checked the verdict came back, so it never
+    exercised the clearing at all: deleting the line that clears it left the
+    test green. Here the mark is only ever set and cleared by the method, and
+    the final poll is the one that can only pass if the clearing happened.
+
+    Why it matters: without clearing, one blip suppresses the store verdict for
+    the whole window -- and reporting that verdict is what this row is for.
+    """
+    import entry
+
+    class _FailsOnceRuntime:
+        def __init__(self):
+            self.pings = 0
+            self.store_status_calls = 0
+
+        async def ping(self):
+            self.pings += 1
+            if self.pings == 1:
+                raise RuntimeError("the runtime did not answer")
+            return {"status": "ok", "store": {"writable": True, "detail": "ok"}}
+
+    rt = _FailsOnceRuntime()
+    inst = _caps_entry(monkeypatch, None, runtime=rt)
+
+    # Window of zero while the mark is established and then superseded, so no
+    # test-side poking of the cache is needed to get past it.
+    monkeypatch.setattr(entry, "_STORE_VIEW_UNREACHABLE_FOR_S", 0.0)
+
+    # Poll 1: the ask fails, so the METHOD records the backend as unreachable.
     caps = await inst.get_training_capabilities()
     assert caps["stores"]["cellpose"]["writable"] is None, caps["stores"]
-    assert inst._rt.pings == 0, "the skipped backend was pinged anyway"
+    assert inst._store_view_unreachable_at.get("cellpose") is not None, (
+        "the failure was not recorded, so this test cannot show it being cleared"
+    )
 
-    # ... and once the mark is gone the real verdict comes back and STAYS back.
-    inst._store_view_unreachable_at.clear()
+    # Poll 2: the ask succeeds, so the METHOD must clear the mark.
     caps = await inst.get_training_capabilities()
     assert caps["stores"]["cellpose"]["writable"] is True, caps["stores"]
-    assert "cellpose" not in inst._store_view_unreachable_at
+
+    # Poll 3, with a real window restored. This is the assertion the mutant
+    # that drops the clearing fails: an uncleared mark suppresses this poll and
+    # the verdict reverts to None.
+    monkeypatch.setattr(entry, "_STORE_VIEW_UNREACHABLE_FOR_S", 30.0)
     caps = await inst.get_training_capabilities()
-    assert caps["stores"]["cellpose"]["writable"] is True, caps["stores"]
+    assert caps["stores"]["cellpose"]["writable"] is True, (
+        f"the verdict reverted to {caps['stores']['cellpose']} after a "
+        "successful ask, so the unreachable mark was never cleared"
+    )
 
 
 # ── the gate is REACHED, not merely present in the source ──────────────────
