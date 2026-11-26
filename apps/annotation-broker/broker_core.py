@@ -732,22 +732,47 @@ NGFF_CHANNEL_AXIS_TYPE = "channel"
 def ngff_channel_axis(
     axes: List[str], axis_types: Optional[List[Optional[str]]] = None
 ) -> int:
-    """The channel axis index, by TYPE where declared and by NAME otherwise.
+    """The channel axis index, by TYPE where any type is declared, by NAME only
+    where none is.
 
     ``-1`` when there is no channel axis.
 
-    **The type is the authority and the name is the fallback, in that order,
-    and the order is the whole fix.** OME-NGFF says what an axis IS --
-    ``{"name": "ch", "type": "channel"}`` -- and nothing in the spec requires
-    a channel axis to be called ``c``. Reading only the name meant a store
-    that called it ``ch`` was reported as having NO channel axis, and because
-    the viewer and the trainer both take their channel axis from this one
-    answer, all three agreed on the wrong thing: a user annotated one plane of
-    a multichannel image while the model trained on another.
+    **The type is the authority and the name is the fallback, and the fallback
+    is reached only when the store declares NO types at all.** OME-NGFF says
+    what an axis IS -- ``{"name": "ch", "type": "channel"}`` -- and nothing in
+    the spec requires a channel axis to be called ``c``. Reading only the name
+    meant a store that called it ``ch`` was reported as having no channel axis,
+    and because the viewer and the trainer both take their channel axis from
+    this one answer, all three agreed on the wrong thing.
 
-    Falling back to the name is not laxity. ``axes`` was optional before
-    OME-NGFF v0.4 and the order was a convention, so a pre-v0.4 store declares
-    no types at all and the name is the only evidence there is.
+    What that cost is milder than it sounds and is recorded because the obvious
+    guess is worse: not "annotated one plane, trained on another", but that a
+    multichannel store could not be trained on at all. The region reader finds
+    the unrecognised channel axis is not a role axis, sees several elements and
+    no plane, and refuses.
+
+    **"Where none is declared" is the condition, and "where no axis is typed
+    `channel`" is NOT.** A review measured the difference and it is the whole
+    rule: with the looser condition, ``(["c", "z", "y", "x"], ["space"] * 4)``
+    answered ``0`` -- a store that declares every axis spatial, and therefore
+    says in terms that it has no channels, still had its ``c``-named SPATIAL
+    axis reported as channels. A declared type that is not ``channel`` is an
+    answer, not a gap.
+
+    A store that types only SOME of its axes is treated as type-declaring, so
+    an untyped axis named ``c`` beside a typed ``y`` is not taken as channels.
+    That is the strict reading and it is deliberate: the cost of it is that
+    such a store reports no channel axis, which makes the region reader REFUSE
+    a multichannel crop -- loud and wrong-but-visible. The cost of the lax
+    reading is reporting a spatial axis as channels, which is silent and gives
+    the viewer and the trainer the same wrong answer. Between a refusal and a
+    quiet mis-read of somebody's image, the refusal is the one to prefer.
+
+    Falling back to the name is not laxity either. ``axes`` was optional before
+    OME-NGFF v0.4 and the order was a convention about names, so a pre-v0.4
+    store declares nothing and the name is the only evidence there is. A caller
+    that passes no ``axis_types`` at all is the same case: it has no types, as
+    opposed to a store that has none.
 
     **More than one axis typed ``channel`` is REFUSED rather than guessed.**
     The spec allows at most one, so such a store is malformed, and picking the
@@ -757,10 +782,10 @@ def ngff_channel_axis(
     behaviour, which would have read such a store as having no channel axis
     unless one of them happened to be named ``c``.
     """
-    types = list(axis_types or [])
+    types = list(axis_types or [])[: len(axes)]
     typed = [
         i
-        for i, t in enumerate(types[: len(axes)])
+        for i, t in enumerate(types)
         if isinstance(t, str) and t == NGFF_CHANNEL_AXIS_TYPE
     ]
     if len(typed) > 1:
@@ -773,6 +798,10 @@ def ngff_channel_axis(
         )
     if typed:
         return typed[0]
+    if any(isinstance(t, str) and t for t in types):
+        # The store declares types and none of them is `channel`. That is an
+        # answer: it has no channel axis. The name is not consulted.
+        return -1
     return axes.index("c") if "c" in axes else -1
 
 

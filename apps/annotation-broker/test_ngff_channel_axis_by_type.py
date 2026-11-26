@@ -8,10 +8,21 @@ axis at all.
 
 WHY THAT IS WORSE THAN A WRONG LABEL. The viewer's plane record comes from the
 broker's roles, and model-finetune's remote region reader takes its channel axis
-from those same roles. So all three agreed — on the wrong axis. A user annotated
-one plane of a multichannel image and the model trained on another, with nothing
+from those same roles. So all three agreed — on the wrong axis — with nothing
 anywhere disagreeing, which is the one shape no amount of cross-checking between
 the three can catch.
+
+WHAT THAT AGREEMENT ACTUALLY COST, measured rather than assumed, because the
+natural guess is worse than the truth and this docstring used to state the
+guess. It is NOT "a user annotated one plane while the model trained on
+another". With the channel axis read by name, `region_index` sees the 3-element
+`ch` axis, finds it is not a role axis, and REFUSES: "axis 'ch' has 3 elements
+and no plane was given ... Index 0 is NOT assumed". So a multichannel store
+could not be trained on at all, and the error invited the user to pick ONE
+channel of an image the viewer had drawn as a stack of single-channel planes.
+The silent-divergence case is reachable only through `planes={"ch": 1}`, which
+was accepted precisely because `ch` was not recognised as channels — and is
+refused now that it is. Both are tests below.
 
 THE DISCRIMINATING CASE, and the reason a test on a ``ch`` store alone is not
 enough: a store can have an axis *named* ``c`` that is NOT the channel axis. The
@@ -143,6 +154,51 @@ def test_the_TYPE_DECIDES_even_when_another_axis_is_named_c():
 def test_the_NAME_is_the_fallback_when_no_type_is_declared():
     assert core.ngff_channel_axis(["t", "c", "y", "x"], [None] * 4) == 1
     assert core.ngff_channel_axis(["t", "c", "y", "x"]) == 1
+
+
+def test_a_FULLY_TYPED_store_with_NO_channel_type_has_NO_channel_axis():
+    """THE RULE THE ROW STATES, which the first version of this did not keep:
+    the name is consulted only when the store declares NO types at all.
+
+    A review measured the difference. With the looser condition -- "fall back
+    whenever nothing is typed `channel`" -- a store that declares every axis
+    spatial, and therefore says in terms that it has no channels, still had its
+    `c`-named SPATIAL axis reported as the channel axis. A declared type that
+    is not `channel` is an answer, not a gap, and both behaviours passed all
+    574 tests before this case existed.
+    """
+    assert core.ngff_channel_axis(["c", "z", "y", "x"], ["space"] * 4) == -1
+    assert core.ngff_channel_axis(["c", "y", "x"], ["time", "space", "space"]) == -1
+    roles = core.ngff_axis_roles(["c", "z", "y", "x"], 4, ["space"] * 4)
+    assert roles["c"] is None, roles
+
+
+def test_a_PARTIALLY_TYPED_store_is_treated_as_TYPE_DECLARING():
+    """The case the row does not decide, decided here and pinned rather than
+    left to whichever branch the code happens to take.
+
+    One declared type anywhere makes the store type-declaring, so an UNTYPED
+    axis named `c` beside a typed `y` is not taken as channels. The cost is a
+    store like this reporting no channel axis, which makes the region reader
+    REFUSE a multichannel crop -- loud, and visibly wrong. The lax reading's
+    cost is reporting a spatial axis as channels, which is silent and hands the
+    viewer and the trainer the same wrong answer. The refusal is the one to
+    prefer, and a reviewer who disagrees is disagreeing with a decision rather
+    than finding an accident.
+    """
+    assert core.ngff_channel_axis(["c", "y", "x"], [None, "space", "space"]) == -1
+    # ...and a typed channel axis still wins in a partially typed store.
+    assert (
+        core.ngff_channel_axis(["c", "ch", "y", "x"], [None, "channel", None, None])
+        == 1
+    )
+
+
+def test_an_EMPTY_STRING_type_is_not_a_declaration():
+    """`{"name": "c", "type": ""}` declares nothing, so the name fallback is
+    still reachable. Otherwise a store with one malformed type entry would lose
+    its channel axis to a technicality."""
+    assert core.ngff_channel_axis(["c", "y", "x"], ["", "", ""]) == 0
 
 
 def test_a_channel_axis_with_NO_TYPE_and_a_NON_c_NAME_is_honestly_unknown():
@@ -394,3 +450,42 @@ async def test_THE_PROBE_REPORTS_THE_TYPED_CHANNEL_AXIS():
     assert probe["level0_shape"][probe["axis_roles"]["c"]] == 3
     # And the width/height came off the spatial axes, not off the `c`-named one.
     assert (probe["width"], probe["height"]) == (800, 600)
+
+
+def test_EVERY_call_site_passes_the_types():
+    """A STRUCTURAL pin, and it is here because the behavioural arm cannot be
+    written honestly.
+
+    `broker.py` calls `ngff_axis_roles` twice: once for the level-0 roles the
+    image entry stores, and once inside the coarsest-level search. A review
+    noted the second has no arm, and it is right that it has none: that call's
+    result is consumed by `ngff_level_dims`, which reads width from the X axis,
+    so dropping the types there changes the channel index and nothing
+    downstream looks at it. The call is inert TODAY. Inventing an arm for it
+    would mean asserting an effect that does not exist.
+
+    So the thing to pin is what can actually regress: that both call sites pass
+    the types at all. `axis_types` is optional for compatibility, which makes
+    an omission silent, and a second call site that quietly stops passing them
+    is a half-fix waiting for the day something downstream starts reading the
+    channel index from it.
+    """
+    import ast
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent / "broker.py").read_text()
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "ngff_axis_roles"
+    ]
+    assert len(calls) == 2, f"{len(calls)} call site(s); this test knows about 2"
+    for call in calls:
+        argc = len(call.args) + len(call.keywords)
+        assert argc == 3, (
+            f"ngff_axis_roles at broker.py:{call.lineno} is called with {argc} "
+            "arguments, so it is NOT passing axis_types and the channel axis "
+            "falls back to the name there"
+        )
