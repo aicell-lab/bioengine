@@ -378,7 +378,9 @@ class _PingRuntime:
         return self._store
 
 
-def _caps_entry(monkeypatch, store, *, backends=("cellpose",), fail=False, runtime=None):
+def _caps_entry(
+    monkeypatch, store, *, backends=("cellpose",), fail=False, runtime=None
+):
     cls = _entry_class()
     inst = cls.__new__(cls)
     rt = runtime if runtime is not None else _PingRuntime(store, fail=fail)
@@ -650,9 +652,9 @@ async def test_a_runtime_that_ANSWERS_is_not_penalised_by_an_earlier_failure(
     # Poll 1: the ask fails, so the METHOD records the backend as unreachable.
     caps = await inst.get_training_capabilities()
     assert caps["stores"]["cellpose"]["writable"] is None, caps["stores"]
-    assert inst._store_view_unreachable_at.get("cellpose") is not None, (
-        "the failure was not recorded, so this test cannot show it being cleared"
-    )
+    assert (
+        inst._store_view_unreachable_at.get("cellpose") is not None
+    ), "the failure was not recorded, so this test cannot show it being cleared"
 
     # Poll 2: the ask succeeds, so the METHOD must clear the mark.
     caps = await inst.get_training_capabilities()
