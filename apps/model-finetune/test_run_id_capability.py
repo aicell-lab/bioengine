@@ -545,10 +545,8 @@ def test_the_README_TABLE_ROW_itself_names_the_weights():
 
 # ── the resume rule, pinned to the CODE's own admission legs ───────────────
 
-#: Each leg `caller_may_resume_run` actually calls, and the thing the
-#: documentation must say because of it. The mapping is explicit, but the SET of
-#: keys is checked against the code rather than trusted: a leg the code gained
-#: or lost fails the test instead of being quietly ignored.
+#: Each leg `caller_may_resume_run` actually calls, and the thing every
+#: documented statement of the rule must say because of it.
 #:
 #: WHY THIS SHAPE, and it is the whole point of this file's existence. The
 #: defect it replaces was a wording pin that REQUIRED `"will be restricted"`, so
@@ -559,14 +557,71 @@ def test_the_README_TABLE_ROW_itself_names_the_weights():
 #: narrowing the code fails because the leg set no longer matches.
 RESUME_ADMISSION_LEGS = {
     # the run's owner AND the dataset's owners/managers, in one helper
-    "_owner_or_comanager": (
-        "the run's owner",
-        "owns or manages the dataset",
-    ),
-    "caller_is_workspace_admin": ("`rw`/admin on `bioimage-io`",),
+    "_owner_or_comanager": ("owns or manages the dataset",),
+    "caller_is_workspace_admin": (),  # worded differently per site, see below
 }
 
-RESUME_DOC_ROW_KEY = "`start_training(resume_session_id=…)`"
+#: Names `caller_may_resume_run` calls that are NOT admission legs. Everything
+#: else it calls must be a known leg, so a leg added under ANY new name fails.
+#:
+#: An INTERSECTION was what the first version of this used, and a review showed
+#: it made the claim above false: widening the function to call
+#: `caller_may_see_run` passed, because the intersection filtered the new name
+#: out before the comparison. The test's own failure message said "a leg was
+#: added" while being structurally unable to notice one. An ignore-list is the
+#: only form that is honest here -- an unknown name is an unknown ADMISSION
+#: until somebody says otherwise.
+RESUME_NON_ADMISSION_CALLS = frozenset(
+    {
+        "read_status",  # how it FINDS the run, not who may use it
+        "frozenset",  # the `writable_datasets` default, in the signature
+    }
+)
+
+#: THE DOCUMENTED STATEMENTS OF THE RULE, each with its own locator and its own
+#: required phrases, scoped to ITS OWN LINE.
+#:
+#: A review narrowed two of these three and nothing reddened, because the test
+#: searched the WHOLE README for each phrase and the table row always supplied
+#: it. A whole-file grep says a phrase exists SOMEWHERE; it says nothing about
+#: whether the sentence under test still contains it -- which is exactly the
+#: failure mode this row was filed about, reproduced one level up.
+#:
+#: The admin leg is worded differently per site (`rw`/admin on `bioimage-io` in
+#: the table and the prose, "an administrator" in the authoritative paragraph),
+#: so the phrases are per-statement rather than per-leg.
+#:
+#: THE RESIDUAL, STATED RATHER THAN GUARDED. A FOURTH statement of the rule
+#: written later is not detected: this pins the three locators it knows. I tried
+#: a heuristic -- every README line mentioning resuming alongside a permission
+#: word must be one of the three -- and it is the wrong instrument: it fired on
+#: four legitimate mentions (the export table row's `resume_checkpoint_file`,
+#: the ownerless-run paragraph, the export-handle paragraph) and would need a
+#: growing exclusion list, which is the shape that rots. A new statement of this
+#: rule has to be added here by whoever writes it, and this comment is the
+#: notice that it does.
+RESUME_DOC_STATEMENTS = {
+    "the capability table row": {
+        "locator": "| `start_training(resume_session_id=…)` |",
+        "phrases": (
+            "the run's owner",
+            "owns or manages the dataset",
+            "`rw`/admin on `bioimage-io`",
+        ),
+    },
+    "the prose beside the table": {
+        "locator": "**Resuming is deliberately wider**",
+        "phrases": ("owns or manages the dataset",),
+    },
+    "the authoritative paragraph": {
+        "locator": "**Resuming sits between the two**",
+        "phrases": (
+            "owns or manages the dataset",
+            "its owner",
+            "an administrator",
+        ),
+    },
+}
 
 
 def _called_names(func_node) -> frozenset:
@@ -587,65 +642,56 @@ def _function(source: str, name: str):
     raise AssertionError(f"{name} is not defined in the source read")
 
 
-def _readme() -> str:
-    return (pathlib.Path(__file__).resolve().parent / "README.md").read_text()
-
-
-def _resume_row() -> str:
-    rows = [
-        line
-        for line in _readme().splitlines()
-        if line.startswith("|") and RESUME_DOC_ROW_KEY in line
-    ]
-    assert len(rows) == 1, f"{len(rows)} documented resume row(s); expected exactly 1"
-    return rows[0]
-
-
-def test_THE_CODES_RESUME_LEGS_ARE_THE_ONES_THIS_TEST_KNOWS():
-    """The half that catches a NARROWED CODE. If `caller_may_resume_run` stops
-    consulting a leg -- dropping the dataset-manager admission back to
-    owner-or-admin -- the set no longer matches and this fails, even though
-    every phrase below would still be present in the README.
-    """
-    training_src = (pathlib.Path(__file__).resolve().parent / "training.py").read_text()
-    legs = _called_names(_function(training_src, "caller_may_resume_run"))
-    # Only the names this test is about: the helper's internals are its own
-    # business, and `read_status` is how it finds the run, not who may use it.
-    relevant = legs & (set(RESUME_ADMISSION_LEGS) | {"caller_may_mutate"})
-
-    assert relevant == set(RESUME_ADMISSION_LEGS), (
-        f"caller_may_resume_run's admission legs are {sorted(relevant)}; this "
-        f"test knows {sorted(RESUME_ADMISSION_LEGS)}. A leg was added, removed "
-        "or renamed -- update RESUME_ADMISSION_LEGS and the documentation "
-        "together, which is the pairing this test exists to force."
+def _readme_lines() -> list:
+    return (
+        (pathlib.Path(__file__).resolve().parent / "README.md").read_text().splitlines()
     )
 
 
-def test_THE_DOCUMENTED_RESUME_ROW_NAMES_EVERY_LEG_THE_CODE_HAS():
-    """The half that catches a NARROWED DOCUMENT. This is the surviving mutant a
-    review found: putting the resume row back to "the run's owner, or `rw`/admin
-    on `bioimage-io`" left every other test in this file green.
+def _statement(locator: str) -> str:
+    hits = [line for line in _readme_lines() if locator in line]
+    assert len(hits) == 1, (
+        f"{len(hits)} README line(s) contain {locator!r}; expected exactly 1. "
+        "The statement moved or was duplicated, and either way this test is no "
+        "longer reading what it thinks it is."
+    )
+    return hits[0]
+
+
+def test_THE_CODES_RESUME_LEGS_ARE_THE_ONES_THIS_TEST_KNOWS():
+    """The half that catches a NARROWED or WIDENED code.
+
+    Every name `caller_may_resume_run` calls must be either a known admission
+    leg or on the explicit non-admission list. Dropping a leg fails; adding one
+    under any name fails too.
     """
-    row = _resume_row()
-    missing = [
-        phrase
-        for phrases in RESUME_ADMISSION_LEGS.values()
-        for phrase in phrases
-        if phrase not in row
-    ]
-    assert (
-        not missing
-    ), f"the documented resume row does not name: {missing}\nrow: {row}"
+    training_src = (pathlib.Path(__file__).resolve().parent / "training.py").read_text()
+    called = _called_names(_function(training_src, "caller_may_resume_run"))
+    admissions = called - RESUME_NON_ADMISSION_CALLS
+
+    assert admissions == set(RESUME_ADMISSION_LEGS), (
+        f"caller_may_resume_run's admission calls are {sorted(admissions)}; this "
+        f"test knows {sorted(RESUME_ADMISSION_LEGS)}. A leg was added, removed "
+        "or renamed -- update RESUME_ADMISSION_LEGS and every documented "
+        "statement in RESUME_DOC_STATEMENTS together, which is the pairing this "
+        "test exists to force. If the new name is not an admission leg, say so "
+        "by adding it to RESUME_NON_ADMISSION_CALLS."
+    )
 
 
-def test_THE_PROSE_BESIDE_THE_TABLE_SAYS_RESUME_IS_WIDER():
-    """The table row is terse and a reader skimming the prose must not come away
-    with the narrower rule. Separate from the row above because they drifted
-    independently once."""
-    text = _readme()
-    assert "**Resuming is deliberately wider**" in text
-    for phrase in RESUME_ADMISSION_LEGS["_owner_or_comanager"][1:]:
-        assert phrase in text, phrase
+@pytest.mark.parametrize("which", sorted(RESUME_DOC_STATEMENTS))
+def test_EVERY_DOCUMENTED_STATEMENT_OF_THE_RESUME_RULE_IS_WIDE(which):
+    """The half that catches a NARROWED document, once per statement.
+
+    Parametrised rather than looped so a failure names WHICH of the three
+    places went narrow. A review narrowed the authoritative paragraph and the
+    prose and the previous version of this stayed green, because it grepped the
+    whole file and the table row supplied the phrase.
+    """
+    spec = RESUME_DOC_STATEMENTS[which]
+    line = _statement(spec["locator"])
+    missing = [phrase for phrase in spec["phrases"] if phrase not in line]
+    assert not missing, f"{which} does not name: {missing}\nline: {line}"
 
 
 def test_NO_COMMENT_IN_THIS_FILE_CONTRADICTS_A_SET_DEFINED_BELOW_IT():
