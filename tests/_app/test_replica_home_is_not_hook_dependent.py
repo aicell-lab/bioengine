@@ -42,6 +42,7 @@ it, which is what makes it the right lever, but an app is free to ignore it.
 
 from __future__ import annotations
 
+import errno
 import os
 import time
 from pathlib import Path
@@ -559,3 +560,71 @@ def test_a_FAILING_rmdir_on_a_stale_claim_does_not_spin(monkeypatch, tmp_path):
         replica_init.setup_replica_environment()
     assert len(attempts) <= 10, f"{len(attempts)} rmdir attempts past a 0s deadline"
     assert calls == [], "it synced without a claim"
+
+
+def test_an_ENOENT_rmdir_retries_IMMEDIATELY_without_sleeping(monkeypatch, tmp_path):
+    """ENOENT from the stale-break rmdir genuinely IS "someone else got there first".
+
+    The claim is already gone, so nothing is being waited for and the next `mkdir` can win
+    straight away. Paying the poll interval for it delays a replica that is in fact
+    unblocked — and with a production poll of 2 s and a cold cluster bringing replicas up
+    together, that is a real stall rather than a rounding error.
+
+    Driven by making the poll expensive and asserting it was never paid: a wall-clock
+    bound would pass whether or not the sleep happened, on a machine fast enough.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    claim = app_dir / ".claim"
+    claim.mkdir()
+    old = time.time() - (replica_init._CLAIM_STALE_S + 600)
+    os.utime(claim, (old, old))
+
+    real_rmdir = Path.rmdir
+    slept = []
+
+    def vanished_rmdir(self):
+        if self.name == ".claim":
+            real_rmdir(self)  # actually remove it, then report it was already gone
+            raise OSError(errno.ENOENT, "No such file or directory")
+        return real_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", vanished_rmdir)
+    monkeypatch.setattr(replica_init.time, "sleep", lambda s: slept.append(s))
+    replica_init.setup_replica_environment()
+
+    assert calls == ["1.2.3"], "it did not get the claim"
+    assert slept == [], f"it slept {slept} for a claim that was already gone"
+
+
+def test_the_timeout_message_CARRIES_the_errno_even_when_an_age_is_known(
+    monkeypatch, tmp_path
+):
+    """The errno is the part a reader can act on.
+
+    Reporting only "held by another replica for Ns" sends whoever reads the log looking
+    for a busy peer, when the real answer is EPERM or ENOTEMPTY on the store. Both facts
+    are known at that point, so both are reported.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    claim = app_dir / ".claim"
+    claim.mkdir()
+    old = time.time() - (replica_init._CLAIM_STALE_S + 600)
+    os.utime(claim, (old, old))
+
+    real_rmdir = Path.rmdir
+
+    def refusing(self):
+        if self.name == ".claim":
+            raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        return real_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", refusing)
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.01)
+    with pytest.raises(RuntimeError) as ei:
+        replica_init.setup_replica_environment()
+    msg = str(ei.value)
+    assert "Directory not empty" in msg, f"the errno never reached the message: {msg}"
+    assert "held by another replica" in msg, f"the age was dropped instead: {msg}"

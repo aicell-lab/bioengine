@@ -26,6 +26,7 @@ deployment fails, and ``auto_redeploy`` retries.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import json
 import logging
@@ -263,12 +264,18 @@ def _wait_or_give_up(
     bounded wait became an unbounded spin.
     """
     if time.monotonic() > deadline:
-        held = f"held by another replica for {age:.0f}s" if age is not None else (
-            f"and the claim could not be read ({exc})"
-        )
+        parts = []
+        if age is not None:
+            parts.append(f"held by another replica for {age:.0f}s")
+        if exc is not None:
+            # Always included, even when an age is known: the errno is the part a reader
+            # can act on, and reporting only the age sends them looking for a busy peer
+            # when the real answer is EPERM or ENOTEMPTY on the store.
+            parts.append(f"last error {exc.__class__.__name__}: {exc}")
+        detail = "; ".join(parts) if parts else "no further detail"
         raise RuntimeError(
             f"BioEngine: timed out after {_CLAIM_WAIT_S}s waiting for the source claim "
-            f"at {claim}, {held}. Refusing to materialise source without a claim."
+            f"at {claim} ({detail}). Refusing to materialise source without a claim."
         )
     time.sleep(_CLAIM_POLL_S)
 
@@ -345,15 +352,19 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
             try:
                 claim.rmdir()
             except OSError as exc:
-                # A failed rmdir is NOT "someone else broke it first" — that case
-                # succeeds or raises ENOENT, and both are fine. It is also EPERM in a
-                # sticky directory whose claim another uid created, ENOTEMPTY from an
-                # NFS silly-rename file left inside it, ESTALE, or EACCES — and every
-                # one of those recurs on the next pass. Retrying with no deadline check
-                # and no sleep is the same unbounded spin as the stat path, so this goes
-                # through the same step. Only a rmdir that SUCCEEDED earns an immediate
-                # retry, because then the next mkdir genuinely has a chance.
-                _wait_or_give_up(claim, deadline, age, exc)
+                if exc.errno != errno.ENOENT:
+                    # NOT "someone else broke it first": that case succeeds, or raises
+                    # ENOENT and is handled above. This is EPERM in a sticky directory
+                    # whose claim another uid created, ENOTEMPTY from an NFS
+                    # silly-rename file left inside it, ESTALE, EACCES — each of which
+                    # recurs on the next pass, so retrying with no deadline check and
+                    # no sleep is the same unbounded spin as the stat path. Only a
+                    # rmdir that removed the claim earns an immediate retry, because
+                    # only then does the next mkdir have a chance.
+                    _wait_or_give_up(claim, deadline, age, exc)
+                # ENOENT: the claim is already gone, so nothing is being waited for and
+                # the next mkdir can win straight away. Sleeping here would delay a
+                # replica that is in fact unblocked.
             continue
 
         _wait_or_give_up(claim, deadline, age, None)
