@@ -237,6 +237,79 @@ METRICS_NEEDING_VALIDATION = ("pixel", "instance")
 INSTANCE_IOU_THRESHOLDS = (0.5, 0.75, 0.9)
 
 
+def base_checkpoint_refusal(model_type: Any, status: Any) -> Optional[str]:
+    """The refusal text for a base checkpoint this site cannot produce, or None.
+
+    *status* is what `RuntimeApp.base_checkpoint_status` returns: the PARTS,
+    not a verdict. The decision lives here, away from the network, so the rule
+    can be tested without one and so a reviewer can read the rule in one place.
+
+    FAILS CLOSED ON ITS OWN IGNORANCE, deliberately. A probe that errored, a
+    part with no URL and no cached copy, or a part that is neither cached nor
+    reachable all refuse. The alternative -- admitting the run when the check
+    could not tell -- restores exactly the behaviour this guard exists to
+    remove: the caller waits for a GPU slot and finds out minutes later.
+
+    THE MODEL TYPE IS NAMED IN EVERY REFUSAL. The message a caller sees has to
+    say which model they asked for, because the fix on their side is to pick a
+    different one.
+
+    Returns None when every published part is cached or reachable, so a site
+    that CAN train a type still starts -- the control that stops this becoming
+    a check which refuses everything.
+    """
+    if not isinstance(status, dict):
+        return (
+            f"the base checkpoint for '{model_type}' could not be checked on this "
+            f"site, so the run is refused rather than started: the availability "
+            f"probe returned {type(status).__name__}, not a result"
+        )
+    err = status.get("probe_error")
+    if err:
+        return (
+            f"the base checkpoint for '{model_type}' could not be checked on this "
+            f"site, so the run is refused rather than started ({err})"
+        )
+    parts = status.get("parts")
+    if not isinstance(parts, dict) or not parts:
+        return (
+            f"the base checkpoint for '{model_type}' could not be checked on this "
+            f"site, so the run is refused rather than started: the probe reported "
+            f"no parts for it"
+        )
+    missing = []
+    for name, info in sorted(parts.items()):
+        if not isinstance(info, dict):
+            missing.append(f"{name} (unreadable probe result)")
+            continue
+        if info.get("cached"):
+            continue
+        if info.get("reachable") is True:
+            continue
+        # AN EXPLICIT REASON WINS over anything derived from the fields. A
+        # caller that already knows WHY a part is unobtainable -- a probe that
+        # timed out, say -- must be able to say so, because the derived text
+        # would otherwise describe the wrong thing entirely: a part with no URL
+        # reads as "micro-sam publishes no URL for it", which sends a reader to
+        # the registry when the real trouble is this site's network.
+        reason = info.get("reason")
+        if isinstance(reason, str) and reason:
+            where = reason
+        elif not info.get("url"):
+            where = "not cached here and micro-sam publishes no URL for it"
+        else:
+            where = "not cached here and not reachable from here"
+        missing.append(f"{name} ({where})")
+    if not missing:
+        return None
+    return (
+        f"'{model_type}' cannot be trained at this site: its base checkpoint is "
+        f"unavailable — {', '.join(missing)}. Nothing was started and no GPU was "
+        f"claimed. Pick a model type whose weights this site can reach, or ask an "
+        f"administrator to mirror this one."
+    )
+
+
 def validate_metrics(metrics: Optional[List[str]]) -> List[str]:
     """Normalise a caller's metric selection against ``TRAINING_METRICS``.
 
@@ -357,6 +430,12 @@ def checkpoint_path(
     if session_backend(session_id, status=status) == "cellpose":
         return sdir / "models" / "model"
     return sdir / "checkpoints" / session_id / "best.pt"
+
+
+#: The mode a run's `status.json` must carry. Named here, beside the writer,
+#: because the writer is what a later change would touch -- see the block in
+#: `write_status` for why 0o600 and not merely "nothing world-writable".
+STATUS_FILE_MODE = 0o600
 
 
 def _status_path(session_id: str) -> Path:
@@ -893,6 +972,30 @@ def _write_status_locked(p, session_id: str, fields: Dict[str, Any]) -> Dict[str
     # to be on the same one as the target.
     fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=".status-", suffix=".tmp")
     try:
+        # THE MODE IS 0o600 AND IT IS REQUESTED, NOT INHERITED.
+        #
+        # This file carries the run's `owner`, and the owner field is what every
+        # permission check on the run is matched against, so the mode is part of
+        # the access story rather than a detail of how the write is done. A
+        # world-writable status file puts "whose run is this" within reach of
+        # anything else running in the container.
+        #
+        # `mkstemp` already creates at 0o600, so this looks redundant. It is
+        # not, for two reasons. It makes the restriction a DECISION that
+        # survives a rewrite of this function -- `Path.write_text` creates at
+        # `0o666 & ~umask`, and whoever rewrites this reads this comment, not
+        # the test. And `mkstemp`'s 0o600 is NOT umask-proof: it calls
+        # `os.open(..., 0o600)` and the umask masks that too; it merely looks
+        # immune because an ordinary umask never clears the OWNER bits. An
+        # explicit `fchmod` is what actually makes the mode independent of the
+        # umask the process happens to carry.
+        #
+        # `os.replace` installs this inode over the target, so the mode is
+        # re-established on every write rather than preserved from the first
+        # one. Pinned by apps/model-finetune/test_status_file_mode.py; the
+        # legacy 0o777 files already on the production store are a separate
+        # matter and no code change reaches them.
+        os.fchmod(fd, STATUS_FILE_MODE)
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(cur))
         os.replace(tmp_name, p)
@@ -1284,10 +1387,31 @@ def _owner_or_comanager(
     artifact-manager round trip while this is synchronous and runs once per run.
     """
     owner = status.get("owner")
-    if isinstance(owner, str) and owner:
+    has_owner = isinstance(owner, str) and bool(owner)
+    if has_owner:
         caller = caller_identity(context).get("owner")
         if caller is not None and caller == owner:
             return True
+    # THE CO-MANAGER LEG REQUIRES THE RUN TO HAVE AN OWNER, and without this
+    # line it did not. A run with no recorded owner on a dataset the caller
+    # manages returned True here, which made an OWNERLESS run visible to a
+    # co-manager and resumable by one.
+    #
+    # Two things said that is wrong, and they agreed with each other before the
+    # code did. The lead's ruling on this row: the widening applies to OWNED
+    # runs only -- a co-manager sees the runs of other MANAGERS on that
+    # dataset -- and ownerless runs stay admin-only. And the shipped README
+    # already said "resuming an ownerless run requires `rw`/admin on
+    # `bioimage-io`, because with no recorded owner there is nobody for the
+    # ownership check to match you against".
+    #
+    # So the rule is not "a manager of the dataset may act on anything filed
+    # under it": it is "a manager may act on a COLLEAGUE's run", and an
+    # ownerless run has no colleague. The administrator leg in each caller --
+    # `caller_may_see_run`, `caller_may_resume_run` -- is what reaches those,
+    # and it is deliberately not widened here.
+    if not has_owner:
+        return False
     dataset = status.get(DATASET_FIELD)
     if isinstance(dataset, str) and dataset and dataset in writable_datasets:
         return True

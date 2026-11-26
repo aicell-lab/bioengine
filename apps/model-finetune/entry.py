@@ -100,6 +100,11 @@ CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
 # these are on. Named here because _gpu_placement_report has to count them.
 GPU_BACKENDS = ("microsam", "cellpose")
 
+# How long the whole base-checkpoint preflight may take, across all of a model
+# type's parts. Bounded because it sits on the admission path: a preflight that
+# could hang would be a worse version of the late failure it prevents.
+BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S = 12.0
+
 
 def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     """Whether this cluster can place the GPU runtimes the enabled backends need.
@@ -718,6 +723,97 @@ class EntryApp:
                 f"model_type '{model_type}' is unavailable here."
             )
         return self.cellpose_runtime if backend == "cellpose" else self.runtime
+
+    async def _refuse_unavailable_base_checkpoint(self, model_type: str) -> None:
+        """Raise if this site cannot produce *model_type*'s base checkpoint.
+
+        The probe runs on the RUNTIME replica, because that is where micro-sam
+        and its cache live -- `micro-sam` is in requirements-runtime.txt and is
+        not importable in the worker image, so an entry-side check would be
+        measuring the wrong filesystem.
+
+        AN OLDER REPLICA IS DETECTED THROUGH `ping`, NOT THROUGH `getattr`.
+        `BioEngineRuntimeHandle.__getattr__` returns a bound method for ANY
+        public name, so `getattr(runtime, "base_checkpoint_status", None)` is
+        never None and a capability test written that way is dead code: the
+        call would fail at the far end, land in the except below, and refuse
+        EVERY micro-sam run during a rollout. `ping` exists on every version of
+        this runtime, so a payload whose `capabilities` lack the probe
+        identifies an old replica positively, and that skips -- restoring the
+        previous behaviour rather than stopping all training.
+
+        Once a replica HAS advertised the probe, the decision fails closed: a
+        probe error or an unanswerable part refuses, because admitting the run
+        when the check could not answer restores exactly what this removes.
+        """
+        import training
+
+        runtime = self._runtime_for(model_type)
+        try:
+            pong = await asyncio.wait_for(runtime.ping(), timeout=2.0)
+        except Exception as exc:
+            # The runtime was reachable a moment ago via _check_runtime_available;
+            # if its ping now fails, that is a runtime problem and not this
+            # guard's to convert into a training refusal.
+            self.logger.warning(
+                "could not read runtime capabilities (%s); skipping the "
+                "base-checkpoint preflight for %s",
+                exc,
+                model_type,
+            )
+            return
+        caps = (pong or {}).get("capabilities") or []
+        if "base_checkpoint_status" not in caps:
+            self.logger.warning(
+                "this runtime does not advertise base_checkpoint_status "
+                "(capabilities=%s); skipping the base-checkpoint preflight for "
+                "%s, so a run with unfetchable weights fails late as before",
+                list(caps),
+                model_type,
+            )
+            return
+
+        try:
+            status = await asyncio.wait_for(
+                runtime.base_checkpoint_status(model_type),
+                timeout=BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            # A TIMEOUT IS AN ANSWER, and it is the one that matters here.
+            # The case this guards against is a host that silently drops
+            # packets, and "could not be checked" is wrong for that -- the
+            # weights are not obtainable here within any budget a caller would
+            # wait for. Reported as unreachable parts so the message says so.
+            status = {
+                "model_type": model_type,
+                "parts": {
+                    "the weights": {
+                        "cached": False,
+                        "reachable": False,
+                        "url": None,
+                        # SAID EXPLICITLY, because the derived sentence would be
+                        # a falsehood: a part with no URL renders as "micro-sam
+                        # publishes no URL for it", which points a reader at the
+                        # registry when what actually happened is that this site
+                        # could not get an answer in time.
+                        "reason": (
+                            "the availability check did not answer within "
+                            f"{BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S:g}s, so the "
+                            "weights are treated as unobtainable here"
+                        ),
+                    },
+                },
+                "probe_error": None,
+            }
+        except Exception as exc:
+            status = {
+                "model_type": model_type,
+                "parts": {},
+                "probe_error": "%s: %s" % (type(exc).__name__, exc),
+            }
+        refusal = training.base_checkpoint_refusal(model_type, status)
+        if refusal:
+            raise ValueError(refusal)
 
     async def _check_runtime_available(self, model_type: Optional[str] = None) -> None:
         runtime = self._runtime_for(model_type)
@@ -2180,6 +2276,25 @@ class EntryApp:
             )
 
         await self._check_runtime_available(model_type)
+
+        # REFUSE A BASE CHECKPOINT THIS SITE CANNOT PRODUCE, before the GPU
+        # slot. Same reasoning as the fixed-tile check above: without this the
+        # first thing that consults the network about the base weights runs
+        # INSIDE the training worker, after the run has been admitted and the
+        # single GPU slot taken, so the caller waits for a slot and then gets a
+        # download error minutes later.
+        #
+        # Only when the base model would actually be fetched. A caller
+        # supplying their own starting weights -- init_checkpoint, a resume, or
+        # a pool init, all of which have resolved into `init_checkpoint` by
+        # now -- is not waiting on micro-sam's registry, and refusing them
+        # would be refusing a run this site CAN do.
+        #
+        # micro-sam types only: cellpose does not resolve weights through that
+        # registry, and asking the micro-sam runtime about `cpsam` would be
+        # asking the wrong backend.
+        if not init_checkpoint and model_type not in CELLPOSE_MODEL_TYPES:
+            await self._refuse_unavailable_base_checkpoint(model_type)
 
         gpu = await self._runtime_gpu_memory(model_type)
         required = training.min_training_vram_mb(model_type)
