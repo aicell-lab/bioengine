@@ -555,10 +555,18 @@ def test_the_README_TABLE_ROW_itself_names_the_weights():
 #: that reads the code's legs and requires the documentation to name each one
 #: cannot: narrowing the prose fails because a leg's phrase goes missing, and
 #: narrowing the code fails because the leg set no longer matches.
+#: A leg whose wording differs per documented site, so its requirement lives in
+#: each statement's own `phrases` rather than here. A SENTINEL rather than an
+#: empty tuple, because an empty tuple is indistinguishable from "nobody filled
+#: this in" and the test below has to tell the two apart.
+PER_SITE = "PER_SITE"
+
 RESUME_ADMISSION_LEGS = {
     # the run's owner AND the dataset's owners/managers, in one helper
     "_owner_or_comanager": ("owns or manages the dataset",),
-    "caller_is_workspace_admin": (),  # worded differently per site, see below
+    # `rw`/admin on `bioimage-io` in the table and the prose, "an administrator"
+    # in the authoritative paragraph
+    "caller_is_workspace_admin": PER_SITE,
 }
 
 #: Names `caller_may_resume_run` calls that are NOT admission legs. Everything
@@ -656,6 +664,57 @@ def _statement(locator: str) -> str:
         "longer reading what it thinks it is."
     )
     return hits[0]
+
+
+def test_EVERY_LEG_PHRASE_IS_ACTUALLY_REQUIRED_OF_EVERY_STATEMENT():
+    """THE VALUES OF `RESUME_ADMISSION_LEGS` ARE LOAD-BEARING, and until a review
+    found otherwise they were dead data.
+
+    Only the KEYS were read. Changing `_owner_or_comanager`'s phrase to
+    `"zzz no such phrase"` left all 27 tests green, and so did adding a leg to
+    the code AND to this dict without touching the README — while the comment
+    above the dict claimed it held "the thing every documented statement of the
+    rule must say because of it" and the leg test's failure message claimed the
+    dict and the documentation were pinned "together". Both claims were false.
+
+    That is this row's own defect — text asserting an enforcement that does not
+    exist — reproduced inside the fix for it, which is why it is worth a test
+    rather than a correction to the comment.
+
+    A leg either names phrases every statement must carry, or declares itself
+    `PER_SITE` because its wording differs and its requirement lives in each
+    statement's own `phrases`.
+    """
+    for leg, required in RESUME_ADMISSION_LEGS.items():
+        if required == PER_SITE:
+            continue
+        assert required, (
+            f"{leg} names no phrases and is not marked PER_SITE, so nothing "
+            "about it is enforced"
+        )
+        for phrase in required:
+            missing = [
+                which
+                for which, spec in RESUME_DOC_STATEMENTS.items()
+                if phrase not in spec["phrases"]
+            ]
+            assert not missing, (
+                f"{leg} requires {phrase!r}, but these documented statements do "
+                f"not list it among their phrases: {missing}. Add it there, or "
+                "mark the leg PER_SITE and say in each statement what it needs."
+            )
+
+
+def test_EVERY_PER_SITE_LEG_IS_NAMED_BY_EVERY_STATEMENT():
+    """`PER_SITE` must not become a way to enforce nothing. A leg marked
+    PER_SITE is one whose wording differs between sites, so every statement
+    still has to name SOMETHING for it: the assertion is that no statement's
+    phrase list is empty, which is the only thing checkable without hard-coding
+    each site's wording twice."""
+    per_site = [leg for leg, v in RESUME_ADMISSION_LEGS.items() if v == PER_SITE]
+    assert per_site, "no leg is PER_SITE; this test is vacuous and should go"
+    for which, spec in RESUME_DOC_STATEMENTS.items():
+        assert spec["phrases"], f"{which} requires no phrases at all"
 
 
 def test_THE_CODES_RESUME_LEGS_ARE_THE_ONES_THIS_TEST_KNOWS():
