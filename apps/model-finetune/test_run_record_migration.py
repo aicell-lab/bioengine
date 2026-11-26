@@ -800,3 +800,78 @@ def test_a_CLEAN_run_does_not_claim_records_present_despite_a_commit_error(store
 
     assert plan["complete"] is True, plan
     assert plan["records_present_despite_commit_error"] is False, plan
+
+
+# ── verify_only: what an interrupted caller can ask the app ────────────────
+
+
+def test_VERIFY_ONLY_says_the_records_landed_after_a_successful_apply(store):
+    """The question an interrupted apply leaves behind, answered BY THE APP.
+
+    Without this the only way to learn whether a timed-out apply landed was to list
+    and hash the artifact from OUTSIDE -- which is the work this operation exists to
+    spare a caller, and which had to be done by hand once already.
+    """
+    for i in range(1, 7):
+        store(f"2026-01-01-0000{i:02d}-7777777{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    applied = _run(cls, inst, apply=True, confirm="6")
+    assert applied["complete"] is True, applied
+
+    out = _run(cls, inst, verify_only=True)
+
+    assert out["verify_only"] is True, out
+    assert out["complete"] is True, out
+    assert out["verified"] == 6, out
+    assert out["mismatched"] == [], out
+
+
+def test_VERIFY_ONLY_WRITES_NOTHING(store):
+    """It must be safe to ask. Asserted on the store's own counters, not on intent."""
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-8888888{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    _run(cls, inst, apply=True, confirm="4")
+    edits, commits, files = am.edits, am.commits, dict(am.files)
+
+    out = _run(cls, inst, verify_only=True)
+
+    assert out["applied"] == 0, out
+    assert am.edits == edits, f"verify_only staged ({am.edits} vs {edits})"
+    assert am.commits == commits, f"verify_only committed ({am.commits} vs {commits})"
+    assert am.files == files, "verify_only changed the stored records"
+
+
+def test_VERIFY_ONLY_reports_records_that_are_NOT_there(store):
+    """THE CONTROL on both tests above: it must be able to say no.
+
+    A verify that always answered "landed" would satisfy them and be worse than
+    having none, because the caller would stop looking.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-9999999{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    out = _run(cls, inst, verify_only=True)  # nothing was ever applied
+
+    assert out["complete"] is False, out
+    assert out["verified"] == 0, out
+    assert out["mismatched"] == out["ids"], out
+
+
+def test_VERIFY_ONLY_does_not_require_confirm(store):
+    """There is nothing to confirm, so demanding it would make the mode unusable.
+
+    `confirm` exists to prove the caller read a plan before WRITING. A read needs no
+    such proof, and an interrupted caller may not know the count any more.
+    """
+    store("2026-01-01-000001-aaaa0001")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    out = _run(cls, inst, verify_only=True)  # no confirm passed; must not raise
+
+    assert out["verify_only"] is True, out

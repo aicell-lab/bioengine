@@ -2836,6 +2836,14 @@ class EntryApp:
                 "the caller read the plan rather than passing apply=true."
             ),
         ),
+        verify_only: bool = Field(
+            False,
+            description=(
+                "Check whether the records are ALREADY in the shared record and "
+                "write nothing. For a caller whose apply was interrupted and who "
+                "needs to know whether it landed."
+            ),
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Backfill this worker's on-disk runs into the shared record. ADMIN ONLY.
@@ -2946,134 +2954,149 @@ class EntryApp:
             "dry_run": not apply,
         }
 
-        if not apply:
+        plan["verify_only"] = bool(verify_only)
+        if verify_only:
+            # READ-ONLY third mode, and the reason it exists: after an apply is
+            # interrupted -- a proxy timeout, a lost connection -- the caller has
+            # no way to learn whether the records landed. The only answer
+            # available was to list and hash the artifact from OUTSIDE the app,
+            # which is exactly the work this operation exists to spare them, and
+            # which is what had to be done once already.
+            #
+            # It runs the SAME read-back the apply runs -- against the artifact,
+            # by id set and content hash -- and writes nothing: no stage, no
+            # upload, no commit. `confirm` is not required, because there is
+            # nothing to confirm.
+            written, failed = [], []
+            stage_error = commit_error = None
+        elif not apply:
             return plan
-
-        if confirm != str(len(planned)):
-            raise ValueError(
-                f"confirm must be {len(planned)!r} — the number of records this "
-                f"run plans to write — and it was {confirm!r}. Run without "
-                f"apply first and read the plan."
-            )
-        if unreadable:
-            raise RuntimeError(
-                f"{len(unreadable)} run(s) could not be read, so a complete "
-                f"backfill cannot be claimed; refusing rather than writing a "
-                f"partial history"
-            )
-
-        # ONE STAGE, MANY UPLOADS, ONE COMMIT.
-        #
-        # This loop used to call `_persist_run_record` per record, and that
-        # helper wraps `edit(stage=True)` ... `commit()` around a SINGLE file.
-        # That is right for its other caller -- one run finishing on its own --
-        # and ruinous here: a 313-record backfill became 313 artifact commits,
-        # about 1565 round trips taken serially, which is what exceeded the
-        # proxy's 600 s ceiling and left this operation with no success path at
-        # production scale. The write itself was never the problem; the number
-        # of round trips was.
-        #
-        # `_persist_run_record` is deliberately NOT changed. The bulk shape
-        # belongs here, where the records are known to be independent of one
-        # another and a single stage/commit pair covers all of them.
-        written, failed = [], []
-        am = await self._runs_artifact_manager()
-
-        # NEITHER THE STAGE NOR THE COMMIT MAY RAISE OUT OF HERE.
-        #
-        # The stage flag is ARTIFACT-LEVEL, and another instance's commit clears
-        # it -- `_persist_run_record`'s docstring documents that race, and this
-        # replica's own `_runs_sync_loop` is a concurrent stage/commit writer
-        # every `RUNS_SYNC_INTERVAL_S`. Holding the flag open for the whole
-        # upload phase instead of one file makes that window much wider, so the
-        # race is likelier here, not rarer.
-        #
-        # An exception escaping this method is indistinguishable, from the
-        # caller's side, from "the write did not happen" -- which is the exact
-        # harm this operation exists to avoid, and a regression against the
-        # per-record path, which retried and still returned a report. So both
-        # are retried like that path, their failure is RECORDED, and the
-        # read-back below still runs so the caller gets a report either way.
-        async def _retrying(label: str, op) -> Optional[str]:
-            err = None
-            for attempt in (1, 2):
-                try:
-                    await op()
-                    return None
-                except Exception as exc:
-                    err = "%s: %s" % (type(exc).__name__, str(exc)[:200])
-                    if attempt == 1:
-                        await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
-            logger.warning(
-                f"model-finetune: backfill could not {label} the runs artifact: {err}"
-            )
-            return err
-
-        stage_error = await _retrying(
-            "stage",
-            lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
-        )
-        upload_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
-
-        async def _upload_one(entry: Dict[str, Any]) -> tuple:
-            # The PLANNED record, not a freshly built one, and serialised the
-            # same way the plan hashed it: the plan's sha256 is of exactly
-            # these bytes, so sending anything else would make the plan a
-            # statement about a document that was never uploaded.
-            body = _json.dumps(entry["record"]).encode("utf-8")
-            async with upload_sem:
-                try:
-                    url = await am.put_file(
-                        training.RUNS_ARTIFACT_ID, file_path=entry["path"]
-                    )
-                    resp = await self._http.put(url, content=body)
-                    resp.raise_for_status()
-                except Exception as exc:
-                    logger.warning(
-                        f"model-finetune: backfill could not upload the record "
-                        f"for '{entry['id']}': {type(exc).__name__}: {exc}"
-                    )
-                    return entry["id"], False
-                return entry["id"], True
-
-        if stage_error is None:
-            # gather preserves argument order, so `written`/`failed` are built
-            # deterministically rather than in completion order.
-            for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
-                (written if ok else failed).append(sid)
         else:
-            # The artifact was never staged, so nothing could be uploaded. Every
-            # planned id is a failure, which is the truth and is reported rather
-            # than raised.
-            failed = [p["id"] for p in planned]
+            if confirm != str(len(planned)):
+                raise ValueError(
+                    f"confirm must be {len(planned)!r} — the number of records this "
+                    f"run plans to write — and it was {confirm!r}. Run without "
+                    f"apply first and read the plan."
+                )
+            if unreadable:
+                raise RuntimeError(
+                    f"{len(unreadable)} run(s) could not be read, so a complete "
+                    f"backfill cannot be claimed; refusing rather than writing a "
+                    f"partial history"
+                )
 
-        # Committed ONCE, and after every upload has been awaited. A commit
-        # taken while uploads were still in flight would publish a version the
-        # read-back below then compares against an incomplete set.
-        # WHAT THIS RETRY DOES AND DOES NOT COVER, because a review found the
-        # comment claiming more than the code delivers.
-        #
-        # It retries the commit ALONE, so it covers a TRANSIENT commit failure
-        # and nothing else. It cannot win the race named in
-        # `_persist_run_record`'s docstring: there, another writer's commit
-        # clears the ARTIFACT-LEVEL stage flag, and that flag stays cleared
-        # until somebody re-stages -- so a second `commit` fails for exactly
-        # the reason the first did. The per-record path survives that race
-        # because its retry repeats `edit(stage=True)` as well.
-        #
-        # Re-staging here would mean calling `edit(stage=True)` AFTER the
-        # uploads, and whether that preserves or discards a staged upload is
-        # NOT measured -- every other caller stages before uploading, so
-        # nothing in this file establishes it. Doing it on an assumption could
-        # throw away the whole upload phase to save a commit. So the narrow
-        # retry stays, and the behaviour under a cleared flag is: fail closed,
-        # record `commit_error`, and still report (there is an arm for it).
-        commit_error = None
-        if stage_error is None:
-            commit_error = await _retrying(
-                "commit",
-                lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+            # ONE STAGE, MANY UPLOADS, ONE COMMIT.
+            #
+            # This loop used to call `_persist_run_record` per record, and that
+            # helper wraps `edit(stage=True)` ... `commit()` around a SINGLE file.
+            # That is right for its other caller -- one run finishing on its own --
+            # and ruinous here: a 313-record backfill became 313 artifact commits,
+            # about 1565 round trips taken serially, which is what exceeded the
+            # proxy's 600 s ceiling and left this operation with no success path at
+            # production scale. The write itself was never the problem; the number
+            # of round trips was.
+            #
+            # `_persist_run_record` is deliberately NOT changed. The bulk shape
+            # belongs here, where the records are known to be independent of one
+            # another and a single stage/commit pair covers all of them.
+            written, failed = [], []
+            am = await self._runs_artifact_manager()
+
+            # NEITHER THE STAGE NOR THE COMMIT MAY RAISE OUT OF HERE.
+            #
+            # The stage flag is ARTIFACT-LEVEL, and another instance's commit clears
+            # it -- `_persist_run_record`'s docstring documents that race, and this
+            # replica's own `_runs_sync_loop` is a concurrent stage/commit writer
+            # every `RUNS_SYNC_INTERVAL_S`. Holding the flag open for the whole
+            # upload phase instead of one file makes that window much wider, so the
+            # race is likelier here, not rarer.
+            #
+            # An exception escaping this method is indistinguishable, from the
+            # caller's side, from "the write did not happen" -- which is the exact
+            # harm this operation exists to avoid, and a regression against the
+            # per-record path, which retried and still returned a report. So both
+            # are retried like that path, their failure is RECORDED, and the
+            # read-back below still runs so the caller gets a report either way.
+            async def _retrying(label: str, op) -> Optional[str]:
+                err = None
+                for attempt in (1, 2):
+                    try:
+                        await op()
+                        return None
+                    except Exception as exc:
+                        err = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+                        if attempt == 1:
+                            await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
+                logger.warning(
+                    f"model-finetune: backfill could not {label} the runs artifact: {err}"
+                )
+                return err
+
+            stage_error = await _retrying(
+                "stage",
+                lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
             )
+            upload_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+            async def _upload_one(entry: Dict[str, Any]) -> tuple:
+                # The PLANNED record, not a freshly built one, and serialised the
+                # same way the plan hashed it: the plan's sha256 is of exactly
+                # these bytes, so sending anything else would make the plan a
+                # statement about a document that was never uploaded.
+                body = _json.dumps(entry["record"]).encode("utf-8")
+                async with upload_sem:
+                    try:
+                        url = await am.put_file(
+                            training.RUNS_ARTIFACT_ID, file_path=entry["path"]
+                        )
+                        resp = await self._http.put(url, content=body)
+                        resp.raise_for_status()
+                    except Exception as exc:
+                        logger.warning(
+                            f"model-finetune: backfill could not upload the record "
+                            f"for '{entry['id']}': {type(exc).__name__}: {exc}"
+                        )
+                        return entry["id"], False
+                    return entry["id"], True
+
+            if stage_error is None:
+                # gather preserves argument order, so `written`/`failed` are built
+                # deterministically rather than in completion order.
+                for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
+                    (written if ok else failed).append(sid)
+            else:
+                # The artifact was never staged, so nothing could be uploaded. Every
+                # planned id is a failure, which is the truth and is reported rather
+                # than raised.
+                failed = [p["id"] for p in planned]
+
+            # Committed ONCE, and after every upload has been awaited. A commit
+            # taken while uploads were still in flight would publish a version the
+            # read-back below then compares against an incomplete set.
+            # WHAT THIS RETRY DOES AND DOES NOT COVER, because a review found the
+            # comment claiming more than the code delivers.
+            #
+            # It retries the commit ALONE, so it covers a TRANSIENT commit failure
+            # and nothing else. It cannot win the race named in
+            # `_persist_run_record`'s docstring: there, another writer's commit
+            # clears the ARTIFACT-LEVEL stage flag, and that flag stays cleared
+            # until somebody re-stages -- so a second `commit` fails for exactly
+            # the reason the first did. The per-record path survives that race
+            # because its retry repeats `edit(stage=True)` as well.
+            #
+            # Re-staging here would mean calling `edit(stage=True)` AFTER the
+            # uploads, and whether that preserves or discards a staged upload is
+            # NOT measured -- every other caller stages before uploading, so
+            # nothing in this file establishes it. Doing it on an assumption could
+            # throw away the whole upload phase to save a commit. So the narrow
+            # retry stays, and the behaviour under a cleared flag is: fail closed,
+            # record `commit_error`, and still report (there is an arm for it).
+            commit_error = None
+            if stage_error is None:
+                commit_error = await _retrying(
+                    "commit",
+                    lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+                )
         plan["applied"] = len(written)
         plan["failed"] = sorted(failed)
         plan["stage_error"] = stage_error
@@ -3172,6 +3195,20 @@ class EntryApp:
             and not plan["mismatched"]
             and set(plan["ids"]) <= set(verified)
         )
+        # `complete` MEANS SOMETHING DIFFERENT IN A READ than in a write, and
+        # saying so explicitly is the point. In verify_only nothing was written,
+        # so `set(written) == set(ids)` can never hold and the answer would have
+        # been False however complete the artifact was -- which is a verify that
+        # always says "no". For a read the question is only whether the artifact
+        # holds every planned record, by the same id set and content hash.
+        if verify_only:
+            plan["complete"] = (
+                verify_error is None
+                and not plan["mismatched"]
+                and set(plan["ids"]) <= set(verified)
+            )
+            return plan
+
         plan["complete"] = (
             not failed
             and set(written) == set(plan["ids"])
