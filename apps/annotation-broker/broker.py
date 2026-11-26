@@ -3478,11 +3478,27 @@ class AnnotationBroker:
         image_read_url = await self._am.get_file(
             artifact_id=artifact_id, file_path=image_file_path, stage=True
         )
-        embedding_put_url = await self._am.put_file(artifact_id, file_path=emb_path)
+
+        # THE SAME BUG AS `get_save_urls`, and found by the review of that fix.
+        # `put_file` asserts the artifact is staged, so a bare call here raised
+        # on any artifact that had been committed -- and adding an image commits
+        # one. The first embedding request for a freshly uploaded image
+        # therefore failed with "Artifact must be in staging mode.", on the same
+        # path a user walks straight after adding their image.
+        #
+        # Fixing it here rather than filing it: the two are one defect, and the
+        # browser check that would have caught it comes after a release.
+        minted: Dict[str, str] = {}
+
+        async def _mint_embedding_url():
+            minted["url"] = await self._am.put_file(artifact_id, file_path=emb_path)
+
+        await self._ensure_staged(artifact_id, _mint_embedding_url)
+
         return {
             "exists": False,
             "image_read_url": image_read_url,
-            "embedding_put_url": embedding_put_url,
+            "embedding_put_url": minted["url"],
         }
 
     @bioengine.method(context=True)
@@ -3547,27 +3563,49 @@ class AnnotationBroker:
 
         timestamp = core.new_timestamp()
         paths = core.annotation_save_paths(label, caller["id"], image_stem, timestamp)
-        png_put_url = await self._am.put_file(artifact_id, file_path=paths["png"])
-        geojson_put_url = await self._am.put_file(
-            artifact_id, file_path=paths["geojson"]
-        )
 
         safe_user = core.sanitize_user_id(caller["id"])
         users_path = core.label_users_path(label)
+        minted: Dict[str, str] = {}
 
-        async def _upsert_users():
+        # THE MINT IS INSIDE THE STAGED BLOCK, and that placement is the whole
+        # fix. `put_file` asserts the artifact is staged, so when these two
+        # calls ran ahead of `_ensure_staged` the FIRST of them raised on any
+        # artifact that had been committed -- and the restage-and-retry that
+        # exists to repair exactly that never ran, because it was still three
+        # lines away. Committing is routine (the upload finish commits, and
+        # `_commit_tolerating_pending_uploads` has many call sites), so this was
+        # not a rare state: adding an image to a dataset guaranteed it, and
+        # every subsequent annotation save on that dataset was refused with
+        # "Artifact must be in staging mode." The annotation the user had just
+        # drawn was lost with it.
+        #
+        # Minting and the users upsert go in ONE block rather than two so a
+        # single restage covers both. A retry is safe because it reuses the
+        # SAME paths -- not because an unused mint is free. It is not:
+        # `_commit_tolerating_pending_uploads` exists precisely because
+        # `put_file` registers the file in the staged manifest immediately, and
+        # a staged entry that never arrives in S3 blocks later commits until it
+        # is pruned. An earlier version of this comment said such a URL "has no
+        # effect", which contradicted that docstring; the conclusion held but
+        # the reason was wrong.
+        async def _mint_and_record_user():
+            minted["png"] = await self._am.put_file(artifact_id, file_path=paths["png"])
+            minted["geojson"] = await self._am.put_file(
+                artifact_id, file_path=paths["geojson"]
+            )
             current = await self._read_json_file(artifact_id, users_path, default={})
             updated = core.upsert_label_user(
                 current, safe_user, caller["id"], caller["email"]
             )
             await self._write_json_file(artifact_id, users_path, updated)
 
-        await self._ensure_staged(artifact_id, _upsert_users)
+        await self._ensure_staged(artifact_id, _mint_and_record_user)
 
         return {
             "timestamp": timestamp,
-            "png_put_url": png_put_url,
-            "geojson_put_url": geojson_put_url,
+            "png_put_url": minted["png"],
+            "geojson_put_url": minted["geojson"],
         }
 
     @bioengine.method(context=True)
