@@ -227,8 +227,11 @@ def _capture_preparing_write(monkeypatch):
     # `object.__new__` skips __init__ on purpose -- constructing the real app
     # needs Hypha. Only the attributes this path touches before the write are
     # supplied, and they were read off the source rather than guessed one
-    # exception at a time: _check_runtime_available, _resolve_pool_init and
-    # _runtime_gpu_memory are the three.
+    # exception at a time: _check_runtime_available, _resolve_pool_init,
+    # _runtime_gpu_memory and _refuse_unavailable_base_checkpoint are the four.
+    # The last is the base-checkpoint preflight; it is stubbed rather than
+    # exercised because this harness is about ATTRIBUTION, and letting it run
+    # would make a test of who-owns-the-run depend on a network probe.
     cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
     inst = object.__new__(cls)
     inst._enabled_backends = {"microsam", "cellpose"}
@@ -251,6 +254,7 @@ def _capture_preparing_write(monkeypatch):
         return {"available": False}
 
     inst._runtime_gpu_memory = _async_gpu
+    inst._refuse_unavailable_base_checkpoint = _async_none
     fn = getattr(cls, "start_training")
     return fn, inst, seen
 

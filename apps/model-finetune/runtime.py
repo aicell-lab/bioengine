@@ -51,6 +51,43 @@ ZOO_MODELS = {
 }
 _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
+# How long the base-checkpoint reachability probe may take PER FILE. Short on
+# purpose: this runs on the admission path, and the thing it protects against
+# is a run that claims the GPU and then discovers the weights minutes later.
+# A probe that could itself take minutes would reproduce the problem.
+BASE_CHECKPOINT_PROBE_TIMEOUT_S = 4.0
+
+
+def _url_reachable(url: str, timeout_s: float) -> bool:
+    """Is *url* fetchable from HERE, without downloading it?
+
+    A HEAD, falling back to a 1-byte ranged GET, because some stores answer
+    HEAD with 405 while serving GET perfectly well -- treating that as
+    unreachable would refuse a model the site can actually train.
+
+    Any failure is False rather than an exception: the caller is deciding
+    whether to admit a run, and "I could not tell" has to behave like "not
+    available here" or the refusal it feeds is not a refusal at all.
+    """
+    import urllib.error
+    import urllib.request
+
+    for make in (
+        lambda: urllib.request.Request(url, method="HEAD"),
+        lambda: urllib.request.Request(url, headers={"Range": "bytes=0-0"}),
+    ):
+        try:
+            with urllib.request.urlopen(make(), timeout=timeout_s) as resp:
+                if 200 <= getattr(resp, "status", 0) < 400:
+                    return True
+        except urllib.error.HTTPError as exc:
+            if 200 <= exc.code < 400:
+                return True
+            continue
+        except Exception:
+            continue
+    return False
+
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
 # runtime_env install did not take fails instead of being advertised as ready.
@@ -202,6 +239,63 @@ class RuntimeApp:
 
             self._gpu_mem_cached = training.detect_gpu_memory()
         return self._gpu_mem_cached
+
+    async def base_checkpoint_status(self, model_type: str) -> Dict[str, Any]:
+        """Can THIS SITE produce the base weights training would start from?
+
+        Composition endpoint, not a Hypha method. Answers for the TRAINING base
+        model, which is a different thing from the zoo weights `_zoo_weights`
+        fetches for inference: `train_sam` with no `checkpoint_path` resolves
+        the base model through micro-sam's OWN pooch registry, so probing the
+        zoo cache would answer a question nobody asked and pass while the
+        training fetch still failed.
+
+        A STATEMENT ABOUT THE SITE, not a list of model types. A hard-coded
+        list goes stale the moment a mirror gains a file, and the whole point
+        of this probe is that the same model_type is runnable where a mirror or
+        upstream is reachable and not runnable where neither is.
+
+        Read-only and bounded: it stats the cache and, only for what is not
+        cached, issues a HEAD with a short timeout. It never downloads -- the
+        cost it exists to avoid is exactly the one a download would pay.
+
+        Returns the parts rather than a verdict, so the caller decides and the
+        decision is testable without a network: ``{"model_type", "parts":
+        {name: {"cached": bool, "reachable": bool|None, "url": str|None}},
+        "probe_error": str|None}``. ``reachable`` is None when it was not
+        asked, because the file is already cached.
+        """
+        import os
+
+        out: Dict[str, Any] = {"model_type": model_type, "parts": {}, "probe_error": None}
+        try:
+            from micro_sam.util import models as _models
+
+            registry = _models()
+            root = str(registry.path)
+            urls = dict(getattr(registry, "urls", {}) or {})
+            known = set(getattr(registry, "registry", {}) or {})
+        except Exception as exc:  # the probe itself failed; say so, do not guess
+            out["probe_error"] = "%s: %s" % (type(exc).__name__, exc)
+            return out
+
+        # The encoder is keyed by the model type; the AIS decoder by
+        # "<model_type>_decoder". BOTH are needed, and a site can hold one and
+        # not the other -- so checking only the encoder would admit a run whose
+        # decoder is unobtainable here.
+        for part, key in (("encoder", model_type), ("decoder", f"{model_type}_decoder")):
+            if key not in known:
+                continue  # micro-sam does not publish this part for this type
+            path = os.path.join(root, key)
+            cached = os.path.exists(path)
+            info: Dict[str, Any] = {"cached": cached, "reachable": None,
+                                    "url": urls.get(key)}
+            if not cached and info["url"]:
+                info["reachable"] = await asyncio.to_thread(
+                    _url_reachable, info["url"], BASE_CHECKPOINT_PROBE_TIMEOUT_S
+                )
+            out["parts"][part] = info
+        return out
 
     def _device(self) -> str:
         """Pick the compute device internally (device is not a public API param)."""
