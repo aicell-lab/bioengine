@@ -86,6 +86,11 @@ class FakeAM:
         #: the backfill used to stage and commit once PER RECORD.
         self.edits = 0
         self.commits = 0
+        #: Make the first N stage/commit calls RAISE. The artifact-level stage
+        #: flag is cleared by any other instance's commit, so both of these
+        #: fail in production; the backfill must report rather than raise.
+        self.fail_edits = 0
+        self.fail_commits = 0
         #: Uploads in flight, and the high-water mark, so a test can assert
         #: the concurrency BOUND rather than hoping.
         self.in_flight = 0
@@ -96,12 +101,18 @@ class FakeAM:
 
     async def edit(self, artifact_id=None, stage=None, **kw):
         self.edits += 1
+        if self.fail_edits > 0:
+            self.fail_edits -= 1
+            raise RuntimeError("artifact is not in staging mode")
 
     async def put_file(self, artifact_id=None, file_path=None, **kw):
         return f"https://upload.example/{file_path}"
 
     async def commit(self, artifact_id=None, **kw):
         self.commits += 1
+        if self.fail_commits > 0:
+            self.fail_commits -= 1
+            raise RuntimeError("artifact is not in staging mode")
 
     async def list_files(
         self, artifact_id=None, dir_path=None, limit=1000, offset=0, **kw
@@ -613,3 +624,105 @@ def test_a_concurrency_of_ONE_still_completes(store):
     assert plan["complete"] is True, plan
     assert am.max_in_flight == 1, am.max_in_flight
     assert am.commits == 1, am.commits
+
+
+# ── neither the stage nor the commit may raise out of the apply ────────────
+
+
+def test_a_commit_that_loses_the_race_ONCE_is_retried_and_still_completes(store):
+    """The stage flag is artifact-level and any other instance's commit clears it.
+
+    `_persist_run_record` retried for exactly this reason. The bulk path holds the
+    flag open for the WHOLE upload phase instead of one file, and this replica's own
+    sync loop is a concurrent stage/commit writer, so the window is WIDER here, not
+    narrower. One lost race must not cost the run.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-ddddddd{i}")
+    am = FakeAM()
+    am.fail_commits = 1
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert plan["commit_error"] is None, plan["commit_error"]
+    assert am.commits == 2, f"the commit was not retried (commits={am.commits})"
+
+
+def test_a_commit_that_KEEPS_failing_RETURNS_A_REPORT_rather_than_raising(store):
+    """THE regression this answers. An exception here is the row's own harm.
+
+    From the caller's side a raised error is indistinguishable from "the write did
+    not happen" -- which is exactly what this operation exists to let them tell
+    apart. The per-record path retried and still returned a report; the first
+    version of the bulk path let the error escape with no report at all.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-eeeeeee{i}")
+    am = FakeAM()
+    am.fail_commits = 99
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")  # must NOT raise
+
+    assert plan["complete"] is False, plan
+    assert plan["commit_error"], "the commit failure was not recorded"
+    assert "staging" in plan["commit_error"], plan["commit_error"]
+    # the read-back still ran, so the caller gets a verdict and not a silence
+    assert "verified" in plan and "mismatched" in plan, plan
+
+
+def test_a_STAGE_that_keeps_failing_also_returns_a_report(store):
+    """Same property one step earlier: nothing was uploaded, and that is reported."""
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-fffffff{i}")
+    am = FakeAM()
+    am.fail_edits = 99
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")  # must NOT raise
+
+    assert plan["complete"] is False, plan
+    assert plan["stage_error"], "the stage failure was not recorded"
+    assert plan["applied"] == 0, plan
+    assert plan["failed"] == plan["ids"], plan
+
+
+def test_the_backfill_RECORDS_WHAT_IT_PUSHED_so_the_sync_loop_does_not_redo_it(store):
+    """Otherwise the 313-commit cost is moved into the background loop, not removed.
+
+    The per-record path recorded every push in `_runs_pushed`. Without it the next
+    `_sync_run_records` sees every migrated record as unpushed and re-pushes all of
+    them, one commit each -- the exact cost this change exists to remove.
+    """
+    ids = []
+    for i in range(1, 5):
+        sid = f"2026-01-01-0000{i:02d}-aaabbbb{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert sorted(inst._runs_pushed) == sorted(ids), sorted(inst._runs_pushed)
+
+
+def test_nothing_is_recorded_as_pushed_when_the_commit_FAILED(store):
+    """THE CONTROL on the test above: the bookkeeping must not lie.
+
+    Recording a push whose commit never landed would make the sync loop skip the
+    very records that are missing from the artifact.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-cccdddd{i}")
+    am = FakeAM()
+    am.fail_commits = 99
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is False, plan
+    assert inst._runs_pushed == {}, inst._runs_pushed

@@ -2978,7 +2978,41 @@ class EntryApp:
         # another and a single stage/commit pair covers all of them.
         written, failed = [], []
         am = await self._runs_artifact_manager()
-        await am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True)
+
+        # NEITHER THE STAGE NOR THE COMMIT MAY RAISE OUT OF HERE.
+        #
+        # The stage flag is ARTIFACT-LEVEL, and another instance's commit clears
+        # it -- `_persist_run_record`'s docstring documents that race, and this
+        # replica's own `_runs_sync_loop` is a concurrent stage/commit writer
+        # every `RUNS_SYNC_INTERVAL_S`. Holding the flag open for the whole
+        # upload phase instead of one file makes that window much wider, so the
+        # race is likelier here, not rarer.
+        #
+        # An exception escaping this method is indistinguishable, from the
+        # caller's side, from "the write did not happen" -- which is the exact
+        # harm this operation exists to avoid, and a regression against the
+        # per-record path, which retried and still returned a report. So both
+        # are retried like that path, their failure is RECORDED, and the
+        # read-back below still runs so the caller gets a report either way.
+        async def _retrying(label: str, op) -> Optional[str]:
+            err = None
+            for attempt in (1, 2):
+                try:
+                    await op()
+                    return None
+                except Exception as exc:
+                    err = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+                    if attempt == 1:
+                        await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
+            logger.warning(
+                f"model-finetune: backfill could not {label} the runs artifact: {err}"
+            )
+            return err
+
+        stage_error = await _retrying(
+            "stage",
+            lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
+        )
         upload_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
 
         async def _upload_one(entry: Dict[str, Any]) -> tuple:
@@ -3002,17 +3036,47 @@ class EntryApp:
                     return entry["id"], False
                 return entry["id"], True
 
-        # gather preserves argument order, so `written`/`failed` are built
-        # deterministically rather than in completion order.
-        for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
-            (written if ok else failed).append(sid)
+        if stage_error is None:
+            # gather preserves argument order, so `written`/`failed` are built
+            # deterministically rather than in completion order.
+            for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
+                (written if ok else failed).append(sid)
+        else:
+            # The artifact was never staged, so nothing could be uploaded. Every
+            # planned id is a failure, which is the truth and is reported rather
+            # than raised.
+            failed = [p["id"] for p in planned]
 
         # Committed ONCE, and after every upload has been awaited. A commit
         # taken while uploads were still in flight would publish a version the
         # read-back below then compares against an incomplete set.
-        await am.commit(artifact_id=training.RUNS_ARTIFACT_ID)
+        commit_error = None
+        if stage_error is None:
+            commit_error = await _retrying(
+                "commit",
+                lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+            )
         plan["applied"] = len(written)
         plan["failed"] = sorted(failed)
+        plan["stage_error"] = stage_error
+        plan["commit_error"] = commit_error
+
+        if stage_error is None and commit_error is None and written:
+            # The per-record path recorded every push here, and the bulk path
+            # must too: without it the next `_sync_run_records` sees every
+            # migrated record as unpushed and re-pushes all of them, ONE COMMIT
+            # EACH -- which is the cost this change removed, moved into the
+            # background loop instead of eliminated.
+            #
+            # REPLACED, not mutated, for the same reason the per-record path
+            # replaces it: `_runs_pushed` has a class-level fallback, and
+            # writing into that would share one replica's bookkeeping with
+            # every other.
+            pushed = dict(self._runs_pushed)
+            by_id = {p["id"]: p["record"] for p in planned}
+            for sid in written:
+                pushed[sid] = _json.dumps(by_id[sid], sort_keys=True)
+            self._runs_pushed = pushed
 
         # THE ARTIFACT IS READ BACK. `written` only means "our commit returned"
         # -- it is this replica's account of its own actions, and a backfill
@@ -3081,6 +3145,13 @@ class EntryApp:
             and set(written) == set(plan["ids"])
             and verify_error is None
             and not plan["mismatched"]
+            # A stage or commit that failed after its retry means the artifact
+            # may not hold what was uploaded, so the run is not complete even if
+            # every PUT returned. Reported as False rather than raised: the
+            # caller needs a verdict, and an exception here is indistinguishable
+            # from "the write never happened".
+            and stage_error is None
+            and commit_error is None
         )
         return plan
 
