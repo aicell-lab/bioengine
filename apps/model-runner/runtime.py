@@ -199,12 +199,13 @@ def _axes_are_objects(descr):
         if getattr(ipt, "id", None) is None:
             return False
         axes = getattr(ipt, "axes", None)
-        # The ``str`` arm is a FAST, EXPLICIT rejection of the 0.4 shape, and it is
-        # deliberately redundant: delete it and the loop below still rejects, because
-        # iterating a string yields CHARACTERS and a character has no ``.type``. No
-        # input can distinguish the two arms, so no test can pin this one alone --
-        # it earns its place by naming the 0.4 shape at the point of decision, not by
-        # changing any answer.
+        # The ``str`` arm is LOAD-BEARING: do not delete it as redundant.
+        # For a NON-empty string such as "bcyx" the loop below would also reject,
+        # because iterating a string yields characters and a character has no
+        # ``.type``. For the EMPTY string it would not: there are no characters, the
+        # loop body never runs, and the guard would answer True -- reporting that a
+        # 0.4 input carries 0.5 axis objects. Vacuous truth, in a predicate written to
+        # stop exactly that. ``axes=""`` is the input that separates the two arms.
         if axes is None or isinstance(axes, str):
             return False
         for axis in axes:

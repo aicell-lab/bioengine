@@ -906,13 +906,13 @@ class _IdAndListButAxisHasNoType:
 
 
 def test_the_guard_rejects_string_axes_even_when_id_is_present() -> None:
-    """A string-axes input is rejected even when ``id`` is present.
+    """A non-empty string-axes input is rejected even when ``id`` is present.
 
     This pins the OUTCOME, not one arm. Measured by mutation: deleting the
-    ``isinstance(axes, str)`` arm leaves this GREEN, because iterating a string yields characters
-    and the ``hasattr(axis, "type")`` arm below rejects them. The two arms overlap by construction
-    and no input can separate them, so claiming this test isolates the string check would be
-    false. What it does pin is that ``id`` alone is not enough to be accepted.
+    ``isinstance(axes, str)`` arm leaves THIS case green, because iterating "bcyx" yields
+    characters and the ``hasattr(axis, "type")`` arm below rejects them. The arm that this case
+    cannot pin is pinned by ``test_the_guard_rejects_EMPTY_string_axes`` below, which is the input
+    that does separate them.
     """
     guard = _load_fn("_axes_are_objects")
     assert guard(_Descr([_IdButStringAxes()])) is False
@@ -928,3 +928,25 @@ def test_the_guard_accepts_a_real_05_shaped_descriptor() -> None:
     """The positive arm: a guard that rejected everything would pass all four tests above."""
     guard = _load_fn("_axes_are_objects")
     assert guard(_fixed_256_model()) is True
+
+
+class _IdButEmptyStringAxes:
+    """Has ``id``, and ``axes`` is the EMPTY string. The one input that separates the guard's arms."""
+
+    def __init__(self) -> None:
+        self.id = "input0"
+        self.axes = ""
+
+
+def test_the_guard_rejects_EMPTY_string_axes() -> None:
+    """The empty string is why the ``isinstance(axes, str)`` arm is load-bearing.
+
+    For "bcyx" the ``hasattr(axis, "type")`` loop below would also reject. For "" it would not:
+    there are no characters, the loop body never runs, and without the str arm the guard answers
+    True — reporting that a 0.4 input carries 0.5 axis objects. A vacuous truth, inside a predicate
+    written to stop exactly that class of mistake.
+
+    Goes RED with the str arm deleted; "bcyx" alone does not.
+    """
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_Descr([_IdButEmptyStringAxes()])) is False
