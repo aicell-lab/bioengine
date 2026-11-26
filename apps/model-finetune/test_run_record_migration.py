@@ -18,6 +18,7 @@ set.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import pytest
@@ -194,6 +195,12 @@ class FakeHTTP:
 
     def __init__(self, am):
         self.am = am
+        # sid -> how many GETs of that record succeed before the rest raise a
+        # TRANSPORT error. Distinct from a 404: the record is there and the read
+        # failed, which is an absence of knowledge about the record rather than
+        # knowledge that the record is absent.
+        self.get_raises_after = {}
+        self.get_counts = {}
 
     @staticmethod
     def _path(url):
@@ -214,6 +221,14 @@ class FakeHTTP:
 
     async def get(self, url, **kw):
         path = self._path(url)
+        sid = path.rsplit("/", 1)[-1][: -len(".json")]
+        n = self.get_counts.get(sid, 0) + 1
+        self.get_counts[sid] = n
+        limit = self.get_raises_after.get(sid)
+        if limit is not None and n > limit:
+            # A transport failure, NOT an HTTP status. The record may well be
+            # present and correct; this read simply did not happen.
+            raise ConnectionError(f"connection reset reading {sid}")
         if path not in self.am.files:
             return self._Resp(404)
         return self._Resp(200, self.am.files[path])
@@ -1097,3 +1112,83 @@ def test_the_pushed_bookkeeping_follows_the_ARTIFACT_not_the_PUT_verdicts(store)
     assert plan["repaired"] == [ids[3]], plan["repaired"]
     # every id the ARTIFACT holds is recorded, including the raised one and the repaired one
     assert sorted(inst._runs_pushed) == sorted(ids), sorted(inst._runs_pushed)
+
+
+def test_a_RECORD_THE_REPAIR_LANDED_is_not_blamed_when_its_RE_READ_fails(store):
+    """A read that could not run is not evidence that the record is absent.
+
+    The repair re-reads the records it just re-uploaded. If that read fails for
+    any reason OTHER than the record being absent -- a dropped connection, a
+    timeout, a 5xx -- then nothing was learnt about the record, and reporting it
+    in `mismatched`/`failed` blames the record for the read. A caller acting on
+    that re-uploads a record the artifact already holds, correctly.
+
+    This is the record-blamed-for-the-read pattern the FIRST read-back's own
+    comment forbids, reproduced inside the repair's reporting.
+    """
+    ids = []
+    for i in range(1, 4):
+        sid = f"2026-01-01-0000{i:02d}-f33d000{i}"
+        store(sid)
+        ids.append(sid)
+    victim = ids[0]
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(victim,))
+    # The FIRST read-back's GET of the victim succeeds (and sees the tampered
+    # bytes, so the record is condemned and the repair re-uploads it). The
+    # repair's RE-READ is the second GET of that id, and it fails at transport.
+    inst._http.get_raises_after[victim] = 1
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    # The artifact DOES hold the record, correctly -- the repair landed it.
+    # Asserted against the PLAN's own hash rather than against a guess at the
+    # record's shape: that is the same comparison the read-back makes, so it
+    # says exactly "the bytes the artifact serves are the bytes planned".
+    stored_text = am.files[f"{training.run_record_dir('an-app')}/{victim}.json"]
+    assert (
+        hashlib.sha256(stored_text.encode("utf-8")).hexdigest()
+        == plan["hashes"][victim]
+    ), "the repair did not land the correct record, so this arm tests nothing"
+    assert json.loads(stored_text).get("tampered") is None, stored_text
+
+    # So the record must NOT be blamed.
+    assert victim not in plan["mismatched"], plan["mismatched"]
+    assert victim not in plan["failed"], plan["failed"]
+    # It is reported under its own key: the state could not be established.
+    assert plan["reread_errors"] == [victim], plan.get("reread_errors")
+    # And it is not claimed as repaired either, because nothing confirmed it.
+    assert victim not in plan["repaired"], plan["repaired"]
+    # An unknown is never a pass.
+    assert plan["complete"] is False, plan
+    # `repair_error` stays reserved for a failed stage/commit: the stage and the
+    # commit both succeeded here, and one record's read is not the pass failing.
+    assert plan.get("repair_error") is None, plan.get("repair_error")
+
+
+def test_a_GENUINELY_ABSENT_record_is_STILL_reported_missing(store):
+    """The control. The cheap way to pass the test above is to swallow every
+    fetch error, which would also hide a record that is really not there.
+
+    A record whose upload fails permanently is absent from the artifact after
+    the repair, and must still be reported in `mismatched`/`failed` -- not under
+    the could-not-read key.
+    """
+    ids = []
+    for i in range(1, 4):
+        sid = f"2026-01-01-0000{i:02d}-f44d000{i}"
+        store(sid)
+        ids.append(sid)
+    gone = ids[1]
+    am = FakeAM()
+    cls, inst = _app(am=am, fail=(gone,))
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    assert (
+        f"{training.run_record_dir('an-app')}/{gone}.json" not in am.files
+    ), "the record should be absent"
+    assert plan["mismatched"] == [gone], plan["mismatched"]
+    assert plan["failed"] == [gone], plan["failed"]
+    assert plan.get("reread_errors") == [], plan.get("reread_errors")
+    assert plan["complete"] is False, plan
