@@ -88,8 +88,12 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
         return state["listing"]
 
     class _Am:
-        async def put_file(self, _a, file_path=None):
+        async def put_file(self, _a, file_path=None, expires_in=None):
+            # Accepted AND recorded: the route passes a short expiry on purpose,
+            # and a double that did not take the argument would turn that call
+            # into a TypeError rather than exercising it.
             state["minted"].append(file_path)
+            state.setdefault("expires_in", []).append(expires_in)
             return f"https://signed.invalid/{file_path}"
 
         async def remove_file(self, artifact_id=None, file_path=None):

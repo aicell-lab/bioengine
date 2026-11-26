@@ -360,9 +360,20 @@ class AnnotationBroker:
 
         doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
         listing = await self._list_files_safe(artifact_id, "images")
+        # Uploads still in flight are withheld from the LISTING side. An object
+        # that has only been PUT would otherwise be a dataset image whether or
+        # not the finishing call was ever made, which is how a caller that
+        # simply never finishes gets past the size ceiling entirely -- measured
+        # in review: 10,000 bytes against a 64-byte ceiling, no finish, listed
+        # as a `local` image. The withholding is what makes the finish a gate.
+        #
+        # The stored manifest is NOT filtered: a successful finish removes its
+        # marker before committing, so a completed image is never withheld, and
+        # filtering a stored entry could hide an image that is genuinely there.
+        withheld = await self._open_upload_paths(artifact_id)
         entries, _ = core.merge_image_manifest(
             core.parse_image_manifest(doc),
-            core.image_names_from_listing(listing),
+            core.image_names_from_listing(listing, withheld),
             dims=dims,
         )
         self._image_manifest_cache[artifact_id] = (time.time(), entries)
@@ -2005,9 +2016,7 @@ class AnnotationBroker:
         if marker_path is None:
             return False
         try:
-            await self._am.remove_file(
-                artifact_id=artifact_id, file_path=marker_path
-            )
+            await self._am.remove_file(artifact_id=artifact_id, file_path=marker_path)
             return True
         except Exception as exc:
             logger.warning(
@@ -2017,21 +2026,25 @@ class AnnotationBroker:
             )
             return False
 
-    async def _sweep_expired_markers(self, artifact_id: str) -> int:
-        """Housekeeping: drop markers whose recorded expiry has passed.
+    async def _marker_pairs(self, artifact_id: str) -> list:
+        """``(marker_path, document)`` for the markers in ``.uploads/``.
 
-        Not a safety mechanism and deliberately best-effort. The authorisation
-        check treats an expired marker as no marker whether or not this ever
-        ran, so a sweep that fails costs disk and nothing else -- which is why
-        every failure here is logged rather than raised into a caller that was
-        in the middle of minting a perfectly good upload.
+        One bounded listing plus one read per marker, shared by the sweep and by
+        the image-list reconciliation so the two cannot form different pictures
+        of which uploads are open. Bounded by the same limit as the sweep: a
+        caller cannot make either path unbounded by minting repeatedly.
+
+        The documents are read rather than the paths being decoded from the
+        filenames. A marker's filename is its MINT ID and nothing else, which is
+        what keeps every marker read inside ``.uploads/`` -- encoding the object
+        path into the name as well would make the filename a second, parallel
+        record of it, and the one thing that must not be guessable from a
+        filename is which object a marker authorises touching.
         """
         try:
-            entries = await self._list_files_safe(
-                artifact_id, core.UPLOAD_MARKER_DIR
-            )
+            entries = await self._list_files_safe(artifact_id, core.UPLOAD_MARKER_DIR)
         except Exception:
-            return 0
+            return []
         pairs = []
         for entry in entries[: core.UPLOAD_MARKER_SWEEP_LIMIT]:
             name = entry.get("name") if isinstance(entry, dict) else None
@@ -2043,10 +2056,69 @@ class AnnotationBroker:
             except Exception:
                 doc = None
             pairs.append((marker_path, doc))
+        return pairs
+
+    async def _open_upload_paths(self, artifact_id: str) -> frozenset:
+        """Object paths belonging to uploads that are minted but not finished.
+
+        Withheld from the image list, because an object that has merely been PUT
+        would otherwise be a dataset image with no size check ever applied: the
+        caller that never finishes is not refused by the finishing check.
+
+        **Fails OPEN, and that is a choice with a reason.** If the markers
+        cannot be listed or read, this returns an empty set and nothing is
+        withheld. The alternative, withholding everything on an error, would
+        make an unreadable ``.uploads/`` present the dataset as having no images
+        at all -- a total outage of the image list, triggered by housekeeping
+        state, on every read path including the annotate page's first call. The
+        exposure this leaves is bounded and covered twice over: the object is
+        deleted outright once its marker expires, and the finishing call still
+        refuses the oversized file. So the failure mode here is "an abandoned
+        upload is listed for up to the TTL", not "the ceiling is unenforced".
+        """
+        pairs = await self._marker_pairs(artifact_id)
+        if not pairs:
+            return frozenset()
+        return core.open_upload_paths(pairs, now=time.time())
+
+    async def _sweep_expired_markers(self, artifact_id: str) -> int:
+        """Housekeeping: drop expired markers AND the objects they vouch for.
+
+        Dropping the marker is tidiness. Dropping the OBJECT is enforcement, and
+        it is the half that matters: a caller that mints, PUTs an oversized body
+        and never finishes is never refused by the finishing check, so what the
+        abandonment leaves behind has to be removed rather than waited on.
+
+        An expired marker is a sound warrant for that delete for exactly the
+        reason the finish-time discard is sound -- it says this app minted that
+        path for an upload that did not complete, so the object at it was never
+        a dataset image. An unparseable marker authorises no object removal at
+        all; it names no path, and guessing one from the filename is the single
+        way this sweep could delete an image the dataset already had.
+
+        Still best-effort for the MARKER half: the authorisation check treats an
+        expired marker as no marker whether or not this ever ran. Every failure
+        is logged rather than raised into a caller that was in the middle of
+        minting a perfectly good upload.
+        """
+        pairs = await self._marker_pairs(artifact_id)
+        if not pairs:
+            return 0
         # `now` is THIS app's clock, the one that wrote `expires_at`. Never a
         # listing's `last_modified`: on the production filer the server clock
         # runs ~79 s ahead of the pods, so that comparison crosses two clocks.
-        removals = core.expired_marker_removals(pairs, now=time.time())
+        now = time.time()
+        abandoned = core.abandoned_upload_removals(pairs, now=now)
+        for marker_path, object_path in abandoned:
+            try:
+                await self._discard_staged_upload(artifact_id, object_path)
+            except Exception as exc:
+                logger.warning(
+                    f"could not discard the abandoned upload {object_path} "
+                    f"(marker {marker_path}): {type(exc).__name__}: "
+                    f"{str(exc)[:160]}"
+                )
+        removals = core.expired_marker_removals(pairs, now=now)
         gone = 0
         for marker_path in removals:
             try:
@@ -2205,8 +2277,19 @@ class AnnotationBroker:
                 # marker write then failed, and the finish would refuse an
                 # upload that did everything right.
                 await self._write_upload_marker(artifact_id, marker)
+                # `expires_in` is passed explicitly and SHORT. The default is an
+                # hour, and a presigned PUT stays writable for its whole life:
+                # under edit-staging the URL writes the same key the image lives
+                # at, so after a successful finish a client can PUT an oversized
+                # body to the same URL and nothing re-checks it. Measured in
+                # review -- finish 32 bytes, then PUT 10,000 to the same URL, and
+                # the listing size became 10,000. This app cannot close that
+                # without help from the storage service; what it can do is make
+                # the window minutes instead of an hour.
                 put_url_holder["url"] = await self._am.put_file(
-                    artifact_id, file_path=path
+                    artifact_id,
+                    file_path=path,
+                    expires_in=core.UPLOAD_URL_TTL_S,
                 )
 
             await self._ensure_staged(artifact_id, _mint)

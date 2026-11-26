@@ -241,23 +241,58 @@ def test_THE_FILE_TIME_GUARD_IGNORES_PROSE():
         None,
         "not a document",
         {},
-        {"marker_version": 999, "mint_id": "0" * 32, "path": "p", "max_bytes": 1,
-         "expires_at": 1.0},
+        {
+            "marker_version": 999,
+            "mint_id": "0" * 32,
+            "path": "p",
+            "max_bytes": 1,
+            "expires_at": 1.0,
+        },
         {"marker_version": 1, "path": "p", "max_bytes": 1, "expires_at": 1.0},
-        {"marker_version": 1, "mint_id": "nope", "path": "p", "max_bytes": 1,
-         "expires_at": 1.0},
+        {
+            "marker_version": 1,
+            "mint_id": "nope",
+            "path": "p",
+            "max_bytes": 1,
+            "expires_at": 1.0,
+        },
         {"marker_version": 1, "mint_id": "0" * 32, "max_bytes": 1, "expires_at": 1.0},
-        {"marker_version": 1, "mint_id": "0" * 32, "path": "", "max_bytes": 1,
-         "expires_at": 1.0},
+        {
+            "marker_version": 1,
+            "mint_id": "0" * 32,
+            "path": "",
+            "max_bytes": 1,
+            "expires_at": 1.0,
+        },
         {"marker_version": 1, "mint_id": "0" * 32, "path": "p", "max_bytes": 1},
-        {"marker_version": 1, "mint_id": "0" * 32, "path": "p", "max_bytes": 1,
-         "expires_at": "soon"},
-        {"marker_version": 1, "mint_id": "0" * 32, "path": "p", "max_bytes": 1,
-         "expires_at": True},
-        {"marker_version": 1, "mint_id": "0" * 32, "path": "p", "max_bytes": 0,
-         "expires_at": 1.0},
-        {"marker_version": 1, "mint_id": "0" * 32, "path": "p", "max_bytes": True,
-         "expires_at": 1.0},
+        {
+            "marker_version": 1,
+            "mint_id": "0" * 32,
+            "path": "p",
+            "max_bytes": 1,
+            "expires_at": "soon",
+        },
+        {
+            "marker_version": 1,
+            "mint_id": "0" * 32,
+            "path": "p",
+            "max_bytes": 1,
+            "expires_at": True,
+        },
+        {
+            "marker_version": 1,
+            "mint_id": "0" * 32,
+            "path": "p",
+            "max_bytes": 0,
+            "expires_at": 1.0,
+        },
+        {
+            "marker_version": 1,
+            "mint_id": "0" * 32,
+            "path": "p",
+            "max_bytes": True,
+            "expires_at": 1.0,
+        },
     ],
 )
 def test_an_UNUSABLE_marker_reads_as_NO_MARKER(doc):
@@ -544,9 +579,9 @@ async def test_a_mint_for_an_EXISTING_image_writes_NO_marker(monkeypatch):
 
     assert out["already"] is True, out
     assert "mint_id" not in out and "put_url" not in out, out
-    assert [p for p in store.objects if p.startswith(core.UPLOAD_MARKER_DIR)] == [], (
-        f"a marker was minted for an existing image: {sorted(store.objects)}"
-    )
+    assert [
+        p for p in store.objects if p.startswith(core.UPLOAD_MARKER_DIR)
+    ] == [], f"a marker was minted for an existing image: {sorted(store.objects)}"
 
 
 @pytest.mark.asyncio
@@ -591,9 +626,9 @@ async def test_a_SWEEP_FAILURE_does_not_cost_a_good_mint(monkeypatch):
 
     out = await b.upload_local_image(ARTIFACT, "scan01.png")
 
-    assert core.UPLOAD_MARKER_DIR in calls, (
-        f"the sweep never ran, so this proves nothing: {calls}"
-    )
+    assert (
+        core.UPLOAD_MARKER_DIR in calls
+    ), f"the sweep never ran, so this proves nothing: {calls}"
     assert out["already"] is False and out["mint_id"], out
     assert out["put_url"].endswith("images/scan01.png"), out
     assert core.upload_marker_path(out["mint_id"]) in store.objects

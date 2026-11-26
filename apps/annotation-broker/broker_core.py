@@ -287,6 +287,13 @@ IMAGE_STATE_REMOTE = "remote"
 # never be read as if it were an image.
 _IMAGE_MANIFEST_NAME = IMAGE_MANIFEST_PATH.split("/")[-1]
 
+# Derived from the manifest path rather than written out again, so the directory
+# an image path is built from and the directory the manifest lives in cannot
+# drift apart. A marker records a full path (`images/<name>`) and the listing
+# yields bare names, so something has to join them; doing it from one constant
+# is what keeps the two sides of that comparison in agreement.
+IMAGE_DIR = IMAGE_MANIFEST_PATH.rsplit("/", 1)[0]
+
 
 def local_image_entry(
     name: str, dims: Optional[List[int]] = None, **extra: Any
@@ -370,9 +377,25 @@ def build_image_manifest(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def image_names_from_listing(entries: List[Any]) -> List[str]:
+def image_names_from_listing(
+    entries: List[Any], withheld_paths: Any = frozenset()
+) -> List[str]:
     """Image filenames out of a ``list_files("images")`` result: no
-    directories, and never the manifest itself."""
+    directories, and never the manifest itself.
+
+    *withheld_paths* holds artifact paths (``images/<name>``) belonging to
+    uploads that are still in flight -- see :func:`open_upload_paths`. A PUT
+    object becomes an image through THIS function, so an upload that was never
+    finished would otherwise be a dataset image with no check ever applied to
+    it. Keyed by full path rather than by name because that is what a marker
+    records, and re-deriving it here would be a second place for the two to
+    disagree.
+
+    Only the READ reconciliation passes a set here. The pruning write must not:
+    withholding a name on that path would let a manifest write delete a stored
+    entry while an upload to the same stem is open.
+    """
+    withheld = frozenset(withheld_paths or ())
     names = []
     for entry in entries:
         name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
@@ -381,6 +404,8 @@ def image_names_from_listing(entries: List[Any]) -> List[str]:
         if isinstance(entry, dict) and (
             entry.get("type") == "directory" or entry.get("is_dir")
         ):
+            continue
+        if f"{IMAGE_DIR}/{name}" in withheld:
             continue
         names.append(name)
     return names
@@ -1452,6 +1477,26 @@ UPLOAD_MARKER_TTL_S = 3600.0
 # treats an expired marker as no marker whether or not it was ever swept.
 UPLOAD_MARKER_SWEEP_LIMIT = 50
 
+# How long a minted upload URL stays writable. Passed explicitly to `put_file`,
+# whose own default is an HOUR.
+#
+# WHY IT IS SHORT, AND WHAT IT DOES NOT FIX. The size check is point-in-time: it
+# reads the object once, when the upload is finished. The presigned URL stays
+# writable for its whole life and, under edit-staging, writes the same key the
+# image lives at -- so after a successful finish the client can PUT an oversized
+# body to the same URL and nothing checks it again. Measured in review: finish
+# 32 bytes, accepted; PUT 10,000 bytes to the same URL; the listing size became
+# 10,000. The enforcement point is the FINISH, and it is a statement about the
+# bytes at that moment, not a guarantee about the stored object forever.
+#
+# This app cannot close that without support from the storage service. What it
+# can do is bound the window, which is the whole purpose of this constant: five
+# minutes is ample for the 64 MB ceiling over a poor link while leaving far less
+# time than an hour in which the trick is available. Deliberately much shorter
+# than UPLOAD_MARKER_TTL_S above: the marker has to outlive the URL so that a
+# client whose PUT lands just before expiry can still finish.
+UPLOAD_URL_TTL_S = 300
+
 # Hex only, fixed length. A mint id becomes a FILENAME, so an id that could
 # contain `/` or `..` would let a caller aim the marker read -- and therefore
 # the discard decision -- at a path of their choosing. A charset that cannot
@@ -1609,6 +1654,79 @@ def expired_marker_removals(
         if parsed is None or upload_marker_is_expired(parsed, now=now):
             out.append(marker_path)
     return out
+
+
+def abandoned_upload_removals(
+    markers: Any, *, now: float, limit: int = UPLOAD_MARKER_SWEEP_LIMIT
+) -> List[tuple]:
+    """``(marker_path, object_path)`` for uploads abandoned without finishing.
+
+    The companion to :func:`expired_marker_removals`, and the reason it is a
+    separate function: sweeping the MARKER is tidiness, while sweeping the
+    OBJECT it vouches for is the enforcement. A caller that mints, PUTs an
+    oversized body and never finishes is not refused by the finishing check --
+    it never makes that call -- so the ceiling has to be applied to what the
+    abandonment leaves behind.
+
+    An EXPIRED marker is the warrant for deleting its object, and it is a good
+    warrant for exactly the reason the finish-time discard is safe: the marker
+    says this app minted that path for an upload that never completed, so the
+    object at it was never a dataset image. Nothing else is touched.
+
+    An UNPARSEABLE document is swept as litter by the sibling function but
+    yields NO object removal here -- it names no path, so there is nothing it
+    could authorise, and guessing one from the filename would be the one way
+    this sweep could delete an image the dataset already had.
+
+    Bounded by *limit* for the same reason as the sibling.
+    """
+    out: List[tuple] = []
+    for item in markers or []:
+        if len(out) >= max(0, int(limit)):
+            break
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        marker_path, doc = item
+        if not isinstance(marker_path, str) or not marker_path:
+            continue
+        parsed = parse_upload_marker(doc)
+        if parsed is None:
+            continue
+        if not upload_marker_is_expired(parsed, now=now):
+            continue
+        out.append((marker_path, parsed["path"]))
+    return out
+
+
+def open_upload_paths(markers: Any, *, now: float) -> frozenset:
+    """Object paths with an OPEN marker: minted, not yet finished, not expired.
+
+    These are uploads IN FLIGHT. The dataset's image list is built by unioning
+    the stored manifest with a listing of ``images/``, so an object that has
+    merely been PUT appears as an image whether or not the finishing call was
+    ever made -- which is how a caller that simply never finishes gets past the
+    size ceiling entirely. Withholding these paths from the listing side is what
+    makes the finish a gate rather than a formality.
+
+    Only OPEN markers withhold anything. An expired one does not: by then the
+    upload is abandoned and :func:`abandoned_upload_removals` deletes the object
+    outright, so withholding it as well would hide a file that is about to go.
+    An unparseable one does not either: it names no path to withhold.
+
+    A successful finish removes its marker BEFORE committing, so a completed
+    image is never withheld -- that ordering is what makes this safe, and it is
+    why the removal cannot be moved after the commit.
+    """
+    out = set()
+    for item in markers or []:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        _marker_path, doc = item
+        parsed = parse_upload_marker(doc)
+        if parsed is None or upload_marker_is_expired(parsed, now=now):
+            continue
+        out.add(parsed["path"])
+    return frozenset(out)
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

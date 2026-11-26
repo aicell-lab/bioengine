@@ -120,9 +120,16 @@ class _Store:
         self.published: dict = {}  # committed by some other route
         self.removed: list = []
         self.committed = 0
+        self.put_file_calls: list = []  # (file_path, expires_in) per mint
 
     # -- the artifact-manager surface the route uses -------------------
-    async def put_file(self, _artifact_id, file_path=None):
+    async def put_file(self, _artifact_id, file_path=None, expires_in=None):
+        # `expires_in` is RECORDED, not ignored. The real `put_file` defaults it
+        # to an hour and the route now passes a short value deliberately, so a
+        # double that swallowed the argument would let that regress silently --
+        # and one that did not accept it at all would turn the route's call into
+        # a TypeError, which is how this double started out.
+        self.put_file_calls.append((file_path, expires_in))
         return f"https://store.invalid/{file_path}"
 
     async def remove_file(self, artifact_id=None, file_path=None):
@@ -327,7 +334,9 @@ async def test_a_REAL_body_AT_the_ceiling_becomes_a_LOCAL_manifest_entry(monkeyp
     # no image is. Asserting on `removed` wholesale would conflate the two, so
     # this names the object and the marker separately.
     marker_path = core.upload_marker_path(mint["mint_id"])
-    assert store.removed == [marker_path], f"a good upload was discarded: {store.removed}"
+    assert store.removed == [
+        marker_path
+    ], f"a good upload was discarded: {store.removed}"
     assert "images/scan01.png" in store.objects, "the accepted image was removed"
     # And `.uploads/` is not left behind in the committed dataset.
     assert marker_path not in store.objects
@@ -373,8 +382,8 @@ async def test_an_object_AT_the_ceiling_still_completes(monkeypatch):
     b = _broker(monkeypatch, manifest={}, listing=_listing(CEILING))
 
     out = await b.upload_local_image(
-            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
-        )
+        ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+    )
 
     assert out["committed"] is True, out
     assert b._tstate["committed"] == 1
@@ -384,8 +393,8 @@ async def test_an_object_AT_the_ceiling_still_completes(monkeypatch):
 async def test_an_ordinary_small_object_still_completes(monkeypatch):
     b = _broker(monkeypatch, manifest={}, listing=_listing(2048))
     out = await b.upload_local_image(
-            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
-        )
+        ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+    )
     assert out["committed"] is True, out
     assert b._tstate["committed"] == 1
 
@@ -475,9 +484,9 @@ async def test_finishing_for_an_EXISTING_IMAGE_destroys_nothing(monkeypatch):
     mint = await b.upload_local_image(ARTIFACT, "big.png")
     assert mint["already"] is True, mint
     assert "mint_id" not in mint, mint
-    assert not [p for p in store.objects if p.startswith(core.UPLOAD_MARKER_DIR)], (
-        f"a marker was minted for an existing image: {sorted(store.objects)}"
-    )
+    assert not [
+        p for p in store.objects if p.startswith(core.UPLOAD_MARKER_DIR)
+    ], f"a marker was minted for an existing image: {sorted(store.objects)}"
 
     # A client that ignores that and finishes anyway must change NOTHING --
     # with no mint id, with a made-up one, and with a well-formed one that
@@ -487,9 +496,7 @@ async def test_finishing_for_an_EXISTING_IMAGE_destroys_nothing(monkeypatch):
             if bad is None:
                 await b.upload_local_image(ARTIFACT, "big.png", done=True)
             else:
-                await b.upload_local_image(
-                    ARTIFACT, "big.png", done=True, mint_id=bad
-                )
+                await b.upload_local_image(ARTIFACT, "big.png", done=True, mint_id=bad)
         assert "NOTHING was changed" in str(exc.value), str(exc.value)
         assert store.removed == [], f"an existing image was deleted: {store.removed}"
 
@@ -551,3 +558,193 @@ async def test_a_GENUINE_upload_still_discards_on_refusal(monkeypatch):
         "images/fresh.png",
         core.upload_marker_path(mint["mint_id"]),
     ], store.removed
+
+
+# ── clause 1, the hole a round-4 review measured: never calling finish ───────
+#
+# The dataset's image list is built by unioning the stored manifest with a
+# listing of `images/`, so an object that has merely been PUT is an image
+# whether or not the finishing call is ever made. A caller that simply does not
+# finish therefore bypassed the ceiling completely -- the finishing check cannot
+# refuse a call nobody makes. Measured in review at 10,000 bytes against a
+# 64-byte ceiling.
+
+
+@pytest.mark.asyncio
+async def test_an_upload_that_NEVER_FINISHES_is_not_an_image(monkeypatch):
+    """The review's probe, as a test: mint, PUT over the ceiling, never finish."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(10000))  # 156x the ceiling
+
+    manifest = await b._image_manifest(ARTIFACT)
+
+    assert "scan01" not in manifest, (
+        "an upload that was never finished is listed as a dataset image, so the "
+        f"ceiling can be bypassed by not calling finish: {manifest}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_FINISHED_upload_IS_an_image(monkeypatch):
+    """THE CONTROL. Withholding every PUT object would satisfy the test above
+    and break the feature outright, so the paired case has to be here: an
+    upload that completes within the ceiling must appear."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(32))
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+    )
+    assert out["committed"] is True
+
+    manifest = await b._image_manifest(ARTIFACT)
+
+    assert "scan01" in manifest, (
+        f"a completed upload inside the ceiling is missing from the image "
+        f"list: {manifest}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_upload_whose_marker_EXPIRED_unfinished_loses_its_OBJECT(
+    monkeypatch,
+):
+    """The second half of the fix: at expiry the object goes, not just the marker.
+
+    Withholding alone would leave an oversized object sitting at the image's
+    path for the whole marker TTL, publishable by any other route's commit. The
+    expired marker is the warrant for deleting it.
+
+    The marker is aged by rewriting it through the shipped builder with an
+    expiry in the past -- not by patching the clock, which would test the patch.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(10000))
+    marker_path = core.upload_marker_path(mint["mint_id"])
+    stale = core.upload_marker_document(
+        path="images/scan01.png",
+        mint_id=mint["mint_id"],
+        max_bytes=64,
+        minted_at=time.time() - 10 * core.UPLOAD_MARKER_TTL_S,
+    )
+    store.objects[marker_path] = json.dumps(stale).encode("utf-8")
+
+    swept = await b._sweep_expired_markers(ARTIFACT)
+
+    assert swept == 1, swept
+    assert (
+        "images/scan01.png" in store.removed
+    ), f"the abandoned object survived its marker's expiry: {store.removed}"
+    assert "images/scan01.png" not in store.objects
+    manifest = await b._image_manifest(ARTIFACT)
+    assert "scan01" not in manifest, manifest
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_does_NOT_delete_an_object_whose_marker_is_OPEN(monkeypatch):
+    """THE CONTROL for the sweep. A sweep that deleted on every pass would
+    satisfy the test above and destroy uploads in flight."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(32))
+
+    swept = await b._sweep_expired_markers(ARTIFACT)
+
+    assert swept == 0, swept
+    assert "images/scan01.png" in store.objects, "an in-flight upload was deleted"
+    assert "images/scan01.png" not in store.removed
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_NEVER_deletes_an_image_the_dataset_ALREADY_HAD(monkeypatch):
+    """The sweep's hard limit, and the reason an unparseable marker authorises
+    no object removal: it names no path, and a path guessed from a filename is
+    the one way this could delete somebody's image."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    store.publish("images/already.png", _png(16))
+    # An expired marker that cannot be parsed, plus one for a DIFFERENT path.
+    store.objects[f"{core.UPLOAD_MARKER_DIR}/{'a' * 32}.json"] = b"{ not json"
+
+    await b._sweep_expired_markers(ARTIFACT)
+
+    assert "images/already.png" in store.objects, store.removed
+    assert "images/already.png" not in store.removed
+
+
+@pytest.mark.asyncio
+async def test_the_minted_URL_is_given_a_SHORT_life_not_the_hour_default(monkeypatch):
+    """Clause 3's point-in-time limitation, bounded rather than documented away.
+
+    The size check reads the object once. The presigned URL stays writable for
+    its whole life and writes the same key the image lives at, so after a
+    successful finish a client can PUT an oversized body to the same URL. This
+    app cannot close that without the storage service; what it must do is pass a
+    short expiry instead of accepting the one-hour default.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    await b.upload_local_image(ARTIFACT, "scan01.png")
+
+    assert store.put_file_calls, "no put_file call was recorded"
+    path, expires_in = store.put_file_calls[-1]
+    assert path == "images/scan01.png", path
+    assert expires_in == core.UPLOAD_URL_TTL_S, expires_in
+    # An absolute bound, not one derived from the constant under test: a
+    # threshold read out of the thing it is checking cannot fail.
+    assert isinstance(expires_in, int) and 0 < expires_in <= 600, expires_in
+    # And it must be shorter than the marker's life, or a PUT landing just
+    # before the URL dies could not be finished.
+    assert expires_in < core.UPLOAD_MARKER_TTL_S
+
+
+@pytest.mark.asyncio
+async def test_an_EXPIRED_marker_withholds_NOTHING_so_its_object_stays_visible(
+    monkeypatch,
+):
+    """Only an OPEN marker withholds. An expired one must not.
+
+    Reachable whenever the sweep has not run yet or its delete failed -- the
+    sweep logs that and carries on, by design. If expiry also withheld, the
+    object would sit at the image's path while the image list said the dataset
+    had no such image, and a re-mint of that name would still answer
+    `already: True` because the no-overwrite check reads the listing. The user
+    would then be told the file is both already uploaded and not present, with
+    no way out. Withholding only in-flight uploads is what keeps those two
+    answers consistent.
+
+    This test is here because the mutant harness found nothing distinguished
+    it: making expiry withhold too left every other test green.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(32))
+    marker_path = core.upload_marker_path(mint["mint_id"])
+    stale = core.upload_marker_document(
+        path="images/scan01.png",
+        mint_id=mint["mint_id"],
+        max_bytes=64,
+        minted_at=time.time() - 10 * core.UPLOAD_MARKER_TTL_S,
+    )
+    store.objects[marker_path] = json.dumps(stale).encode("utf-8")
+
+    # NO sweep: this is the window in which the object is still there.
+    manifest = await b._image_manifest(ARTIFACT)
+
+    assert "scan01" in manifest, (
+        "an expired marker withheld its object, so the image list denies a file "
+        f"that is present and that a re-mint will refuse to overwrite: {manifest}"
+    )
