@@ -2563,21 +2563,99 @@ def read_metadata(
     return json.loads(p.read_text())
 
 
+class MetadataConflict(RuntimeError):
+    """A write was refused because the record changed after it was read.
+
+    Raised by ``write_metadata`` when ``expect_updated_at`` does not match what
+    is on disk. Callers that go through ``update_metadata`` never see this: it
+    retries with a fresh read. Callers that pass ``expect_updated_at``
+    themselves get it, and must NOT swallow it — the whole point is that a
+    refused write is visible rather than a silently lost one.
+    """
+
+
+_NO_CAS = object()
+
+
 def write_metadata(
-    metadata: Dict[str, Any], root: Optional[Path] = None
+    metadata: Dict[str, Any],
+    root: Optional[Path] = None,
+    expect_updated_at: Any = _NO_CAS,
 ) -> Dict[str, Any]:
     """Atomically write *metadata* (write to a ``.tmp`` file, then
     ``os.replace``) — same pattern as ``training.write_status`` in the
-    micro-sam app. Stamps ``updated_at`` and returns the written dict."""
+    micro-sam app. Stamps ``updated_at`` and returns the written dict.
+
+    ``expect_updated_at`` turns this into a COMPARE-AND-SET. The whole record is
+    written as one blob, so a caller that read it, awaited something, and then
+    wrote it back used to erase every change made in between — atomically, which
+    is why it left no trace. Passing the ``updated_at`` seen at read time makes
+    that refuse with ``MetadataConflict`` instead. Pass ``None`` to require that
+    no record exists yet (a create).
+
+    The compare and the ``os.replace`` are not a hardware CAS, but there is no
+    ``await`` between them, so against other coroutines on this event loop the
+    pair is indivisible — which is the concurrency that produced the lost
+    update. It does NOT serialise two OS processes or two Serve replicas sharing
+    one state root; that would need a lock file, and is out of scope here
+    because the broker runs a single replica.
+    """
     artifact_id = metadata["artifact_id"]
+    p = metadata_path(artifact_id, root)
+    if expect_updated_at is not _NO_CAS:
+        current = read_metadata(artifact_id, root)
+        seen = current.get("updated_at") if current else None
+        if seen != expect_updated_at:
+            raise MetadataConflict(
+                f"{artifact_id}: record changed since it was read "
+                f"(expected updated_at {expect_updated_at!r}, found {seen!r}); "
+                f"refusing to overwrite it"
+            )
     metadata = dict(metadata)
     metadata["updated_at"] = now_iso()
-    p = metadata_path(artifact_id, root)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(metadata, indent=2))
     os.replace(tmp, p)
     return metadata
+
+
+def update_metadata(
+    artifact_id: str,
+    mutate: Any,
+    root: Optional[Path] = None,
+    attempts: int = 5,
+) -> Dict[str, Any]:
+    """Read-modify-write one dataset record safely, and return what was STORED.
+
+    ``mutate(meta)`` is handed a FRESH copy of the record on every attempt and
+    mutates it in place. The write is a compare-and-set against the
+    ``updated_at`` seen by that same read, so a change that landed in between
+    cannot be erased: the attempt is retried against the new state instead.
+
+    Two things it deliberately does NOT do:
+
+    * It does not reuse a record the caller read earlier. That record is exactly
+      what makes the lost update possible, so the mutation has to be expressed
+      as a function of whatever is current.
+    * It does not return the caller's own dict. It returns the stored record, so
+      a caller cannot be handed a description of a write that did not land.
+    """
+    last: Optional[MetadataConflict] = None
+    for _ in range(max(1, attempts)):
+        current = read_metadata(artifact_id, root)
+        if current is None:
+            raise KeyError(f"no metadata record for {artifact_id!r}")
+        token = current.get("updated_at")
+        candidate = dict(current)
+        mutate(candidate)
+        try:
+            return write_metadata(candidate, root=root, expect_updated_at=token)
+        except MetadataConflict as exc:
+            last = exc
+    raise MetadataConflict(
+        f"{artifact_id}: gave up after {attempts} attempts; last conflict: {last}"
+    )
 
 
 def delete_metadata(artifact_id: str, root: Optional[Path] = None) -> bool:

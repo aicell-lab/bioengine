@@ -3215,8 +3215,23 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         description = description if isinstance(description, str) else ""
-        core.add_label(meta, name, description)  # raises ValueError on a bad name
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+        # Validate the name BEFORE any write, on a throwaway copy: `add_label`
+        # raises ValueError on a bad name, and that must not depend on having
+        # reached the write. It is idempotent and validates first, so running it
+        # again inside the update below is safe.
+        core.add_label(dict(meta), name, description)
+        # `meta` from `_require_role` is a read, and this method is not the only
+        # writer of the record — `get_dataset_index` writes it too, across
+        # awaits. Writing this read back whole is what made a created label
+        # vanish. Re-read under compare-and-set and return what was STORED, so
+        # the caller is never handed a record describing a write that did not
+        # land; on a persistent conflict this RAISES rather than reporting a
+        # success it cannot support.
+        meta = core.update_metadata(
+            artifact_id,
+            lambda m: core.add_label(m, name, description),
+            root=STATE_ROOT,
+        )
 
         async def _put_label_metadata():
             await self._write_json_file(
@@ -3301,8 +3316,28 @@ class AnnotationBroker:
                     dims_cache[stem] = dims
                     cache_grew = True
             if cache_grew:
-                meta["image_dims"] = dims_cache
-                core.write_metadata(meta, root=STATE_ROOT)
+                # THIS is the write that used to lose other people's changes.
+                # `meta` was read at the top of this method and we have since
+                # awaited `_image_manifest` and one HTTP range GET per image, so
+                # anything written in that window (a label, a share, a role) was
+                # already gone by the time the old code wrote `meta` back whole.
+                #
+                # Two changes, both load-bearing:
+                #  * `update_metadata` re-reads under compare-and-set, so the
+                #    only field this call contributes is image_dims;
+                #  * the dims are MERGED rather than assigned, so a concurrent
+                #    dims write is not lost either.
+                def _merge_dims(m: Dict[str, Any]) -> None:
+                    merged = dict(m.get("image_dims") or {})
+                    merged.update(dims_cache)
+                    m["image_dims"] = merged
+
+                # Rebind `meta`: the code below reads `meta["labels"]` to build
+                # the reply, so a stale record here would also report labels
+                # that the caller's own window had just changed.
+                meta = core.update_metadata(
+                    artifact_id, _merge_dims, root=STATE_ROOT
+                )
         for img in images:
             entry = manifest[img["stem"]]
             dims = (
