@@ -241,9 +241,11 @@ def _cover(pkg_dir: Path, input_chw: np.ndarray, mask_hw: np.ndarray) -> None:
 
     disp = np.transpose(input_chw, (1, 2, 0))
     # np.ptp(disp), not disp.ptp(): NumPy 2.0 removed the ndarray method, and
-    # this app has runtimes on both majors. Correct today only because this
-    # worker runs in the cellpose runtime, which pins 1.26.4 — which is exactly
-    # the kind of "correct by where it happens to run" that stops being true.
+    # this app has runtimes on both majors, so the free function is the only
+    # form correct in every environment the bundle ships into. This line USED to
+    # call the method, which was correct only because this worker runs in the
+    # cellpose runtime, which pins 1.26.4 — "correct by where it happens to run"
+    # is the property that stops being true without the file changing.
     disp = (disp - disp.min()) / (np.ptp(disp) or 1.0)
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 5))
     a1.imshow(disp)

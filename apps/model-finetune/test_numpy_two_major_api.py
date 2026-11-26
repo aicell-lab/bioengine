@@ -5,18 +5,24 @@ This app ships two Ray deployments on two different NumPy majors, on purpose:
 ``python-elf`` requires it, and ``requirements-runtime-cellpose.txt`` pins
 1.26.4 and says in terms that the two cannot share a major. So "it works here"
 is not a statement about the bundle — a call that is fine in the cellpose
-runtime raises ``AttributeError`` in the micro-sam one, and the bundle's own
-tests cannot even be *collected* in the environment where it does.
+runtime raises ``AttributeError`` in the micro-sam one.
 
 The specific trap pinned here is the removal of array METHODS in NumPy 2.0
 whose free-function form survived. ``arr.ptp()`` reads as the natural spelling,
 the module-level ``np.ptp(arr)`` works on both majors, and the two are
 otherwise interchangeable — so the wrong one is easy to write, easy to review
 past, and raises only in the runtime nobody ran the suite in. Three CLAHE tests
-in ``test_preflight.py`` sat in exactly that state: green in CI, uncollectable
-under 2.x, and the ``AttributeError`` they raised there named an array method,
-which reads like a defect in the code under test rather than a version
-mismatch in the harness.
+in ``test_preflight.py`` sat in exactly that state: green in CI, and under 2.x
+COLLECTED AND THEN FAILED AT RUN TIME — measured on the tree before this fix,
+3 failed and 13 passed with no collection error, each failure an
+``AttributeError`` naming an array method. **The failure mode matters for
+diagnosis and the earlier draft of this docstring got it wrong**, saying the
+file could not be collected: anyone who believes that looks for an import
+error that never happens. Collection succeeds because the banned spelling is
+inside a function body, not at module level; what fails is the assertion that
+runs it. And an ``AttributeError`` about an array method reads like a defect in
+the code under test rather than a version mismatch in the harness, which is
+what made the three failures expensive.
 
 Why a source scan rather than a run under both majors: a run can only fail on
 a line it reaches. These are single call sites inside plotting and assertion
