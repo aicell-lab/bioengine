@@ -121,7 +121,12 @@ def _install_replica_bootstrap_finder() -> None:
 
                     print(
                         "BioEngine: replica source bootstrap failed — user "
-                        "source will not be on sys.path. Traceback:",
+                        "source will not be on sys.path. HOME and TMPDIR ARE "
+                        "set before the source sync, so they point at the "
+                        "per-app workspace; if this traceback shows them "
+                        "unset, a write to Path.home() will hit a read-only "
+                        "path and the real cause is HERE, not at that write. "
+                        "Traceback:",
                         flush=True,
                     )
                     traceback.print_exc()

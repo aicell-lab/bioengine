@@ -249,11 +249,39 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             logger.info(f"BioEngine: source mirrored from local path {candidate}")
             return source
 
+    import errno
     import fcntl
+
+    # The lock serialises concurrent replicas materialising the same app_dir.
+    # It lives on the shared store, which on an external cluster is NFS — and an
+    # NFS export whose lock manager is not serving returns ENOLCK rather than
+    # blocking. Advisory locking is an optimisation here, not a correctness
+    # requirement: the sync is idempotent and writes through a snapshot plus a
+    # version marker. So a store that cannot lock degrades to an unlocked sync
+    # instead of failing the whole replica setup.
+    #
+    # EOPNOTSUPP/ENOSYS are included because some filesystems reject flock
+    # outright rather than reporting no locks available. Any OTHER errno still
+    # raises: this widens the no-lock path to filesystems that cannot lock, and
+    # deliberately does not swallow a genuine failure such as EBADF.
+    _NO_LOCK_ERRNOS = (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS)
 
     lock_path = app_dir / ".lock"
     with open(lock_path, "w") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        locked = False
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except OSError as exc:
+            if exc.errno not in _NO_LOCK_ERRNOS:
+                raise
+            logger.warning(
+                f"BioEngine: advisory locking unavailable on {lock_path} "
+                f"({exc.strerror}, errno={exc.errno}); syncing source WITHOUT a "
+                f"lock. Concurrent replicas on this app_dir may duplicate work. "
+                f"HOME and TMPDIR are already set, so this cannot leave the "
+                f"replica writing to a read-only HOME."
+            )
         try:
             files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
             if not files_url:
@@ -270,7 +298,11 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             version_marker.write_text(identity)
             return source
         finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            # Only unlock what was actually locked: on the ENOLCK path the
+            # LOCK_UN would raise the same error out of a `finally` and mask
+            # whatever the sync was doing — including a successful return.
+            if locked:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def setup_replica_environment() -> None:
@@ -297,8 +329,24 @@ def setup_replica_environment() -> None:
             "which version of the source to materialise."
         )
 
-    source = _ensure_source(app_dir, version, logger)
-
+    # HOME/TMPDIR FIRST, before the source sync, because they do not depend on
+    # it and the ordering is load-bearing.
+    #
+    # The caller of this function (the ``sys.meta_path`` finder installed in
+    # ``bioengine/__init__.py``) catches every exception, reports that user
+    # source will be missing from ``sys.path``, and lets the replica continue.
+    # When these assignments came *after* ``_ensure_source``, any failure in the
+    # sync skipped them, so the replica ran on with HOME still pointing at the
+    # image's own ``/home/ray`` — which is read-only. The replica then registered
+    # with the proxy, reported HEALTHY, and died at the first write to
+    # ``Path.home()``, far from the real cause.
+    #
+    # Measured on a production external-cluster worker: ``_ensure_source`` raised
+    # ``OSError: [Errno 37] No locks available`` from its ``flock`` on an NFS
+    # store, and every training run on that replica then failed with
+    # ``OSError: [Errno 30] Read-only file system: '/home/ray/.bioengine'``.
+    # Setting these first turns that into a missing-source error, which is loud,
+    # immediate and points at what actually went wrong.
     home = app_dir / "home"
     tmp = app_dir / "tmp"
     home.mkdir(parents=True, exist_ok=True)
@@ -307,6 +355,8 @@ def setup_replica_environment() -> None:
     os.environ["TMPDIR"] = str(tmp)
     os.environ["TMP"] = str(tmp)
     os.environ["TEMP"] = str(tmp)
+
+    source = _ensure_source(app_dir, version, logger)
 
     src_str = str(source)
     if src_str not in sys.path:
