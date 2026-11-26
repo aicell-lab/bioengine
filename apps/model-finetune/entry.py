@@ -709,40 +709,67 @@ class EntryApp:
 
         The probe runs on the RUNTIME replica, because that is where micro-sam
         and its cache live -- `micro-sam` is in requirements-runtime.txt and is
-        not importable in the worker image at all, so an entry-side check would
-        be measuring the wrong filesystem.
+        not importable in the worker image, so an entry-side check would be
+        measuring the wrong filesystem.
 
-        A RUNTIME WITHOUT THE PROBE IS NOT A REFUSAL, and that is a deliberate
-        choice rather than an oversight. During a rollout the entry can be new
-        while the runtime replica is still the previous version; failing closed
-        there would refuse ALL training on a worker that was training fine a
-        minute earlier. What this guard removes is a late, confusing failure --
-        it is not a safety boundary, so its absence restores the old behaviour
-        rather than stopping work. The skip is logged so it is visible.
+        AN OLDER REPLICA IS DETECTED THROUGH `ping`, NOT THROUGH `getattr`.
+        `BioEngineRuntimeHandle.__getattr__` returns a bound method for ANY
+        public name, so `getattr(runtime, "base_checkpoint_status", None)` is
+        never None and a capability test written that way is dead code: the
+        call would fail at the far end, land in the except below, and refuse
+        EVERY micro-sam run during a rollout. `ping` exists on every version of
+        this runtime, so a payload whose `capabilities` lack the probe
+        identifies an old replica positively, and that skips -- restoring the
+        previous behaviour rather than stopping all training.
 
-        Once the probe HAS answered, the decision fails closed: see
-        `training.base_checkpoint_refusal`, which refuses on a probe error or
-        an unanswerable part rather than admitting the run.
+        Once a replica HAS advertised the probe, the decision fails closed: a
+        probe error or an unanswerable part refuses, because admitting the run
+        when the check could not answer restores exactly what this removes.
         """
         import training
 
         runtime = self._runtime_for(model_type)
-        probe = getattr(runtime, "base_checkpoint_status", None)
-        if probe is None:
+        try:
+            pong = await asyncio.wait_for(runtime.ping(), timeout=2.0)
+        except Exception as exc:
+            # The runtime was reachable a moment ago via _check_runtime_available;
+            # if its ping now fails, that is a runtime problem and not this
+            # guard's to convert into a training refusal.
             self.logger.warning(
-                "this runtime has no base_checkpoint_status; skipping the "
-                "base-checkpoint preflight for %s (a run with unfetchable "
-                "weights will fail late, as it did before)",
-                model_type,
+                "could not read runtime capabilities (%s); skipping the "
+                "base-checkpoint preflight for %s", exc, model_type
             )
             return
+        caps = (pong or {}).get("capabilities") or []
+        if "base_checkpoint_status" not in caps:
+            self.logger.warning(
+                "this runtime does not advertise base_checkpoint_status "
+                "(capabilities=%s); skipping the base-checkpoint preflight for "
+                "%s, so a run with unfetchable weights fails late as before",
+                list(caps), model_type,
+            )
+            return
+
         try:
             status = await asyncio.wait_for(
-                probe(model_type), timeout=BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S
+                runtime.base_checkpoint_status(model_type),
+                timeout=BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
             )
+        except asyncio.TimeoutError:
+            # A TIMEOUT IS AN ANSWER, and it is the one that matters here.
+            # The case this guards against is a host that silently drops
+            # packets, and "could not be checked" is wrong for that -- the
+            # weights are not obtainable here within any budget a caller would
+            # wait for. Reported as unreachable parts so the message says so.
+            status = {
+                "model_type": model_type,
+                "parts": {
+                    "encoder": {"cached": False, "reachable": False, "url": None},
+                },
+                "probe_error": None,
+                "timed_out_after_s": BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
+            }
         except Exception as exc:
-            # The probe is bounded; if it times out or the call fails, say so
-            # as the probe's own error and let the decision refuse on it.
             status = {"model_type": model_type, "parts": {},
                       "probe_error": "%s: %s" % (type(exc).__name__, exc)}
         refusal = training.base_checkpoint_refusal(model_type, status)

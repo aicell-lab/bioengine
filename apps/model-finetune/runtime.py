@@ -55,7 +55,10 @@ _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 # purpose: this runs on the admission path, and the thing it protects against
 # is a run that claims the GPU and then discovers the weights minutes later.
 # A probe that could itself take minutes would reproduce the problem.
-BASE_CHECKPOINT_PROBE_TIMEOUT_S = 4.0
+BASE_CHECKPOINT_PROBE_TIMEOUT_S = 3.0
+
+# Methods a caller may rely on being present. Advertised through `ping`.
+RUNTIME_CAPABILITIES = ("base_checkpoint_status",)
 
 
 def _url_reachable(url: str, timeout_s: float) -> bool:
@@ -228,6 +231,13 @@ class RuntimeApp:
             "loaded_model_type": self._loaded_model_type,
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
+            # WHAT THIS REPLICA CAN BE ASKED, so a newer entry can tell an older
+            # replica from a broken one. `getattr` on the composition handle
+            # cannot: BioEngineRuntimeHandle.__getattr__ returns a bound method
+            # for ANY public name, so a missing method is indistinguishable from
+            # a present one until the call fails -- and treating that failure as
+            # "unavailable" would refuse every run during a rollout.
+            "capabilities": sorted(RUNTIME_CAPABILITIES),
         }
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
@@ -259,6 +269,14 @@ class RuntimeApp:
         cached, issues a HEAD with a short timeout. It never downloads -- the
         cost it exists to avoid is exactly the one a download would pay.
 
+        CACHED MEANS PRESENT, NOT VALID. The check is `os.path.exists`, so a
+        file whose hash no longer matches micro-sam's registry counts as
+        cached here while `pooch.fetch` would re-download it. That is the
+        right trade for an admission check -- verifying hashes would mean
+        reading every byte of multi-hundred-megabyte weights on a path that
+        must stay quick -- but it means this answers "is there a file here",
+        and a corrupt one still fails later.
+
         Returns the parts rather than a verdict, so the caller decides and the
         decision is testable without a network: ``{"model_type", "parts":
         {name: {"cached": bool, "reachable": bool|None, "url": str|None}},
@@ -283,18 +301,40 @@ class RuntimeApp:
         # "<model_type>_decoder". BOTH are needed, and a site can hold one and
         # not the other -- so checking only the encoder would admit a run whose
         # decoder is unobtainable here.
+        # THE PARTS ARE PROBED CONCURRENTLY, and the arithmetic is the reason.
+        # `_url_reachable` makes up to TWO attempts (HEAD, then a ranged GET),
+        # so a part costs up to 2 x BASE_CHECKPOINT_PROBE_TIMEOUT_S. Run
+        # sequentially, two parts cost up to 4x that -- which overran the
+        # entry's own budget, so the caller's timeout fired first and the user
+        # was told the check "could not be checked" instead of that the weights
+        # are unavailable here. That is the wrong sentence for the one case
+        # this probe exists for: a host that silently drops packets.
+        pending = []
         for part, key in (("encoder", model_type), ("decoder", f"{model_type}_decoder")):
             if key not in known:
                 continue  # micro-sam does not publish this part for this type
-            path = os.path.join(root, key)
-            cached = os.path.exists(path)
+            cached = os.path.exists(os.path.join(root, key))
             info: Dict[str, Any] = {"cached": cached, "reachable": None,
                                     "url": urls.get(key)}
-            if not cached and info["url"]:
-                info["reachable"] = await asyncio.to_thread(
-                    _url_reachable, info["url"], BASE_CHECKPOINT_PROBE_TIMEOUT_S
-                )
             out["parts"][part] = info
+            if not cached and info["url"]:
+                pending.append((info, info["url"]))
+
+        if pending:
+            results = await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        _url_reachable, url, BASE_CHECKPOINT_PROBE_TIMEOUT_S
+                    )
+                    for _, url in pending
+                ),
+                return_exceptions=True,
+            )
+            for (info, _), res in zip(pending, results):
+                # An exception here is not "reachable unknown": the caller is
+                # deciding whether to admit a run, so it has to read as "not
+                # obtainable from here".
+                info["reachable"] = res is True
         return out
 
     def _device(self) -> str:

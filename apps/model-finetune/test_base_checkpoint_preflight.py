@@ -186,3 +186,270 @@ def test_the_runtime_probe_NEVER_DOWNLOADS():
             "probe must only stat the cache and ask whether a URL answers"
         )
     assert "HEAD" in src, "the reachability probe no longer uses a HEAD request"
+
+
+# ── the probe ITSELF, executed. Everything above this line runs on hand-built
+#    dicts, and a review pointed out what that leaves open: a probe that
+#    reported every part uncached and unreachable -- wrong path, wrong key, an
+#    exception swallowed -- would pass every case above, because the ADMITTED
+#    cases never went through it. Two real bugs were exactly that shape and
+#    both survived. These execute the probe. ─────────────────────────────────
+
+
+import asyncio
+import http.server
+import socket
+import threading
+import time
+import types
+
+
+def _runtime_cls():
+    import runtime
+
+    return getattr(runtime.RuntimeApp, "func_or_class", runtime.RuntimeApp)
+
+
+def _stub_micro_sam(monkeypatch, cache_root, urls, keys):
+    """A stand-in for `micro_sam.util` shaped like the pinned 1.8.11.
+
+    `models()` there is `pooch.create(path=<cachedir>/models, registry, urls)`,
+    so the stub exposes exactly `path`, `urls` and `registry` — the three the
+    probe reads. Injected through sys.modules because micro-sam is a RUNTIME
+    dependency and is not importable here at all.
+    """
+    reg = types.SimpleNamespace(path=str(cache_root), urls=dict(urls),
+                                registry={k: "xxh128:0" for k in keys})
+    mod = types.ModuleType("micro_sam.util")
+    mod.models = lambda: reg
+    pkg = types.ModuleType("micro_sam")
+    pkg.util = mod
+    monkeypatch.setitem(__import__("sys").modules, "micro_sam", pkg)
+    monkeypatch.setitem(__import__("sys").modules, "micro_sam.util", mod)
+    return reg
+
+
+def test_a_CACHED_type_is_admitted_and_the_probe_TOUCHES_NO_NETWORK(tmp_path, monkeypatch):
+    """(a) Both parts on disk must admit, and must not ask the network at all —
+    a cached model is the common case and paying a round trip for it would be
+    a cost this guard is supposed to remove, not add."""
+    import runtime
+
+    models = tmp_path / "models"
+    models.mkdir()
+    for key in ("vit_b_lm", "vit_b_lm_decoder"):
+        (models / key).write_bytes(b"weights")
+    _stub_micro_sam(monkeypatch, models, {}, ("vit_b_lm", "vit_b_lm_decoder"))
+
+    def _never(*a, **k):
+        raise AssertionError("the probe went to the network for a CACHED model")
+
+    monkeypatch.setattr(runtime, "_url_reachable", _never)
+    st = asyncio.run(_runtime_cls().base_checkpoint_status(object(), "vit_b_lm"))
+    assert st["probe_error"] is None, st
+    assert set(st["parts"]) == {"encoder", "decoder"}, st
+    assert all(p["cached"] for p in st["parts"].values()), st
+    assert training.base_checkpoint_refusal("vit_b_lm", st) is None, st
+
+
+def test_a_store_that_answers_HEAD_with_405_is_still_ADMITTED(tmp_path, monkeypatch):
+    """(b) Some stores refuse HEAD and serve GET perfectly well. Treating that
+    as unreachable would refuse a model this site can actually train, so the
+    probe falls back to a 1-byte ranged GET — exercised here against a real
+    server rather than asserted from the source."""
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(405)
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes 0-0/1")
+            self.end_headers()
+            self.wfile.write(b"x")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        models = tmp_path / "models"
+        models.mkdir()
+        _stub_micro_sam(
+            monkeypatch, models,
+            {"vit_b_lm": base + "/enc", "vit_b_lm_decoder": base + "/dec"},
+            ("vit_b_lm", "vit_b_lm_decoder"),
+        )
+        st = asyncio.run(_runtime_cls().base_checkpoint_status(object(), "vit_b_lm"))
+    finally:
+        srv.shutdown()
+    assert st["probe_error"] is None, st
+    assert all(p["reachable"] is True for p in st["parts"].values()), st
+    assert training.base_checkpoint_refusal("vit_b_lm", st) is None, st
+
+
+def test_an_UNREACHABLE_store_is_REFUSED_with_the_unavailable_text(tmp_path, monkeypatch):
+    """(c) The case the row was filed for. A refused connection is used rather
+    than a black hole so the test is fast and deterministic; the BUDGET under a
+    black hole is the next test."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead = s.getsockname()[1]
+    s.close()  # nothing listens here now -> connection refused, immediately
+
+    models = tmp_path / "models"
+    models.mkdir()
+    base = f"http://127.0.0.1:{dead}"
+    _stub_micro_sam(
+        monkeypatch, models,
+        {"vit_t_em_organelles": base + "/enc",
+         "vit_t_em_organelles_decoder": base + "/dec"},
+        ("vit_t_em_organelles", "vit_t_em_organelles_decoder"),
+    )
+    st = asyncio.run(
+        _runtime_cls().base_checkpoint_status(object(), "vit_t_em_organelles")
+    )
+    assert st["probe_error"] is None, st
+    assert all(p["reachable"] is False for p in st["parts"].values()), st
+    msg = training.base_checkpoint_refusal("vit_t_em_organelles", st)
+    assert msg and "cannot be trained at this site" in msg, msg
+    assert "vit_t_em_organelles" in msg, msg
+
+
+def test_the_probe_FITS_the_entry_budget_against_a_BLACK_HOLE(tmp_path, monkeypatch):
+    """The arithmetic a review caught. Two parts, each up to two attempts: run
+    sequentially that exceeded the entry's own timeout, so the caller's
+    deadline fired first and the user was told the check "could not be
+    checked" rather than that the weights are unavailable here — the wrong
+    sentence for a host that silently drops packets.
+    """
+    import entry
+    import runtime
+
+    models = tmp_path / "models"
+    models.mkdir()
+    # 10.255.255.1 is unroutable: packets are dropped, not refused, so each
+    # attempt costs its full timeout rather than failing fast.
+    _stub_micro_sam(
+        monkeypatch, models,
+        {"vit_t_em_organelles": "http://10.255.255.1/enc",
+         "vit_t_em_organelles_decoder": "http://10.255.255.1/dec"},
+        ("vit_t_em_organelles", "vit_t_em_organelles_decoder"),
+    )
+    t0 = time.monotonic()
+    st = asyncio.run(
+        _runtime_cls().base_checkpoint_status(object(), "vit_t_em_organelles")
+    )
+    elapsed = time.monotonic() - t0
+    budget = entry.BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S
+    assert elapsed < budget, (
+        f"the probe took {elapsed:.1f}s against a black hole, which does not fit "
+        f"the entry's {budget}s budget — the caller's timeout fires first and the "
+        f"refusal says 'could not be checked' instead of naming the weights"
+    )
+    assert all(p["reachable"] is False for p in st["parts"].values()), st
+    msg = training.base_checkpoint_refusal("vit_t_em_organelles", st)
+    assert msg and "cannot be trained at this site" in msg, msg
+
+
+# ── the WIRING, which a review found was dead code ──────────────────────────
+
+
+class _FakeRuntime:
+    """Shaped like the composition handle, which is the point.
+
+    `BioEngineRuntimeHandle.__getattr__` returns a bound method for ANY public
+    name, so `getattr(runtime, "base_checkpoint_status", None)` is never None.
+    A capability test written that way looks like it skips on an older replica
+    and actually calls, fails, and refuses. This fake reproduces that: every
+    attribute exists.
+    """
+
+    def __init__(self, caps, probe=None):
+        self._caps = caps
+        self._probe = probe
+
+    async def ping(self):
+        return {"status": "ok", "capabilities": list(self._caps)}
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        async def _call(*a, **k):
+            if self._probe is None:
+                raise AttributeError(
+                    "'RuntimeApp' object has no attribute %r" % name
+                )
+            return self._probe(*a, **k)
+
+        return _call
+
+
+def _entry_instance(runtime_obj):
+    import entry
+
+    cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
+    inst = object.__new__(cls)
+    inst._enabled_backends = {"microsam", "cellpose"}
+    inst.runtime = runtime_obj
+    import logging
+
+    inst.logger = logging.getLogger("test-entry")
+    return cls, inst
+
+
+def test_an_OLDER_RUNTIME_SKIPS_rather_than_refusing_every_run():
+    """A replica that does not advertise the probe must not stop training.
+
+    During a rollout the entry can be newer than the runtime. This guard
+    removes a late failure; it is not a safety boundary, so its absence has to
+    restore the previous behaviour. A review measured that the first version
+    did the opposite — `getattr` answered for a method that was not there, the
+    call failed, and EVERY micro-sam run was refused.
+    """
+    cls, inst = _entry_instance(_FakeRuntime(caps=[], probe=None))
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+
+
+def test_a_runtime_that_ADVERTISES_the_probe_but_FAILS_it_REFUSES():
+    """The other direction. Once a replica says it has the probe, a failure is
+    a real failure and must not be mistaken for an old replica."""
+    cls, inst = _entry_instance(
+        _FakeRuntime(caps=["base_checkpoint_status"], probe=None)
+    )
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert "vit_b_lm" in str(exc.value), exc.value
+
+
+def test_an_unavailable_type_RAISES_naming_it():
+    cls, inst = _entry_instance(
+        _FakeRuntime(
+            caps=["base_checkpoint_status"],
+            probe=lambda mt: status({"encoder": UNREACHABLE}, model_type=mt),
+        )
+    )
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(
+            cls._refuse_unavailable_base_checkpoint(inst, "vit_t_em_organelles")
+        )
+    assert "vit_t_em_organelles" in str(exc.value), exc.value
+    assert "no GPU was claimed" in str(exc.value), exc.value
+
+
+def test_an_AVAILABLE_type_does_NOT_raise():
+    """The control for the two above: a wiring that refused everything would
+    pass both of them."""
+    cls, inst = _entry_instance(
+        _FakeRuntime(
+            caps=["base_checkpoint_status"],
+            probe=lambda mt: status(
+                {"encoder": CACHED, "decoder": CACHED}, model_type=mt
+            ),
+        )
+    )
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
