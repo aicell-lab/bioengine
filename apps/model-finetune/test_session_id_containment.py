@@ -216,47 +216,118 @@ def test_every_path_helper_inherits_the_guard(root, helper):
         fn("../escaped")
 
 
+def _sessions_root_callers(module_file: str) -> set:
+    """Every function that CALLS `sessions_root`, read from the syntax tree.
+
+    AST rather than text, and that is a repair rather than a style choice: the
+    line-matching version counted a DOCSTRING that mentions `sessions_root()`
+    in prose as a call site, so it reported four where three existed and would
+    have misfired on any new docstring that named the function. A scan matches
+    the shape you wrote, not the thing you meant.
+    """
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(module_file).read_text())
+    callers = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "sessions_root"
+            ):
+                callers.add(node.name)
+    return callers
+
+
+#: The ONLY functions allowed to reach the sessions root directly. Named rather
+#: than counted: a count says "three" and tolerates any three, while a set says
+#: WHICH three and reddens when a fourth appears or one moves.
+SESSIONS_ROOT_CALLERS = {
+    # builds every session path, and validates the id before it does
+    "session_dir",
+    # iterates the root to list what is there, and validates nothing because
+    # it validates nothing it hands out -- see its own skipped-name handling
+    "list_sessions",
+    # probes that the root accepts a WRITE. It has to read the root to write
+    # in it, and it deliberately does not build a session path: a health check
+    # that created a session directory would be a side effect on every probe.
+    "assert_sessions_root_writable",
+}
+
+
 def test_no_path_helper_bypasses_the_chokepoint():
     """A structural guard. If a new helper builds on `sessions_root()` directly
     it will not be validated, and that is invisible in a behavioural test."""
-    import pathlib
-
-    src = pathlib.Path(training.__file__).read_text()
-    uses = [
-        line.strip()
-        for line in src.splitlines()
-        if "sessions_root()" in line and not line.strip().startswith("#")
-        # the DEFINITION is not a use -- counting it is how this test came to
-        # allow 3 when only 2 call sites exist, which tolerated exactly the
-        # extra call site it is supposed to catch
-        and not line.strip().startswith("def sessions_root")
-    ]
-    # EXACT, not an upper bound, for that same reason.
-    assert uses == ["root = sessions_root()", "root = sessions_root()"], (
-        f"expected exactly 2 call sites for sessions_root() -- one in session_dir, "
-        f"one in the listing that iterates the root -- and found {len(uses)}: "
-        f"{uses}. A new caller may be building a session path without going "
-        "through session_dir. If it is legitimate, change this assertion "
-        "deliberately rather than relaxing it."
+    callers = _sessions_root_callers(training.__file__)
+    assert callers == SESSIONS_ROOT_CALLERS, (
+        f"the set of functions calling sessions_root() changed: "
+        f"unexpected {sorted(callers - SESSIONS_ROOT_CALLERS)}, "
+        f"missing {sorted(SESSIONS_ROOT_CALLERS - callers)}. A new caller may "
+        "be building a session path without going through session_dir. If it "
+        "is legitimate, add it to SESSIONS_ROOT_CALLERS deliberately, with a "
+        "line saying why it may reach the root."
     )
 
 
 def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch):
     """The control for the structural test above, which reads a file and so can
-    silently measure the wrong thing. Point it at a module that really does have
-    a third call site and it must complain."""
+    silently measure the wrong thing. Point it at a module that really does
+    have an unlisted caller and it must complain."""
     import pathlib
 
     fake = tmp_path / "fake_training.py"
     fake.write_text(
         "def sessions_root():\n    pass\n"
-        "root = sessions_root()\n"
-        "root = sessions_root()\n"
-        "sneaky = sessions_root() / 'x'\n"
+        "def session_dir(sid):\n    root = sessions_root()\n"
+        "def list_sessions(ctx):\n    root = sessions_root()\n"
+        "def assert_sessions_root_writable():\n    root = sessions_root()\n"
+        "def sneaky(sid):\n    return sessions_root() / sid\n"
     )
     monkeypatch.setattr(training, "__file__", str(fake))
     with pytest.raises(AssertionError):
         test_no_path_helper_bypasses_the_chokepoint()
+
+
+def test_the_guard_PASSES_on_exactly_the_allowed_set(tmp_path, monkeypatch):
+    """The other half of the control, and the one the old version lacked: a
+    module with exactly the allowed callers must PASS. Without it, a guard that
+    refused everything would satisfy the test above and look like coverage."""
+    import pathlib
+
+    fake = tmp_path / "ok_training.py"
+    fake.write_text(
+        "def sessions_root():\n    pass\n"
+        "def session_dir(sid):\n    root = sessions_root()\n"
+        "def list_sessions(ctx):\n    root = sessions_root()\n"
+        "def assert_sessions_root_writable():\n    root = sessions_root()\n"
+    )
+    monkeypatch.setattr(training, "__file__", str(fake))
+    test_no_path_helper_bypasses_the_chokepoint()
+
+
+def test_a_DOCSTRING_mentioning_the_function_is_not_a_call_site(tmp_path, monkeypatch):
+    """The defect the line-matching version had, pinned so it cannot return.
+
+    It counted prose. A module whose docstring names `sessions_root()` and
+    whose callers are exactly the allowed set must pass.
+    """
+    fake = tmp_path / "doc_training.py"
+    fake.write_text(
+        '"""A module whose prose mentions sessions_root() twice.\n\n'
+        'Calling sessions_root() is the subject of this sentence.\n"""\n'
+        "def sessions_root():\n    pass\n"
+        "def session_dir(sid):\n    root = sessions_root()\n"
+        "def list_sessions(ctx):\n    root = sessions_root()\n"
+        "def assert_sessions_root_writable():\n"
+        '    """Mentions sessions_root() in its own docstring too."""\n'
+        "    root = sessions_root()\n"
+    )
+    monkeypatch.setattr(training, "__file__", str(fake))
+    test_no_path_helper_bypasses_the_chokepoint()
 
 
 # ── reads refuse too, and the status reader does not swallow it ──────────────
