@@ -62,7 +62,8 @@ CACHE_DIR_ENV = "MICROSAM_CACHEDIR"
 #: The keys of :func:`seed_plan` that are DISJOINT buckets and whose union is
 #: exactly what was asked for. Named so a caller can assert that property
 #: without having to know which of the plan's keys are buckets -- the plan also
-#: carries `provenance_unverified`, which deliberately OVERLAPS `ok`.
+#: carries `provenance_unverified`, which CROSSES the buckets: see `seed_plan`
+#: for why it is not tied to `ok` and not tied to the waiver.
 SEED_PLAN_BUCKETS = (
     "ok",
     "place",
@@ -425,15 +426,29 @@ def seed_plan(
     named in :data:`SEED_PLAN_BUCKETS`, so that assertion does not have to know
     which of the plan's keys are buckets.
 
-    **``provenance_unverified`` is NOT one of them.** It lists the members whose
-    provenance leg could not be computed -- `xxhash` absent, with the waiver
-    passed -- and it deliberately OVERLAPS `ok`: such a member is in `ok`,
-    because nothing it was checked against disagreed, and in here, because what
-    was checked was integrity alone. A review found this one level up from where
-    it started: a bool could not say "matched, but only on integrity", and then
-    neither could the plan, so a caller logging the plan showed a verified
-    mirror where one leg had been skipped. It is empty whenever the waiver is
-    not passed, since without it such a member raises instead.
+    **``provenance_unverified`` is NOT one of them.** It lists every member
+    whose provenance leg could not be computed here -- `xxhash` absent -- and it
+    CROSSES the buckets rather than belonging to one. A review found the need
+    for it one level up from where it started: a bool could not say "matched,
+    but only on integrity", and then neither could the plan, so a caller logging
+    the plan showed a verified mirror where one leg had been skipped.
+
+    Two corrections to what this docstring used to claim, both measured by a
+    review and both wrong in the same direction -- they understated when the
+    field is populated:
+
+    * it does NOT overlap `ok` alone. A member whose sha256 MISMATCHES is
+      reported as a mismatch without the waiver being needed, because a
+      mismatch is decidable without the missing hasher -- so it lands in
+      `replace` or `corrupt_unavailable` AND in here, since its xxh128 really
+      was not checked;
+    * it is NOT empty without the waiver. Without the waiver a member that
+      matched everything checkable raises, so it never reaches a bucket; but a
+      MISMATCHED member returns normally, and its skipped leg is recorded.
+
+    The rule, stated once: this field answers "was any recorded digest left
+    uncomputed for this member", for every member that reached a bucket at all.
+    It is independent of which bucket, and independent of the waiver.
 
     *allow_unverified_provenance* is passed straight through to
     :func:`verify_member`. It has to exist here because planning happens in the

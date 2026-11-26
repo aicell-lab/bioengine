@@ -619,3 +619,57 @@ def test_the_PLAN_records_NO_skip_when_everything_was_fully_checked(tmp_path):
 
     assert plan["ok"] == [GENERALIST], plan
     assert plan["provenance_unverified"] == [], plan
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_provenance_unverified_is_recorded_for_a_MISMATCH_too_and_WITHOUT_the_waiver(
+    tmp_path,
+):
+    """The contract, pinned in the direction the docstring had wrong.
+
+    A review measured that `provenance_unverified` is populated for any member
+    whose provenance leg could not be computed -- including a MISMATCHED one,
+    and without the waiver, because a mismatch returns normally rather than
+    raising. The docstring claimed it overlapped `ok` alone and was empty
+    without the waiver; both were false, and nothing pinned either reading.
+
+    The behaviour is the right one: the xxh128 genuinely was not checked,
+    whatever the sha256 said. So the test pins the behaviour and the docstring
+    was corrected to match it, not the other way round.
+    """
+    _write(tmp_path, GENERALIST, b"the wrong bytes")
+    wanted = {
+        GENERALIST: {
+            "xxh128": "a" * 32,
+            "sha256": _d(b"some other bytes", "sha256").split(":", 1)[1],
+        }
+    }
+
+    mirrored = cm.seed_plan(tmp_path, wanted, available=[GENERALIST])
+    assert mirrored["replace"] == [GENERALIST], mirrored
+    assert mirrored["provenance_unverified"] == [GENERALIST], mirrored
+
+    cold = cm.seed_plan(tmp_path, wanted, available=[])
+    assert cold["corrupt_unavailable"] == [GENERALIST], cold
+    assert cold["provenance_unverified"] == [GENERALIST], cold
+
+
+def test_provenance_unverified_is_EMPTY_when_every_digest_WAS_computed(tmp_path):
+    """THE CONTROL, and it must hold in both environments.
+
+    A field populated for every member says nothing. This is the case where
+    every recorded digest was computed -- one algorithm, present locally -- so
+    nothing was skipped and the field has to be empty.
+    """
+    data = b"a" * 4096
+    _write(tmp_path, GENERALIST, data)
+    _write(tmp_path, PLAIN, b"wrong bytes entirely")
+    wanted = {GENERALIST: _d(data), PLAIN: _d(b"the right bytes")}
+
+    plan = cm.seed_plan(tmp_path, wanted, available=[GENERALIST, PLAIN])
+
+    assert plan["ok"] == [GENERALIST], plan
+    assert plan["replace"] == [PLAIN], plan
+    assert plan["provenance_unverified"] == [], plan
