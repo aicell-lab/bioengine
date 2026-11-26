@@ -19,14 +19,17 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import time
+import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -285,6 +288,13 @@ IMAGE_STATE_REMOTE = "remote"
 # never be read as if it were an image.
 _IMAGE_MANIFEST_NAME = IMAGE_MANIFEST_PATH.split("/")[-1]
 
+# Derived from the manifest path rather than written out again, so the directory
+# an image path is built from and the directory the manifest lives in cannot
+# drift apart. A marker records a full path (`images/<name>`) and the listing
+# yields bare names, so something has to join them; doing it from one constant
+# is what keeps the two sides of that comparison in agreement.
+IMAGE_DIR = IMAGE_MANIFEST_PATH.rsplit("/", 1)[0]
+
 
 def local_image_entry(
     name: str, dims: Optional[List[int]] = None, **extra: Any
@@ -370,7 +380,20 @@ def build_image_manifest(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
 
 def image_names_from_listing(entries: List[Any]) -> List[str]:
     """Image filenames out of a ``list_files("images")`` result: no
-    directories, and never the manifest itself."""
+    directories, and never the manifest itself.
+
+    **The withholding is NOT applied here, and it used to be.** This function
+    answers "what files are in ``images/``", which is a fact about the store;
+    whether a file may be treated as a dataset image is a different question,
+    and :func:`merge_image_manifest` now answers it in one place. A review
+    measured what splitting it cost: the withheld set was passed at the two
+    READ call sites and omitted at the two manifest WRITERS, so a manager
+    running `sync_image_manifest` -- or importing a remote image -- during
+    somebody's open upload recorded that upload as a permanent dataset image
+    and committed it. Nothing in the signature made the omission visible,
+    because an optional argument that changes correctness reads as a tuning
+    knob.
+    """
     names = []
     for entry in entries:
         name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
@@ -389,6 +412,8 @@ def merge_image_manifest(
     listing_names: List[str],
     dims: Optional[Dict[str, List[int]]] = None,
     prune: bool = False,
+    *,
+    withheld_paths: Any,
 ) -> tuple:
     """Reconcile *stored* entries against the ``images/`` listing.
 
@@ -399,8 +424,34 @@ def merge_image_manifest(
     ``a.tif``) collapse to a single entry, the alphabetically last. Before
     0.10.0 they produced two identical-stem rows in the index, which no
     caller handled sensibly.
+
+    **``withheld_paths`` is REQUIRED and has no default**, which is the point
+    of it rather than an inconvenience. It holds artifact paths
+    (``images/<name>``) belonging to uploads that have not been finished -- see
+    :func:`withheld_upload_paths` -- and it governs BOTH halves of this
+    reconciliation, in opposite directions:
+
+    * a withheld name is never ADDED. A PUT object becomes a dataset image
+      through this function, so an upload that was never finished would
+      otherwise be an image with no size check ever applied to it;
+    * a withheld path is treated as PRESENT when pruning, so a stored entry on
+      that path is never DROPPED while an upload to it is open.
+
+    Both are needed and neither implies the other, which is exactly how the
+    defect arose: the rule used to live in :func:`image_names_from_listing`,
+    where it could only express the first half, so the pruning writer could not
+    use it -- and the two manifest writers therefore passed NO withheld set at
+    all. A review measured the consequence: one `sync_image_manifest` during
+    somebody's open upload wrote that upload into the stored manifest and
+    committed it, making an unchecked object a permanent image, which the
+    expiry sweep then deleted and left a dangling entry behind.
+
+    Required rather than defaulted because an omission here is silent and
+    changes correctness. A caller that has nothing withheld says so with
+    ``frozenset()``; a caller that forgot gets a `TypeError`.
     """
     dims = dims or {}
+    withheld = frozenset(withheld_paths or ())
     entries = {stem: dict(entry) for stem, entry in stored.items()}
     changed = False
 
@@ -411,6 +462,13 @@ def merge_image_manifest(
     }
     for name in sorted(listing_names):
         if name in covered:
+            continue
+        if f"{IMAGE_DIR}/{name}" in withheld:
+            # NEVER ADDED. The object is at `images/<name>` and the listing
+            # reports it, but no finishing call has vouched for it, so nothing
+            # has checked its size or its signature. Keyed by full path rather
+            # than by name because that is what a marker records; re-deriving
+            # it would be a second place for the two to disagree.
             continue
         stem = Path(name).stem
         if not stem:
@@ -442,6 +500,14 @@ def merge_image_manifest(
         for stem in list(entries):
             entry = entries[stem]
             if entry.get("state") != IMAGE_STATE_LOCAL:
+                continue
+            if entry.get("path", "") in withheld:
+                # TREATED AS PRESENT, the opposite direction from the add
+                # above, and the reason this set is passed here rather than
+                # filtered out of `listing_names` before the call. A filtered
+                # list would make a withheld path look ABSENT to this loop and
+                # drop a stored entry while an upload to it is open -- turning
+                # the fix for the writer into a different data loss.
                 continue
             if entry.get("path", "").split("/", 1)[-1] not in present:
                 del entries[stem]
@@ -1319,6 +1385,543 @@ def looks_like_tiff(header: bytes) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Direct upload of one local image
+#
+# A browser without the File System Access API cannot mount a folder, and the
+# mounted folder is what registers the data-provider service every other
+# upload route goes through. Such a browser therefore had no way to put a
+# local image into a dataset at all. These rules exist so an image that
+# arrives by presigned PUT is indistinguishable, afterwards, from one that
+# arrived through a mount: the object lands at ``images/<stem><ext>``, and the
+# manifest entry is then produced by the ordinary listing reconciliation
+# rather than written by the upload path.
+#
+# The extension list is the one the frontend already applies when it reads a
+# mounted folder. It is restated HERE, server-side, deliberately: a presigned
+# PUT is handed to the client, so a rule that lives only in the client is a
+# suggestion. Before this there was no server-side format rule, because no
+# server-side upload route existed to need one.
+LOCAL_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+# Same ceiling as a materialisation: both end up as one object in the same
+# bucket, read by the same viewer, and there is no reason for two numbers.
+MAX_LOCAL_IMAGE_BYTES = MAX_MATERIALISE_BYTES
+
+
+def file_size_from_listing(entries: Any, name: str) -> Optional[int]:
+    """The stored size of *name* in a ``list_files`` result, or None.
+
+    MEASURED before this was written, because the whole enforcement rests on
+    it: a STAGED listing already reports the size of an object that has just
+    been PUT, with no commit and no download. On a staged artifact,
+    `list_files(..., stage=True)` returned
+    ``[{"type": "file", "name": "probe.bin", "size": 12345,
+    "last_modified": ...}]`` for a 12345-byte body — the exact length. So the
+    size can be read where the signature check already looks, rather than by
+    fetching the object.
+
+    None means "no size for that name here", which is not the same as "zero":
+    the file may be absent, or a store may not report sizes. The caller decides
+    what to do about it, and :func:`oversized_image_refusal` refuses rather
+    than waving it through.
+    """
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") != name:
+            continue
+        if entry.get("type") == "directory" or entry.get("is_dir"):
+            continue
+        size = entry.get("size")
+        # A bool is an int in Python and `True` would compare as 1. Rejected
+        # explicitly, because a store reporting a flag where a size belongs
+        # would otherwise read as a one-byte file.
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return None
+        return size
+    return None
+
+
+def oversized_image_refusal(
+    name: str, size: Optional[int], max_bytes: int
+) -> Optional[str]:
+    """A refusal naming BOTH the ceiling and the size found, or None to allow.
+
+    The ceiling was advertised to the client by the minting call and enforced
+    nowhere, so an object of any size that merely STARTED with the declared
+    format's signature became a dataset image. This is the enforcement.
+
+    An UNREADABLE size refuses too, and that direction is deliberate: the
+    alternative admits exactly the object the ceiling exists to keep out, and
+    it would do so silently. The refusal says which case it is, so a store that
+    stops reporting sizes is a loud failure rather than a quiet hole.
+
+    The boundary is INCLUSIVE: a file of exactly *max_bytes* is allowed, since
+    the number is advertised as a maximum and a client that honours it to the
+    byte must not be refused.
+    """
+    if size is None:
+        return (
+            f"The size of '{name}' could not be read, so the {max_bytes}-byte "
+            "limit cannot be checked. The upload was not accepted. Re-run with "
+            "done=False and PUT again; if this repeats, the store is not "
+            "reporting object sizes and the limit cannot be enforced."
+        )
+    if size > max_bytes:
+        return (
+            f"'{name}' is {size} bytes, over the {max_bytes}-byte limit for a "
+            "local image upload. It was not accepted. The limit is reported as "
+            "'max_bytes' by the call that mints the upload URL."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The upload marker: provenance for the discard
+# ---------------------------------------------------------------------------
+#
+# Discarding an object that is too big needs an answer to exactly one question
+# first: did THIS route put it there? Nothing readable in the store answers it.
+# Measured against the live artifact manager, an object that has just been PUT
+# into an open stage is returned by EVERY listing view there is -- `stage=True`,
+# `stage` unset, `stage=False`, `version="v0"` and `version="latest"` all listed
+# it. So the committed listing cannot distinguish "the caller uploaded this a
+# moment ago" from "this was already an image in the dataset", and a guard built
+# on that distinction does not merely fail to protect the pre-existing image: it
+# refuses every legitimate upload, because every legitimate upload also appears
+# in the committed view.
+#
+# So the route records the fact at the moment it creates it, instead of trying
+# to infer it afterwards. Minting an upload URL writes a marker OUTSIDE
+# `images/`; finishing requires one, and the marker is the only thing that
+# authorises touching the object. That bounds the discard to objects this route
+# minted -- and because the mint refuses a filename that is already an image, an
+# object with a marker is provably not a pre-existing image. The guarantee is
+# the conjunction of those two rules, so neither may be removed alone.
+
+UPLOAD_MARKER_DIR = ".uploads"
+UPLOAD_MARKER_VERSION = 1
+
+# An hour. Long enough that a slow client pushing the 64 MB ceiling over a poor
+# link is not refused in mid-flight, short enough that a crashed client's marker
+# does not sit in the artifact indefinitely.
+UPLOAD_MARKER_TTL_S = 3600.0
+
+# How many markers one sweep will REMOVE per call. Bounded so that a caller
+# cannot turn a mint into an unbounded series of deletions; the sweep is
+# housekeeping, and doing less of it per call is merely slower, never wrong --
+# the authorisation check treats an expired marker as no marker whether or not
+# it was ever swept, and the withholding holds a path until its object is gone.
+#
+# ⚠ THIS DOES NOT BOUND THE READ, and it used to. A review measured both ways
+# that cost: the finish consumed the markers for its path out of a capped list,
+# so a marker past the 50th entry -- including the finishing upload's own -- was
+# never seen and the fail-closed check passed on a list that did not contain it;
+# and the withholding was computed from the same capped list, so with more than
+# 50 markers in flight an unfinished upload past the cap was a dataset image
+# again. A cap on a read that a correctness decision depends on is not a bound,
+# it is a silent wrong answer. Both now read every marker; only the removals
+# below are capped.
+UPLOAD_MARKER_SWEEP_LIMIT = 50
+
+# How long a minted upload URL stays writable. Passed explicitly to `put_file`,
+# whose own default is an HOUR.
+#
+# WHY IT IS SHORT, AND WHAT IT DOES NOT FIX. The size check is point-in-time: it
+# reads the object once, when the upload is finished. The presigned URL stays
+# writable for its whole life and, under edit-staging, writes the same key the
+# image lives at -- so after a successful finish the client can PUT an oversized
+# body to the same URL and nothing checks it again. Measured in review: finish
+# 32 bytes, accepted; PUT 10,000 bytes to the same URL; the listing size became
+# 10,000. The enforcement point is the FINISH, and it is a statement about the
+# bytes at that moment, not a guarantee about the stored object forever.
+#
+# This app cannot close that without support from the storage service. What it
+# can do is bound the window, which is the whole purpose of this constant: five
+# minutes is ample for the 64 MB ceiling over a poor link while leaving far less
+# time than an hour in which the trick is available. Deliberately much shorter
+# than UPLOAD_MARKER_TTL_S above: the marker has to outlive the URL so that a
+# client whose PUT lands just before expiry can still finish.
+UPLOAD_URL_TTL_S = 300
+
+# Hex only, fixed length. A mint id is compared against the one in a stored
+# marker document, and a fixed charset keeps that comparison a comparison: an
+# id that could contain `/` or `..` must never be usable to aim anything, here
+# or in any future caller, so the shape is refused at the edge rather than
+# trusted because today's lookup happens not to use it as a filename.
+MINT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def new_mint_id() -> str:
+    """A fresh mint id: 32 lowercase hex characters, matching MINT_ID_RE."""
+    return uuid.uuid4().hex
+
+
+def upload_marker_path_for_object(object_path: Any) -> Optional[str]:
+    """``.uploads/<sha256(object_path)>.json``, or None if that is not a path.
+
+    **The marker is keyed by the OBJECT PATH, and it used to be keyed by the
+    mint id.** That is not a naming preference; it is what makes "one path, one
+    marker" a property of the store rather than something a scan has to
+    establish. A review measured what the mint-id keying cost, over four rounds:
+    two mints for one path left two marker files, so the finish had to find the
+    others by LISTING ``.uploads/`` and consuming every marker for its path --
+    and that listing is paginated, so every bound on it was a cap that decided
+    correctness. A short read let a duplicate marker survive, which withheld the
+    committed image and then had the sweep delete it; a bound tight enough to
+    terminate against a server that ignores ``offset`` refused valid uploads
+    once a few staged removals sat in the directory. With the path as the key
+    the second marker cannot exist: a re-mint OVERWRITES the one file, and the
+    finish reads and removes exactly that file, found by name, with no listing
+    in the path at all.
+
+    **The filename confers nothing.** Authorisation is unchanged and still comes
+    from the document -- it must name this exact path AND this exact mint id and
+    be unexpired (:func:`marker_authorises_discard`) -- so the hash is a lookup
+    key, not a credential. That is what answers the obvious objection to putting
+    the path in the name: a caller who can compute the digest of a path learns
+    nothing and gains nothing, because knowing which file to read is not
+    permission to use it. Hashing also means no caller-supplied character
+    reaches the filename, so the old mint-id charset rule is not weakened by
+    this: a path can hold ``/`` or ``..`` and its digest cannot.
+
+    **What a lost mint answer now gets, said plainly:** a fresh mint for the
+    same path replaces the marker, so a finish presenting the EARLIER mint id is
+    refused -- the mint id in the document no longer matches. That is correct
+    rather than unfortunate: the superseded URL and the live one write the same
+    key, so the bytes a stale finish would publish are whichever PUT landed
+    last, and nothing in the request says which. The refusal touches nothing,
+    the path stays withheld because the marker is still there, and a retry with
+    ``done=false`` mints again. Under the mint-id keying either id could finish,
+    which is exactly how two markers for one path arose.
+
+    None rather than a raise, for the reason the mint-id version gave: a path
+    this cannot key is answered by the same refusal as a path with no marker.
+    """
+    if not isinstance(object_path, str) or not object_path:
+        return None
+    digest = hashlib.sha256(object_path.encode("utf-8")).hexdigest()
+    return f"{UPLOAD_MARKER_DIR}/{digest}.json"
+
+
+def upload_marker_document(
+    *,
+    path: str,
+    mint_id: str,
+    max_bytes: int,
+    minted_at: float,
+    ttl_s: float = UPLOAD_MARKER_TTL_S,
+) -> Dict[str, Any]:
+    """The marker to store for one minted upload.
+
+    ``expires_at`` is an ABSOLUTE instant, written from the same clock that will
+    later be compared against it -- this app's own. That is the whole reason the
+    expiry is recorded at mint time rather than derived at read time from the
+    object's modification time: on the production NFS filer the server's clock
+    runs about 79 seconds ahead of the pods, measured, so `time.time()` compared
+    against a stored `st_mtime` or `last_modified` compares two different clocks.
+    A marker written a moment ago can then look stale, or dated in the future,
+    with nothing in either value saying which clock set it. Two stamps taken
+    from one clock cannot do that.
+    """
+    minted_at = float(minted_at)
+    return {
+        "marker_version": UPLOAD_MARKER_VERSION,
+        "mint_id": mint_id,
+        "path": path,
+        "max_bytes": int(max_bytes),
+        "minted_at": minted_at,
+        "expires_at": minted_at + float(ttl_s),
+    }
+
+
+def parse_upload_marker(doc: Any) -> Optional[Dict[str, Any]]:
+    """A stored marker as a validated record, or None if it cannot be used.
+
+    Fail-closed on every doubt. An unusable marker has to read as NO marker, so
+    that the route refuses and touches nothing, rather than authorising a
+    deletion on the strength of a document it does not understand.
+    """
+    # Mapping, not dict: a document that arrived over hypha-rpc is a `dotdict`,
+    # which is NOT a dict subclass, so `isinstance(doc, dict)` is False for it
+    # and the whole marker would read as unusable.
+    if not isinstance(doc, Mapping):
+        return None
+    if doc.get("marker_version") != UPLOAD_MARKER_VERSION:
+        return None
+    mint_id = doc.get("mint_id")
+    if not isinstance(mint_id, str) or not MINT_ID_RE.match(mint_id):
+        return None
+    path = doc.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    expires_at = doc.get("expires_at")
+    # A bool is an int in Python, so `True` would pass a numeric check and then
+    # compare as 1.0 -- an expiry in 1970, i.e. always stale.
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return None
+    max_bytes = doc.get("max_bytes")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        return None
+    if max_bytes <= 0:
+        return None
+    return {
+        "marker_version": UPLOAD_MARKER_VERSION,
+        "mint_id": mint_id,
+        "path": path,
+        "max_bytes": max_bytes,
+        "expires_at": float(expires_at),
+    }
+
+
+def upload_marker_is_expired(marker: Mapping, *, now: float) -> bool:
+    """True once *now* has passed the marker's OWN recorded expiry.
+
+    *now* must come from this app's clock -- the clock that wrote ``expires_at``.
+    Nothing in here reads a file time or a listing's ``last_modified``; see
+    :func:`upload_marker_document` for the measurement that forbids it.
+    """
+    return float(now) > float(marker["expires_at"])
+
+
+def marker_authorises_discard(
+    marker: Any, *, path: str, mint_id: str, now: float
+) -> bool:
+    """Whether this marker permits touching the object at *path*.
+
+    Every condition must hold: the marker parses, it was minted for exactly this
+    path, it is the marker for exactly this mint id, and it has not expired.
+
+    A false answer means the route refuses and leaves the object alone. That is
+    the behaviour this route had before any discard existed, and it is the safe
+    direction: an object no marker vouches for is an object whose provenance is
+    unknown, and the one thing the discard must never do is delete an image the
+    dataset already had.
+    """
+    parsed = parse_upload_marker(marker)
+    if parsed is None:
+        return False
+    if parsed["path"] != path:
+        return False
+    if parsed["mint_id"] != mint_id:
+        return False
+    return not upload_marker_is_expired(parsed, now=now)
+
+
+def expired_marker_removals(
+    markers: Any, *, now: float, limit: int = UPLOAD_MARKER_SWEEP_LIMIT
+) -> List[str]:
+    """Which marker paths the housekeeping sweep should remove.
+
+    *markers* is an iterable of ``(marker_path, document)`` pairs as read from
+    :data:`UPLOAD_MARKER_DIR`. A document that does not parse is swept too: it
+    authorises nothing, so it is litter, and leaving it would mean the only
+    thing that ever cleans it up is a human.
+
+    Returns at most *limit* paths, so a mint cannot turn into an unbounded
+    series of removals.
+    """
+    out: List[str] = []
+    for item in markers or []:
+        if len(out) >= max(0, int(limit)):
+            break
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        marker_path, doc = item
+        if not isinstance(marker_path, str) or not marker_path:
+            continue
+        parsed = parse_upload_marker(doc)
+        if parsed is None or upload_marker_is_expired(parsed, now=now):
+            out.append(marker_path)
+    return out
+
+
+def abandoned_upload_removals(
+    markers: Any, *, now: float, limit: int = UPLOAD_MARKER_SWEEP_LIMIT
+) -> List[tuple]:
+    """``(marker_path, object_path)`` for uploads abandoned without finishing.
+
+    The companion to :func:`expired_marker_removals`, and the reason it is a
+    separate function: sweeping the MARKER is tidiness, while sweeping the
+    OBJECT it vouches for is the enforcement. A caller that mints, PUTs an
+    oversized body and never finishes is not refused by the finishing check --
+    it never makes that call -- so the ceiling has to be applied to what the
+    abandonment leaves behind.
+
+    An EXPIRED marker is the warrant for deleting its object, and it is a good
+    warrant for exactly the reason the finish-time discard is safe: the marker
+    says this app minted that path for an upload that never completed, so the
+    object at it was never a dataset image. Nothing else is touched.
+
+    An UNPARSEABLE document is swept as litter by the sibling function but
+    yields NO object removal here -- it names no path, so there is nothing it
+    could authorise, and guessing one from the filename would be the one way
+    this sweep could delete an image the dataset already had.
+
+    Bounded by *limit* for the same reason as the sibling.
+    """
+    out: List[tuple] = []
+    for item in markers or []:
+        if len(out) >= max(0, int(limit)):
+            break
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        marker_path, doc = item
+        if not isinstance(marker_path, str) or not marker_path:
+            continue
+        parsed = parse_upload_marker(doc)
+        if parsed is None:
+            continue
+        if not upload_marker_is_expired(parsed, now=now):
+            continue
+        out.append((marker_path, parsed["path"]))
+    return out
+
+
+def withheld_upload_paths(markers: Any) -> frozenset:
+    """Object paths that must NOT be treated as dataset images yet.
+
+    Every marker that parses withholds its path -- **open or expired**. The
+    dataset's image list is built by unioning the stored manifest with a listing
+    of ``images/``, so an object that has merely been PUT appears as an image
+    whether or not the finishing call was ever made; withholding is what makes
+    the finish a gate rather than a formality.
+
+    **Expiry does not stop the withholding, and an earlier version of this was
+    wrong about that.** It withheld only unexpired markers, reasoning that an
+    expired one's object is about to be deleted by the sweep. A review measured
+    the gap: the sweep ran only at the END of a successful mint, which a mint of
+    the same name never reaches because the no-overwrite check answers
+    ``already`` first -- so on a dataset where nobody uploads anything else, the
+    object stayed an image indefinitely and the next commit from any route would
+    publish it. The gap was not bounded by anything.
+
+    What makes withholding-until-swept consistent is that the sweep now runs at
+    the START of a mint, before the no-overwrite check reads the listing. An
+    abandoned object is therefore deleted before that check can answer
+    ``already`` about it, so "the image list hides a file" and "a re-mint says
+    it already exists" can no longer both be true for the same path.
+
+    An unparseable marker withholds nothing: it names no path. A successful
+    finish removes THE marker for its path before committing, so a completed
+    image is never withheld -- that is what makes this safe, and it is why the
+    finish must fail closed if that removal fails. **"The" marker, singular, is
+    a property of the keying**: a marker's filename is the digest of its object
+    path, so a re-mint overwrites the one file rather than adding a second.
+    Before that, a finish had to find the duplicates by listing this directory,
+    and a listing it could not read in full left one open -- which withheld the
+    image it had just committed and then had the sweep delete it.
+    """
+    out = set()
+    for item in markers or []:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        _marker_path, doc = item
+        parsed = parse_upload_marker(doc)
+        if parsed is None:
+            continue
+        out.add(parsed["path"])
+    return frozenset(out)
+
+
+# `markers_for_path` USED TO BE HERE, and its removal is the point of the
+# path-keyed marker rather than a tidy-up. It answered "which marker files
+# record an upload of this object?", a question only a LISTING of `.uploads/`
+# can answer -- and the finish asked it, so the finish's correctness depended on
+# reading a paginated directory in full. Four review rounds went on that: a
+# short read left a duplicate marker, which withheld the committed image and had
+# the sweep delete it; a bound tight enough to terminate against a server that
+# ignores `offset` refused valid uploads once staged removals sat in the
+# directory. Keying the marker by its object path removes the question instead
+# of bounding the answer: there is one marker per path, its name is computable
+# from the path, and :func:`upload_marker_path_for_object` finds it without a
+# listing. The listing survives only in the two HOUSEKEEPING readers -- the
+# withholding, which is fail-open, and the sweep, which is best-effort -- where
+# reading less per call costs a later pass rather than a wrong answer.
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+
+
+def split_local_image_filename(filename: Any) -> tuple:
+    """``(stem, ext)`` for an uploadable local image, or raise.
+
+    The extension is lowercased so ``Scan.TIF`` and ``scan.tif`` land on one
+    rule, but the STEM keeps its case: it is the manifest key and the name
+    the user sees, and silently changing it would make the uploaded image a
+    different image from the one they picked.
+    """
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("An image filename is required.")
+    # Reject a path rather than taking its basename. A caller that sent
+    # "a/b.png" has a different idea of where this goes than the broker does,
+    # and quietly flattening it would store the image somewhere they do not
+    # expect under a stem they did not choose.
+    if "/" in filename or "\\" in filename:
+        raise ValueError(
+            f"'{filename}' is a path, not a filename; send only the final "
+            f"component."
+        )
+    dot = filename.rfind(".")
+    if dot <= 0:
+        raise ValueError(
+            f"'{filename}' has no extension; one of "
+            f"{', '.join(LOCAL_IMAGE_EXTS)} is required."
+        )
+    stem, ext = filename[:dot], filename[dot:].lower()
+    if ext not in LOCAL_IMAGE_EXTS:
+        raise ValueError(
+            f"'{ext}' is not a supported image format. Supported: "
+            f"{', '.join(LOCAL_IMAGE_EXTS)}."
+        )
+    if not is_valid_image_stem(stem):
+        raise ValueError(
+            f"'{stem}' is not a usable image name. Use letters, digits, "
+            f"dot, dash or underscore only."
+        )
+    return stem, ext
+
+
+def looks_like_png(header: bytes) -> bool:
+    """True if *header* starts like a PNG file."""
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        PNG_SIGNATURE
+    )
+
+
+def looks_like_jpeg(header: bytes) -> bool:
+    """True if *header* starts like a JPEG file."""
+    return isinstance(header, (bytes, bytearray)) and bytes(header).startswith(
+        JPEG_SIGNATURE
+    )
+
+
+def header_matches_ext(ext: str, header: bytes) -> bool:
+    """True if *header*'s signature agrees with the declared *ext*.
+
+    Checked because a presigned PUT reports success from S3, not from this
+    app: "the client says it uploaded a PNG" is not evidence that a PNG is
+    there. An error page or a truncated body stored under a .png name would
+    otherwise be recorded as a readable image.
+
+    An unknown extension is False rather than True. Reaching here with one
+    means ``split_local_image_filename`` has been bypassed, and the safe
+    reading of a rule that did not run is that it did not pass.
+    """
+    ext = (ext or "").lower()
+    if ext == ".png":
+        return looks_like_png(header)
+    if ext in (".jpg", ".jpeg"):
+        return looks_like_jpeg(header)
+    if ext in (".tif", ".tiff"):
+        return looks_like_tiff(header)
+    return False
+
+
 def embedding_path(stem: str, model_type: str) -> str:
     return f"embeddings/{stem}_{model_type}.npz"
 
@@ -1728,7 +2331,6 @@ PUBLIC_DATASET_FIELDS = (
     "name",
     "description",
     "image_count",
-    "owner_display",
 )
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -1761,19 +2363,27 @@ def iter_public_metadata(root: Optional[Path] = None) -> List[Dict[str, Any]]:
     return out
 
 
-def owner_display(metadata: Dict[str, Any]) -> Optional[str]:
-    """A display string for the owner that is NEVER an email address.
-
-    Broker metadata stores ``{"id", "email"}`` and nothing resembling a name,
-    so the id is the only non-email identifier available. When the id is
-    itself an address -- some logins record one -- there is nothing publishable
-    and this returns ``None`` rather than inventing something.
-    """
-    owner = metadata.get("owner") or {}
-    ident = owner.get("id")
-    if isinstance(ident, str) and ident and not _EMAIL_RE.search(ident):
-        return ident
-    return None
+# THE GALLERY CARD NAMES NO OWNER, and that is a decision rather than an
+# omission.
+#
+# An earlier version published the owner's id -- `github|…` -- on the grounds
+# that it is not an email address and that broker metadata holds nothing else.
+# Both halves were true and the conclusion was still wrong. The requirement for
+# this method is "no emails AND no user ids", and the id is a stable account
+# identifier for a named individual: the one measured on the live gallery was
+# the same id that holds the collection's `"*"` grant. Publishing it on a page
+# anyone can read is a smaller version of the exposure this gallery exists to
+# replace.
+#
+# What was never priced was the third option. A display name does not exist to
+# offer instead -- measured on the live artifact, `manifest.owner` is `{id,
+# email}` and `created_by` is the id, with nothing name-like anywhere -- so the
+# choice was only ever "an account id" or "no owner", and no owner is the one
+# that meets the requirement. The card loses a line; nobody loses an identifier.
+#
+# There is deliberately no `owner_display` helper left to call. A function that
+# returned `None` would be a slot for somebody to fill back in later with
+# whatever identifier is to hand, which is exactly how this field arrived.
 
 
 def public_dataset_entry(
@@ -1785,16 +2395,19 @@ def public_dataset_entry(
 ) -> Dict[str, Any]:
     """Project one public dataset down to its gallery card.
 
-    Every value is scrubbed for email addresses on the way out, not just the
-    owner field: ``name`` and ``description`` are free text an owner typed and
-    could contain one.
+    **No owner field** -- see the block comment above for why the card names
+    nobody. ``metadata`` is still the argument because it carries the
+    ``artifact_id``; nothing identifying is read out of it.
+
+    Every value is still scrubbed for email addresses on the way out, and that
+    is not redundant now the owner is gone: ``name`` and ``description`` are
+    free text an owner typed and either could contain an address.
     """
     entry = {
         "artifact_id": metadata.get("artifact_id"),
         "name": _scrub_emails(name),
         "description": _scrub_emails(description),
         "image_count": image_count,
-        "owner_display": _scrub_emails(owner_display(metadata)),
     }
     return {k: entry.get(k) for k in PUBLIC_DATASET_FIELDS}
 

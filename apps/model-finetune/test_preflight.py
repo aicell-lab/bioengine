@@ -13,6 +13,15 @@ check that it is *adaptive* — not merely that it changes pixels.
 
 Plain pytest, no network, no GPU, no Ray: the external sources are stubbed, so
 what is under test is the preflight logic rather than the BioImage Archive.
+
+Peak-to-peak is written ``np.ptp(arr)`` and not ``arr.ptp()`` on purpose. NumPy
+2.0 removed the ``ndarray.ptp`` method; the free function is the form that works
+on both majors. This app has runtimes on both — ``requirements-runtime.txt``
+holds NumPy at 2.x because micro-sam's ``python-elf`` requires it, while
+``requirements-runtime-cellpose.txt`` pins 1.26.4 — so the method form makes
+this file unrunnable in one of the app's own environments, and the
+``AttributeError`` it raises there reads like a defect in the code under test
+rather than a version mismatch in the harness. Do not "simplify" it back.
 """
 
 from __future__ import annotations
@@ -60,7 +69,7 @@ def test_clahe_raises_contrast_on_a_low_contrast_frame() -> None:
     out = entry._clahe_numpy(img)
 
     assert out.std() > img.std()
-    assert out.ptp() > img.ptp() * 1.4
+    assert np.ptp(out) > np.ptp(img) * 1.4
     assert out.dtype == np.uint8 and out.shape == img.shape
 
 
@@ -74,7 +83,7 @@ def test_clahe_leaves_a_flat_frame_flat() -> None:
     out = entry._clahe_numpy(flat)
 
     assert np.isfinite(out).all()
-    assert out.ptp() == 0
+    assert np.ptp(out) == 0
 
 
 def test_clahe_is_adaptive_not_one_global_curve() -> None:
@@ -111,7 +120,7 @@ def test_apply_clahe_rescales_a_non_uint8_frame() -> None:
     """BioImage Archive TIFFs are routinely uint16, and the histogram has 256 bins.
 
     The input is a row-major ramp, so the output must climb from dark to bright
-    without ever collapsing. Neither ``dtype == uint8`` nor ``ptp() > 0`` nor even
+    without ever collapsing. Neither ``dtype == uint8`` nor ``np.ptp(out) > 0`` nor even
     a first-row/last-row gap catches the failure that matters: casting uint16
     straight to uint8 truncates modulo 256, which still gives a full-range uint8
     frame with a brighter bottom — but one in which the ramp has been shredded
@@ -124,7 +133,7 @@ def test_apply_clahe_rescales_a_non_uint8_frame() -> None:
     out = entry._apply_clahe(img)
     row_means = out.mean(axis=1)
 
-    assert out.dtype == np.uint8 and out.ptp() > 0
+    assert out.dtype == np.uint8 and np.ptp(out) > 0
     assert np.diff(row_means).min() > -50
     assert row_means[0] < 30 and row_means[-1] > 200
 

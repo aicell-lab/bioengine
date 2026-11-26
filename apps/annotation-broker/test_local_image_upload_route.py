@@ -1,0 +1,337 @@
+"""The upload route itself, called for real — not just the rules it applies.
+
+`test_local_image_upload.py` covers the pure stem/format/signature rules. A
+review found that nothing covered the route's own no-overwrite check: removing
+that check entirely left all 31 of those tests passing, because they never call
+the method. These do.
+
+The check was also wrong, and in a way only a call could show. It read the
+saved `manifest.json` alone, but a dataset's image list is that manifest
+reconciled against the `images/` listing — which is precisely why this route
+can leave the manifest to the reconciliation, and therefore precisely why its
+own earlier uploads are absent from the manifest it was reading. A name already
+on disk read as free, and the mint handed out a URL that would overwrite it.
+
+The runtime stubs come from `test_broker_ngff`, deliberately: that module
+installs `bioengine`/`hypha_rpc` stubs unconditionally and then restores
+`sys.modules` exactly as it found it, with a long comment explaining why both
+halves matter. Re-implementing that here would be a second copy of subtle
+logic that is already right, and getting the restore wrong poisons every other
+app's suite in the same pytest process.
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+import broker_core as core
+from test_broker_ngff import bk
+
+
+ARTIFACT = "ws/ds"
+
+
+def _broker(monkeypatch, *, manifest=None, listing=None):
+    """A real `AnnotationBroker` with storage and role checks faked out.
+
+    Only the collaborators are replaced. `upload_local_image` itself is the
+    shipped method, so a change to its logic changes what these tests see.
+    """
+    b = bk.AnnotationBroker()
+    state = {
+        "minted": [],
+        "committed": 0,
+        "manifest": manifest or {},
+        "listing": listing or [],
+        # path -> document, for the upload markers the route writes at mint
+        # time and requires at finish time.
+        "markers": {},
+        "removed": [],
+    }
+
+    monkeypatch.setattr(b, "_canonical_id", lambda a: a)
+    monkeypatch.setattr(
+        b,
+        "_require_role",
+        lambda context, artifact_id, minimum: ({}, {"id": "u1"}, "manager"),
+    )
+
+    async def _read_json_file(_a, path, _default=None):
+        if path in state["markers"]:
+            return state["markers"][path]
+        if path.startswith(f"{core.UPLOAD_MARKER_DIR}/"):
+            return _default
+        return {
+            "manifest_version": core.IMAGE_MANIFEST_VERSION,
+            "images": state["manifest"],
+        }
+
+    async def _write_json_file(_a, path, data):
+        state["markers"][path] = data
+
+    async def _list_files_safe(_a, dir_path, stage=True):
+        if dir_path == core.UPLOAD_MARKER_DIR:
+            return [
+                {"name": p.split("/")[-1], "type": "file", "size": 1}
+                for p in sorted(state["markers"])
+            ]
+        # `listing` is the STAGED view: what is there after this request's PUT.
+        # It is returned for the committed view too, because MEASURED against
+        # the live artifact manager the two views are not different -- a
+        # just-PUT staged object is listed by `stage=True`, by `stage` unset, by
+        # `stage=False`, by `version="v0"` and by `version="latest"` alike. The
+        # earlier version of this fixture returned `[]` for the committed view,
+        # which modelled a distinction the store does not make and let a guard
+        # that would refuse every real upload pass its tests.
+        return state["listing"]
+
+    class _Am:
+        async def list_files(self, _a, dir_path=None, stage=True, limit=None, offset=0):
+            """The paginated surface BOTH the marker read and the image read use.
+
+            Present because the finish FAILS CLOSED on a listing it could not
+            read in full, and an `_Am` without this method made every finish
+            refuse through an AttributeError -- which is the fail-closed working,
+            but against a double rather than against the case it is for.
+
+            It serves ``images`` as well, and leaving that out was a real trap
+            rather than an omission: it answered ``[]`` for every directory but
+            the marker one, so once the route's image reads were paged this
+            double said the dataset had no images at all. Tests then failed on
+            `already: False` and on a size that could not be read -- both of
+            them the route behaving correctly about a listing the DOUBLE had
+            emptied. `state["listing"]` is the one source for images here, the
+            same value `_list_files_safe` above returns, so the two surfaces
+            cannot disagree.
+            """
+            if dir_path == core.UPLOAD_MARKER_DIR:
+                rows = [
+                    {"name": n.split("/")[-1], "type": "file"}
+                    for n in sorted(state["markers"])
+                ]
+            elif dir_path == "images":
+                rows = list(state["listing"])
+            else:
+                rows = []
+            start = int(offset or 0)
+            size = int(limit) if limit else len(rows)
+            return rows[start : start + size]
+
+        async def put_file(self, _a, file_path=None, expires_in=None):
+            # Accepted AND recorded: the route passes a short expiry on purpose,
+            # and a double that did not take the argument would turn that call
+            # into a TypeError rather than exercising it.
+            state["minted"].append(file_path)
+            state.setdefault("expires_in", []).append(expires_in)
+            return f"https://signed.invalid/{file_path}"
+
+        async def remove_file(self, artifact_id=None, file_path=None):
+            state["removed"].append(file_path)
+            state["markers"].pop(file_path, None)
+
+    async def _ensure_staged(_a, fn):
+        return await fn()
+
+    async def _commit(_a):
+        state["committed"] += 1
+
+    async def _object_head(_a, _path, _n):
+        return core.PNG_SIGNATURE
+
+    monkeypatch.setattr(b, "_read_json_file", _read_json_file)
+    monkeypatch.setattr(b, "_write_json_file", _write_json_file)
+    monkeypatch.setattr(b, "_list_files_safe", _list_files_safe)
+    monkeypatch.setattr(b, "_am", _Am())
+    monkeypatch.setattr(b, "_ensure_staged", _ensure_staged)
+    monkeypatch.setattr(b, "_commit_tolerating_pending_uploads", _commit)
+    monkeypatch.setattr(b, "_object_head", _object_head)
+    b._tstate = state
+    return b
+
+
+def _open_mint(b, path="images/scan01.png", *, ttl_s=core.UPLOAD_MARKER_TTL_S):
+    """Record an OPEN mint for *path*, exactly as the minting call leaves one.
+
+    Used by the tests that exercise the finishing half against a fixed listing,
+    where calling the real mint is impossible: that listing already contains the
+    object, so the mint would correctly answer `already: True` and hand out
+    nothing. The marker DOCUMENT is built by the shipped builder, so a change
+    to its shape reaches these tests; only its storage is faked, like every
+    other collaborator in this fixture.
+    """
+    mint_id = core.new_mint_id()
+    # Keyed by the OBJECT PATH, as the app keys it: the marker filename is the
+    # digest of the path and the mint id lives in the document. Keying this
+    # fixture by the mint id instead would record a marker the finish cannot
+    # find, which is a fixture that tests nothing.
+    b._tstate["markers"][core.upload_marker_path_for_object(path)] = (
+        core.upload_marker_document(
+            path=path,
+            mint_id=mint_id,
+            max_bytes=core.MAX_LOCAL_IMAGE_BYTES,
+            minted_at=time.time(),
+            ttl_s=ttl_s,
+        )
+    )
+    return mint_id
+
+
+# ── the defect the review found ─────────────────────────────────────────────
+
+
+async def test_a_file_ALREADY_IN_THE_LISTING_is_not_handed_an_overwriting_URL(
+    monkeypatch,
+):
+    """THE case. `images/scan01.png` on disk, manifest empty.
+
+    This route does not write the manifest, so its own earlier uploads are
+    never in it. Reading the manifest alone reported the name free and minted a
+    URL for that very path, so the second upload replaced the first image and
+    orphaned any annotations drawn on it.
+    """
+    b = _broker(
+        monkeypatch, manifest={}, listing=[{"name": "scan01.png", "type": "file"}]
+    )
+
+    out = await b.upload_local_image(ARTIFACT, "scan01.png")
+
+    assert out["already"] is True, out
+    assert "put_url" not in out, "a URL was minted for a name already on disk"
+    assert b._tstate["minted"] == [], b._tstate["minted"]
+
+
+async def test_the_SAME_STEM_under_a_different_extension_is_refused(monkeypatch):
+    """`scan01.tif` on disk, `scan01.png` uploaded.
+
+    The stem is the manifest key, so the two collapse into ONE entry. Depending
+    on which extension the reconciliation keeps, either the new image never
+    appears or it silently replaces the one the annotations belong to.
+    """
+    b = _broker(
+        monkeypatch, manifest={}, listing=[{"name": "scan01.tif", "type": "file"}]
+    )
+
+    out = await b.upload_local_image(ARTIFACT, "scan01.png")
+
+    assert out["already"] is True, out
+    assert b._tstate["minted"] == []
+
+
+async def test_a_name_in_the_MANIFEST_is_still_refused(monkeypatch):
+    """The half that already worked. Kept so a fix cannot trade one for the other."""
+    b = _broker(
+        monkeypatch,
+        manifest={"scan01": core.local_image_entry("scan01.png")},
+        listing=[],
+    )
+
+    out = await b.upload_local_image(ARTIFACT, "scan01.png")
+
+    assert out["already"] is True, out
+    assert b._tstate["minted"] == []
+
+
+async def test_A_FREE_NAME_STILL_GETS_A_URL(monkeypatch):
+    """THE CONTROL on all three refusals above.
+
+    A check that refused everything would satisfy them and make the route
+    useless. This is the case that must still work.
+    """
+    b = _broker(
+        monkeypatch,
+        manifest={"other": core.local_image_entry("other.png")},
+        listing=[{"name": "other.png", "type": "file"}],
+    )
+
+    out = await b.upload_local_image(ARTIFACT, "scan01.png")
+
+    assert out["already"] is False, out
+    assert out["path"] == "images/scan01.png"
+    assert out["put_url"].endswith("images/scan01.png")
+    assert out["max_bytes"] == core.MAX_LOCAL_IMAGE_BYTES
+    assert b._tstate["minted"] == ["images/scan01.png"]
+
+
+async def test_the_manifest_is_ignored_when_the_LISTING_disagrees_with_it(monkeypatch):
+    """Why the fix reconciles rather than reading either source alone.
+
+    A stem in the manifest whose file is gone is still 'taken' here: pruning is
+    the manifest writer's job, and treating it as free would hand out a URL
+    under a name readers may still be resolving.
+    """
+    b = _broker(
+        monkeypatch,
+        manifest={"scan01": core.local_image_entry("scan01.png")},
+        listing=[],  # the file is not there
+    )
+
+    out = await b.upload_local_image(ARTIFACT, "scan01.png")
+
+    assert out["already"] is True, out
+
+
+# ── the stale cache the review also found ──────────────────────────────────
+
+
+async def test_FINISHING_an_upload_drops_the_cached_image_list(monkeypatch):
+    """Otherwise the caller is told the upload succeeded and cannot see it.
+
+    Every other route that adds or removes an image refreshes this cache. This
+    one did not, so `get_dataset_index` could serve a list computed up to
+    `MANIFEST_CACHE_TTL_S` ago — without the image just uploaded.
+    """
+    # The listing carries the uploaded object WITH its size, which is what a
+    # staged listing really looks like after a PUT lands (measured: a staged
+    # listing reports `{"type": "file", "name": ..., "size": N, ...}`). It used
+    # to be `[]` here, which says the opposite -- that nothing was uploaded --
+    # and the finishing call now refuses that, correctly: see
+    # test_finishing_with_NOTHING_IN_THE_LISTING_is_refused below.
+    b = _broker(
+        monkeypatch,
+        manifest={},
+        listing=[{"name": "scan01.png", "type": "file", "size": 2048}],
+    )
+    b._image_manifest_cache[ARTIFACT] = (time.time(), {"stale": {}})
+
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+    )
+
+    assert out["committed"] is True
+    assert ARTIFACT not in b._image_manifest_cache, "the stale image list survived"
+    assert b._tstate["committed"] == 1
+
+
+async def test_finishing_still_REFUSES_bytes_that_are_not_the_declared_format(
+    monkeypatch,
+):
+    """The signature check must survive the cache fix, not be traded for it."""
+    # A listing with a plausible size, so this test measures the SIGNATURE
+    # check rather than tripping the size check that now runs before it.
+    b = _broker(
+        monkeypatch,
+        manifest={},
+        listing=[{"name": "scan01.png", "type": "file", "size": 2048}],
+    )
+
+    async def _bad_head(_a, _path, _n):
+        return b"<!DOCTYPE html>"[:8]
+
+    monkeypatch.setattr(b, "_object_head", _bad_head)
+
+    with pytest.raises(ValueError) as e:
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=_open_mint(b)
+        )
+
+    assert "not a PNG" in str(e.value)
+    assert b._tstate["committed"] == 0, "it committed despite refusing"
+    # Discarded now, where it used to be left staged. Same measured reason as
+    # the size refusal: the image list is built from the staged listing, so an
+    # object left at `images/scan01.png` becomes an image anyway and the refusal
+    # would have stopped only this route's own commit. Safe only because a
+    # marker vouches for the object -- which is why it moved with this change
+    # and not earlier.
+    assert "images/scan01.png" in b._tstate["removed"], b._tstate["removed"]
