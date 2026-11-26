@@ -53,7 +53,6 @@ import pytest
 from bioengine._app import replica_init
 from bioengine.apps.builder import AppBuilder
 
-
 # ─────────────────────────── leg 1: the builder ────────────────────────────
 
 
@@ -649,7 +648,9 @@ def test_the_timeout_message_CARRIES_the_errno_even_when_an_age_is_known(
 # properties written against the landed implementation.
 
 
-def test_a_claim_that_CANNOT_BE_CREATED_fails_loudly_naming_the_path(monkeypatch, tmp_path):
+def test_a_claim_that_CANNOT_BE_CREATED_fails_loudly_naming_the_path(
+    monkeypatch, tmp_path
+):
     """mkdir failing outright is not the same as a peer holding the claim.
 
     `FileExistsError` means wait; every other `OSError` from that mkdir means the store
@@ -749,10 +750,12 @@ def test_two_concurrent_replicas_NEVER_SYNC_AT_ONCE(monkeypatch, tmp_path):
     overlaps = [
         (a, b)
         for i, a in enumerate(spans)
-        for b in spans[i + 1:]
+        for b in spans[i + 1 :]
         if a[0] < b[1] and b[0] < a[1]
     ]
-    assert not overlaps, f"two syncs were in flight at once over one source/: {overlaps}"
+    assert (
+        not overlaps
+    ), f"two syncs were in flight at once over one source/: {overlaps}"
 
 
 def test_the_bootstrap_failure_message_POINTS_AT_THE_REAL_CAUSE():
@@ -772,7 +775,7 @@ def test_the_bootstrap_failure_message_POINTS_AT_THE_REAL_CAUSE():
     src = Path(replica_init.__file__).parent.parent.joinpath("__init__.py").read_text()
     i = src.find("replica source bootstrap failed")
     assert i != -1, "the bootstrap failure message is gone"
-    window = src[i:i + 900]
+    window = src[i : i + 900]
     # Keyword presence is NOT the property. A message saying "HOME and TMPDIR may NOT be
     # set" contains every keyword while asserting the OPPOSITE of the clause, and passed.
     # So require the message to REPORT the values it is talking about: it cannot make a
@@ -790,6 +793,6 @@ def test_the_bootstrap_failure_message_POINTS_AT_THE_REAL_CAUSE():
         "eventual read-only write"
     )
     for forbidden in ("may NOT be set", "may not be set"):
-        assert forbidden not in window, (
-            f"the message now says {forbidden!r}, the opposite of what the setup does"
-        )
+        assert (
+            forbidden not in window
+        ), f"the message now says {forbidden!r}, the opposite of what the setup does"
