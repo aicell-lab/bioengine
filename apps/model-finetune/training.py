@@ -991,6 +991,16 @@ DATASET_FIELD = "dataset_artifact_id"
 # This is the same narrowing `caller_is_workspace_admin` makes for workspace
 # grants, for the same reason, and a mutant that reads the wildcard turns the
 # public-dataset test red.
+#
+# Annotators hold "r+" and are deliberately NOT co-managers: a run's
+# collaborators are its dataset's MANAGERS, and the page draws the same line
+# (`role === 'owner' || role === 'manager'`). "r+" lets someone add annotations
+# to a dataset; it is not authority over models trained from it. Requiring
+# exactly "*" is what enforces that, so there is no second constant listing the
+# permissions that do NOT confer management -- an enumeration of the rejected
+# values would be a second place for the rule to live, and the wrong one to
+# trust, since a new Hypha permission string absent from it would read as a
+# manager.
 DATASET_MANAGER_PERMISSION = "*"
 
 
@@ -1203,6 +1213,126 @@ def run_names_on_disk() -> "tuple[List[str], List[str]]":
     return names, skipped
 
 
+# What an operator is shown about somebody else's run.
+#
+# An ALLOW-LIST, not a list of things to strip. `redact_private` removes `owner`
+# and `owner_anonymous`, and an earlier version of this view used it and then
+# claimed "nothing about whose it is". That was false: the record also carries
+# `dataset_artifact_id`, and a dataset the caller manages lives in the caller's
+# own workspace, so its id names them as surely as the owner field does. The
+# free-text `label` is a second such channel, and the next field somebody adds
+# would be a third. A strip-list has to be right about every field that exists
+# now and every field added later; an allow-list only has to be right about what
+# an operator needs.
+#
+# What an operator needs is: which run, what state, how long, and on which
+# backend -- enough to decide whether to stop it.
+OPERATOR_FIELDS = (
+    "session_id",  # how an operator stops it; the mapping key is not enough
+    #               for a caller holding one record on its own
+    "status",
+    "start_time",
+    "updated_at",
+    "end_time",
+    "elapsed_s",
+    "model_type",
+    "backend",
+    "n_epochs",
+    "n_epochs_completed",
+    "terminated_by",
+)
+
+
+def quiet_seconds(record: Dict[str, Any]) -> float:
+    """How long since *record* was last written, by its own ``updated_at``.
+
+    Returns infinity when there is no usable timestamp, so a record with none
+    reads as maximally stale -- the safe direction for every caller here, all
+    of which use this to decide whether something has gone quiet.
+
+    It exists because the arithmetic was written inline in three places as
+    ``time.time() - record.get("updated_at", 0)``, which raises TypeError on a
+    non-numeric value and takes the whole read down with it. `get_status` is on
+    every run-reading path, so one malformed record would have made the run
+    listing, the status call and the operator view all raise rather than
+    skipping the bad record. Booleans are rejected explicitly: `True` is an
+    `int` to `isinstance` and would otherwise be read as a timestamp of 1.
+    """
+    stamped = record.get("updated_at")
+    if isinstance(stamped, bool) or not isinstance(stamped, (int, float)):
+        return float("inf")
+    return time.time() - stamped
+
+
+def operator_view(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a run record down to what an operator may see, plus staleness.
+
+    `stale` is the second half of this, and it exists because a non-terminal
+    status is NOT the same as a running process. `get_status` sweeps a run to
+    STOPPED when it has gone quiet, but only from PREPARING or TRAINING --
+    QUEUED is deliberately exempt, so a run that was QUEUED when its replica
+    restarted stays QUEUED for ever. That is exactly the outlived-its-process
+    case this view exists for, and without a staleness mark an operator reading
+    the list sees a busy worker that is in fact idle: the inverse of the
+    blindness being fixed. A record whose status cannot be read at all is in
+    the same position.
+
+    Marked rather than dropped. A stale QUEUED record may be a genuinely stuck
+    run that somebody needs to see, and hiding it would reproduce the original
+    complaint in a new place.
+    """
+    out = {k: status[k] for k in OPERATOR_FIELDS if k in status}
+    state = status.get("status")
+    # A non-numeric `updated_at` must not take the whole operator listing down
+    # with a TypeError. This view exists to stay readable when things are
+    # wrong, and the listing it sits in already promises that a junk directory
+    # does not break it. An unusable timestamp is treated as no timestamp,
+    # which reads as stale -- the safe direction for an operator.
+    quiet_for = quiet_seconds(status)
+    out["stale"] = bool(
+        state is None or state == "UNKNOWN" or quiet_for > STATUS_STALE_SECONDS
+    )
+    if out["stale"]:
+        out["stale_for_s"] = None if quiet_for == float("inf") else round(quiet_for, 1)
+    return out
+
+
+def non_terminal_runs() -> Dict[str, Dict[str, Any]]:
+    """Every run on this worker that has NOT finished, keyed by session id.
+
+    The OPERATOR question -- "what is this worker currently working on" -- which
+    the per-caller listing deliberately cannot answer. A run is returned to its
+    owner, to a manager of its dataset, or (ownerless only) to an administrator;
+    so a run started by a token-less caller whose connection has since closed is
+    visible to nobody, while still occupying the worker. This reports those by
+    LIFECYCLE rather than by ownership.
+
+    **Each record is projected through `operator_view`**, an allow-list of the
+    fields an operator needs, which is the whole point of it being a separate
+    function rather than a widened listing. Stripping the owner fields is not
+    enough on its own -- `dataset_artifact_id` names a workspace, and so names
+    its owner -- which is why this projects rather than redacts. Widening
+    `list_sessions` instead would hand every owned run to every administrator
+    and undo a privacy rule that has a test pinning it.
+
+    Read from the DISK, not from any in-memory task registry. A replica's
+    `_training_tasks` dict is empty after a restart, which would miss precisely
+    the run that outlived its process -- the case most worth catching.
+
+    Uses the one existing walk of the sessions root, so it adds no new way to
+    enumerate runs and no new I/O pattern.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name in run_names_on_disk()[0]:
+        try:
+            status = get_status(name, include_private=True)
+        except InvalidSessionId:
+            continue
+        if status.get("status") not in _TERMINAL:
+            out[name] = operator_view(status)
+    return out
+
+
 def require_caller_may_resume_run(
     session_id: str, context: Any, *, writable_datasets: Any = frozenset()
 ) -> None:
@@ -1390,7 +1520,7 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     # A run with no live thread that hasn't updated in a while is stale → stopped.
     if (
         st.get("status") in ("PREPARING", "TRAINING")
-        and time.time() - st.get("updated_at", 0) > STATUS_STALE_SECONDS
+        and quiet_seconds(st) > STATUS_STALE_SECONDS
     ):
         st["status"] = "STOPPED"
         st["message"] = "no status update within the stale window"
@@ -1597,7 +1727,7 @@ def get_export(export_id: str) -> Dict[str, Any]:
     if (
         rec
         and rec.get("status") in ("PENDING", "BUILDING")
-        and time.time() - rec.get("updated_at", 0) > STATUS_STALE_SECONDS
+        and quiet_seconds(rec) > STATUS_STALE_SECONDS
     ):
         rec["status"] = "FAILED"
         rec["message"] = "failed"

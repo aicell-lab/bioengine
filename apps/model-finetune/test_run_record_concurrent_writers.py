@@ -641,16 +641,44 @@ def test_the_HEARTBEAT_CALL_SITES_use_the_best_effort_helper():
     The helper is only worth having if the heartbeats call it, and the terminal
     writes do not. Read from the source, so moving a call to the wrong one
     fails here.
+
+    **Over the AST, not by splitting the text**, because the third call site is
+    a METHOD. Splitting on ``"\\ndef "`` ends a top-level function at the next
+    one and a method's body at the end of its whole class, so the same text
+    search that worked for the two module-level heartbeats would have read
+    hundreds of unrelated lines for `_preparing_heartbeat` -- and a search over
+    too much text passes for the wrong reason. `ast.get_source_segment` returns
+    exactly the function.
+
+    `entry._preparing_heartbeat` was the one that escaped: it kept calling the
+    raising `write_status` after the lock landed, and since it also covers the
+    whole QUEUED wait -- which can be hours -- a single contended write ended
+    the detached task and left a healthy run reporting itself stale.
     """
+    import ast
     import pathlib
 
     here = pathlib.Path(__file__).parent
+
+    def body_of(filename: str, fn: str) -> str:
+        src = (here / filename).read_text()
+        tree = ast.parse(src)
+        found = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn
+        ]
+        assert len(found) == 1, f"{filename}: {len(found)} definitions of {fn}"
+        seg = ast.get_source_segment(src, found[0])
+        assert seg, f"{filename}:{fn} source segment is empty"
+        return seg
+
     for name, fn in (
         ("train_worker.py", "_heartbeat"),
         ("train_worker_cellpose.py", "_heartbeat"),
+        ("entry.py", "_preparing_heartbeat"),
     ):
-        src = (here / name).read_text()
-        body = src.split(f"def {fn}(", 1)[1].split("\ndef ", 1)[0]
+        body = body_of(name, fn)
         assert "write_status_best_effort(" in body, f"{name}:{fn} does not use it"
         assert (
             "training.write_status(" not in body

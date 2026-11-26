@@ -1327,22 +1327,49 @@ class EntryApp:
     async def _preparing_heartbeat(
         self, session_id: str, interval: float = 60.0
     ) -> None:
-        """Refresh status.json's ``updated_at`` while a run is still PREPARING.
+        """Refresh status.json's ``updated_at`` while a run is PREPARING or QUEUED.
 
         Nothing between the PREPARING write and the runtime's TRAINING write
         reports progress — input resolution, a cold runtime replica coming up,
         the GPU lock — so on a cold instance that span can exceed
         STATUS_STALE_SECONDS and get_status sweeps a healthy run to STOPPED.
-        Exits as soon as the status moves on, so a wedged TRAINING run is still
-        swept; the worker's own heartbeat covers that phase.
+
+        **QUEUED is covered too, and that is not cosmetic.** The semaphore
+        caps concurrent trainings at one by default, so a second run waits here
+        for as long as the first one trains — routinely far longer than the
+        stale window. Nothing else refreshes the record in that phase, so
+        without this the operator listing marks a perfectly healthy queued run
+        as stale, i.e. "probably dead", and the obvious response to that is to
+        stop somebody's valid job. Covering QUEUED is what makes a stale QUEUED
+        record mean what it claims: the replica that was waiting is gone.
+
+        Exits as soon as the status moves beyond those two, so a wedged
+        TRAINING run is still swept; the worker's own heartbeat covers that
+        phase.
+
+        **BEST-EFFORT, like every other heartbeat**, and the raising
+        `write_status` here was a defect rather than a choice. The record lock
+        makes that function raise when the mutex cannot be taken or the record
+        will not parse, which is right for a terminal write and wrong for a
+        heartbeat -- so `write_status_best_effort` exists for exactly these call
+        sites. This one runs as a detached task, so an exception ends it
+        silently and nothing restarts it: `updated_at` stops advancing and the
+        run it was protecting is reported stale, which is the failure this
+        function exists to prevent, arrived at from the other side. Measured
+        with the mutex held and the wait shortened: the task ended with
+        `RunRecordLockTimeout` and the healthy QUEUED run then read
+        `stale: True`. The QUEUED span can be hours, so the window is wide.
         """
         import training
 
         while True:
             await asyncio.sleep(interval)
-            if training.read_status(session_id).get("status") != "PREPARING":
+            if training.read_status(session_id).get("status") not in (
+                "PREPARING",
+                "QUEUED",
+            ):
                 return
-            training.write_status(session_id)
+            training.write_status_best_effort(session_id)
 
     async def _run_training(
         self,
@@ -1413,7 +1440,10 @@ class EntryApp:
             # one replica, not two.
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
-            # so a session waiting here is not false-flagged STOPPED.
+            # so a session waiting here is not false-flagged STOPPED -- but the
+            # record still has to be refreshed while it waits, or the operator
+            # listing reports a healthy queued run as stale. That is what
+            # `_preparing_heartbeat` covers; it runs through this phase.
             if self._training_sem.locked():
                 training.write_status(
                     session_id,
@@ -2116,6 +2146,52 @@ class EntryApp:
             if training.caller_manages_dataset(permissions, context):
                 managed.add(artifact_id)
         return frozenset(managed)
+
+    @bioengine.method(context=True)
+    async def list_active_training_runs(self, context=None) -> Dict[str, Any]:
+        """Every UNFINISHED run on this worker, for an operator. Administrators only.
+
+        Answers the question the per-caller run listing deliberately cannot:
+        what is this worker currently working on. `list_training_sessions`
+        returns a run to its owner, to a manager of its dataset, or -- when it
+        has no owner -- to a `bioimage-io` administrator. A run started by a
+        caller who was not signed in therefore becomes invisible to everybody
+        once their connection closes, because Hypha mints that identity per
+        connection: the owner no longer exists to look, and the run is owned so
+        no administrator may list it. It keeps occupying the worker regardless.
+
+        **Each record is projected to an allow-list of operator fields** --
+        status, timings, backend and epoch counts -- rather than having its
+        owner fields stripped. An earlier version stripped `owner` and
+        `owner_anonymous` and claimed it said nothing about whose the run was;
+        that was false, because the record also carries `dataset_artifact_id`,
+        and a dataset its manager owns lives in that manager's own workspace,
+        so the id names them. The free-text label was a second such channel.
+        An allow-list has to be right only about what an operator needs; a
+        strip-list has to be right about every field anybody ever adds.
+
+        That is also why this is a separate call rather than a loosened
+        `list_training_sessions`: widening the administrator leg of that one
+        would hand every owned run to every administrator and undo a privacy
+        decision made on purpose, which a test pins.
+
+        **`stale` marks a record that is non-terminal but probably dead**, with
+        `stale_for_s` giving how long it has been quiet. A non-terminal status
+        is not a running process: the stale sweep in `get_status` only moves
+        PREPARING and TRAINING on, so a run that was QUEUED when its replica
+        restarted stays QUEUED for ever. Without the mark an operator would
+        read a busy worker that is in fact idle. Stale records are marked, not
+        hidden, because one of them may be a genuinely stuck run.
+
+        Returns `{}` for anyone who is not a `bioimage-io` administrator --
+        refusing rather than raising, because an operator surface should not
+        become a way to probe whether anything is running at all.
+        """
+        import training
+
+        if not training.caller_is_workspace_admin(context):
+            return {}
+        return training.non_terminal_runs()
 
     @bioengine.method(context=True)
     async def stop_training(
