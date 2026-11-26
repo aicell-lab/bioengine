@@ -1087,10 +1087,31 @@ def _owner_or_comanager(
     artifact-manager round trip while this is synchronous and runs once per run.
     """
     owner = status.get("owner")
-    if isinstance(owner, str) and owner:
+    has_owner = isinstance(owner, str) and bool(owner)
+    if has_owner:
         caller = caller_identity(context).get("owner")
         if caller is not None and caller == owner:
             return True
+    # THE CO-MANAGER LEG REQUIRES THE RUN TO HAVE AN OWNER, and without this
+    # line it did not. A run with no recorded owner on a dataset the caller
+    # manages returned True here, which made an OWNERLESS run visible to a
+    # co-manager and resumable by one.
+    #
+    # Two things said that is wrong, and they agreed with each other before the
+    # code did. The lead's ruling on this row: the widening applies to OWNED
+    # runs only -- a co-manager sees the runs of other MANAGERS on that
+    # dataset -- and ownerless runs stay admin-only. And the shipped README
+    # already said "resuming an ownerless run requires `rw`/admin on
+    # `bioimage-io`, because with no recorded owner there is nobody for the
+    # ownership check to match you against".
+    #
+    # So the rule is not "a manager of the dataset may act on anything filed
+    # under it": it is "a manager may act on a COLLEAGUE's run", and an
+    # ownerless run has no colleague. The administrator leg in each caller --
+    # `caller_may_see_run`, `caller_may_resume_run` -- is what reaches those,
+    # and it is deliberately not widened here.
+    if not has_owner:
+        return False
     dataset = status.get(DATASET_FIELD)
     if isinstance(dataset, str) and dataset and dataset in writable_datasets:
         return True
