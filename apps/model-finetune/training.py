@@ -286,9 +286,19 @@ def base_checkpoint_refusal(model_type: Any, status: Any) -> Optional[str]:
             continue
         if info.get("reachable") is True:
             continue
-        where = "not cached here and not reachable from here"
-        if not info.get("url"):
+        # AN EXPLICIT REASON WINS over anything derived from the fields. A
+        # caller that already knows WHY a part is unobtainable -- a probe that
+        # timed out, say -- must be able to say so, because the derived text
+        # would otherwise describe the wrong thing entirely: a part with no URL
+        # reads as "micro-sam publishes no URL for it", which sends a reader to
+        # the registry when the real trouble is this site's network.
+        reason = info.get("reason")
+        if isinstance(reason, str) and reason:
+            where = reason
+        elif not info.get("url"):
             where = "not cached here and micro-sam publishes no URL for it"
+        else:
+            where = "not cached here and not reachable from here"
         missing.append(f"{name} ({where})")
     if not missing:
         return None

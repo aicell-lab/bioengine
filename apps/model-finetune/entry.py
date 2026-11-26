@@ -764,10 +764,23 @@ class EntryApp:
             status = {
                 "model_type": model_type,
                 "parts": {
-                    "encoder": {"cached": False, "reachable": False, "url": None},
+                    "the weights": {
+                        "cached": False,
+                        "reachable": False,
+                        "url": None,
+                        # SAID EXPLICITLY, because the derived sentence would be
+                        # a falsehood: a part with no URL renders as "micro-sam
+                        # publishes no URL for it", which points a reader at the
+                        # registry when what actually happened is that this site
+                        # could not get an answer in time.
+                        "reason": (
+                            "the availability check did not answer within "
+                            f"{BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S:g}s, so the "
+                            "weights are treated as unobtainable here"
+                        ),
+                    },
                 },
                 "probe_error": None,
-                "timed_out_after_s": BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
             }
         except Exception as exc:
             status = {"model_type": model_type, "parts": {},

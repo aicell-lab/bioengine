@@ -453,3 +453,141 @@ def test_an_AVAILABLE_type_does_NOT_raise():
         )
     )
     asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+
+
+# ── the guard must be WIRED to the real runtime, not just to a fake ─────────
+
+
+def test_the_REAL_runtime_ADVERTISES_the_probe():
+    """Every wiring test above builds a fake whose capabilities IT supplies, so
+    none of them notices if the real runtime stops advertising the probe.
+
+    A review measured the hole: setting `RUNTIME_CAPABILITIES = ()` left the
+    whole suite byte-identically green while every micro-sam `start_training`
+    silently took the "older runtime" skip and failed late again — the exact
+    behaviour this guard exists to remove, switched off by a one-line edit.
+
+    Renaming the method without updating the string, refactoring the tuple, or
+    a `ping` rewrite that drops the key would all do the same.
+    """
+    import runtime
+
+    cls = _runtime_cls()
+    app = object.__new__(cls)
+    app._loaded_model_type = None
+    app._gpu_lock = asyncio.Lock()
+    app.start_time = time.time()
+    pong = asyncio.run(cls.ping(app))
+    caps = pong.get("capabilities")
+    assert caps, f"ping advertises no capabilities at all: {pong}"
+    assert "base_checkpoint_status" in caps, (
+        "the real runtime does not advertise base_checkpoint_status, so the "
+        f"entry takes the older-runtime skip and the guard is off: {caps}"
+    )
+
+
+def test_every_ADVERTISED_capability_is_a_REAL_method():
+    """The other direction of the same hole. A list that names a method which
+    does not exist would have the entry call something absent and refuse every
+    run — advertising is a promise, so it is checked against the class."""
+    cls = _runtime_cls()
+    import runtime
+
+    for name in runtime.RUNTIME_CAPABILITIES:
+        assert callable(getattr(cls, name, None)), (
+            f"ping advertises {name!r}, which is not a method on the runtime"
+        )
+
+
+def test_a_TIMED_OUT_probe_does_NOT_blame_micro_sam(monkeypatch):
+    """A review found this sentence was a falsehood.
+
+    The entry's timeout fallback used to build a part with `url: None`, and the
+    decision renders that as "micro-sam publishes no URL for it" — which sends
+    the reader to the registry when what actually happened is that THIS SITE
+    could not get an answer in time. The failure is in the network here, not in
+    micro-sam's publishing.
+    """
+    import entry
+
+    monkeypatch.setattr(entry, "BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S", 0.2)
+
+    async def _too_slow(*a, **k):
+        await asyncio.sleep(5)
+
+    class _Slow(_FakeRuntime):
+        def __getattr__(self, name):
+            if name == "base_checkpoint_status":
+                return _too_slow
+            return super().__getattr__(name)
+
+    cls, inst = _entry_instance(_Slow(caps=["base_checkpoint_status"], probe=None))
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(
+            cls._refuse_unavailable_base_checkpoint(inst, "vit_t_em_organelles")
+        )
+    msg = str(exc.value)
+    assert "vit_t_em_organelles" in msg, msg
+    assert "publishes no URL" not in msg, (
+        "a timeout is reported as micro-sam not publishing the weights, which "
+        f"points the reader at the wrong system entirely: {msg}"
+    )
+    assert "did not answer within" in msg, msg
+
+
+def test_start_training_REFUSES_WITHOUT_EVER_ASKING_FOR_THE_GPU(tmp_path, monkeypatch):
+    """Round-1 item (d): the behavioural form of the ordering pin.
+
+    The AST test asserts the CALL precedes the GPU gate in the source. This
+    asserts the consequence a caller actually feels: on an unavailable model
+    type, `_runtime_gpu_memory` is never awaited at all, so nothing queued for
+    a slot before being told no.
+    """
+    import entry
+    import training
+
+    monkeypatch.setattr(training, "sessions_root", lambda: tmp_path)
+    monkeypatch.setattr(training, "session_dir", lambda sid: tmp_path / sid)
+
+    cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
+    inst = object.__new__(cls)
+    inst._enabled_backends = {"microsam", "cellpose"}
+    import logging
+
+    inst.logger = logging.getLogger("test-entry")
+    inst.runtime = _FakeRuntime(
+        caps=["base_checkpoint_status"],
+        probe=lambda mt: status({"encoder": UNREACHABLE}, model_type=mt),
+    )
+
+    asked = []
+
+    async def _async_none(*a, **k):
+        return None
+
+    async def _async_pool(*a, **k):
+        return None, None
+
+    async def _gpu(*a, **k):
+        asked.append(1)
+        return {"available": False}
+
+    inst._check_runtime_available = _async_none
+    inst._resolve_pool_init = _async_pool
+    inst._runtime_gpu_memory = _gpu
+
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(
+            cls.start_training(
+                inst,
+                train_images=[],
+                train_labels=[],
+                model_type="vit_t_em_organelles",
+                context={"user": {"id": "u1", "is_anonymous": False}},
+            )
+        )
+    assert "vit_t_em_organelles" in str(exc.value), exc.value
+    assert asked == [], (
+        "the GPU gate was asked even though the base checkpoint is "
+        "unavailable — the caller queued for a slot before being told no"
+    )
