@@ -297,8 +297,16 @@ def setup_replica_environment() -> None:
             "which version of the source to materialise."
         )
 
-    source = _ensure_source(app_dir, version, logger)
-
+    # Point HOME/TMPDIR at the per-app workspace BEFORE materialising the
+    # source. These four assignments are local and cheap; the source sync
+    # reaches the network and can fail. While the sync ran first, a failed
+    # sync returned through the caller's error path with HOME still pointing
+    # at the image's `/home/ray`, which is read-only in the published worker
+    # image — so the app's first write died with `OSError: [Errno 30]
+    # Read-only file system` and the real cause (a source sync that raised)
+    # was two steps removed from the symptom. Nothing is gained by deferring
+    # them behind the download, and a replica that cannot fetch its source is
+    # still better off with a writable HOME.
     home = app_dir / "home"
     tmp = app_dir / "tmp"
     home.mkdir(parents=True, exist_ok=True)
@@ -307,6 +315,8 @@ def setup_replica_environment() -> None:
     os.environ["TMPDIR"] = str(tmp)
     os.environ["TMP"] = str(tmp)
     os.environ["TEMP"] = str(tmp)
+
+    source = _ensure_source(app_dir, version, logger)
 
     src_str = str(source)
     if src_str not in sys.path:

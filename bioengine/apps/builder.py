@@ -264,11 +264,22 @@ class AppBuilder:
         The replica setup hook (``bioengine._app.replica_init``) reads
         ``BIOENGINE_APP_DIR`` + ``BIOENGINE_ARTIFACT_FILES_URL`` +
         ``BIOENGINE_ARTIFACT_VERSION`` + ``BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN``
-        from this dict to materialise the user source. HOME and TMPDIR are
-        deliberately *not* set here — the setup hook computes them under
-        ``BIOENGINE_APP_DIR`` so they survive app version bumps and stay
-        per-app-per-node (shared across replicas of the same app on the
-        same node by design; see :doc:`v0.11.4 release notes`).
+        from this dict to materialise the user source.
+
+        ``HOME`` and ``TMPDIR`` are set here *as well as* by the setup hook,
+        which computes the same paths under ``BIOENGINE_APP_DIR`` so they
+        survive app version bumps and stay per-app-per-node (shared across
+        replicas of the same app on the same node by design; see
+        :doc:`v0.11.4 release notes`). They used to be left to the hook
+        alone, which is not safe: Ray Serve does not honour
+        ``runtime_env.worker_process_setup_hook`` for its replicas, so the
+        hook is reached only through the ``sys.meta_path`` finder installed
+        in ``bioengine/__init__.py``. That finder fires on the first
+        *unresolved* import, at most once per process, and swallows its own
+        failures — so a replica whose imports all resolve, or whose source
+        sync raises, never got ``HOME`` and wrote to the image's read-only
+        ``/home/ray``. ``runtime_env`` env_vars are applied by Ray before any
+        user code imports, so this leg cannot be skipped.
         """
         env_vars: Dict[str, str] = {}
         env_vars.update(non_secret_env_vars)
@@ -288,6 +299,25 @@ class AppBuilder:
         app_dir_name = f"{worker_workspace}-{application_id}"
         app_dir = self.apps_workdir / app_dir_name
         env_vars["BIOENGINE_APP_DIR"] = str(app_dir)
+        # Must match the paths the setup hook computes, so a replica sees the
+        # same HOME whether or not the hook ran. See the docstring for why the
+        # hook alone is not enough.
+        env_vars["HOME"] = str(app_dir / "home")
+        env_vars["TMPDIR"] = str(app_dir / "tmp")
+        env_vars["TMP"] = env_vars["TMPDIR"]
+        env_vars["TEMP"] = env_vars["TMPDIR"]
+        # Create them from here too, so HOME exists even for a replica whose
+        # hook never fires. Best-effort: on a venue where the worker cannot
+        # write `apps_workdir` the replica side still creates them, and
+        # refusing the deploy over it would break deployments that work today.
+        for _path in (app_dir / "home", app_dir / "tmp"):
+            try:
+                _path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self.logger.warning(
+                    f"Could not pre-create {_path} for '{application_id}' "
+                    f"({exc}); the replica will have to create it itself."
+                )
 
         if self.server is not None:
             env_vars["HYPHA_SERVER_URL"] = self.server_url
