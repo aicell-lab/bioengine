@@ -378,25 +378,22 @@ def build_image_manifest(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def image_names_from_listing(
-    entries: List[Any], withheld_paths: Any = frozenset()
-) -> List[str]:
+def image_names_from_listing(entries: List[Any]) -> List[str]:
     """Image filenames out of a ``list_files("images")`` result: no
     directories, and never the manifest itself.
 
-    *withheld_paths* holds artifact paths (``images/<name>``) belonging to
-    uploads not yet completed -- see :func:`withheld_upload_paths`. A PUT
-    object becomes an image through THIS function, so an upload that was never
-    finished would otherwise be a dataset image with no check ever applied to
-    it. Keyed by full path rather than by name because that is what a marker
-    records, and re-deriving it here would be a second place for the two to
-    disagree.
-
-    Only the READ reconciliation passes a set here. The pruning write must not:
-    withholding a name on that path would let a manifest write delete a stored
-    entry while an upload to the same stem is open.
+    **The withholding is NOT applied here, and it used to be.** This function
+    answers "what files are in ``images/``", which is a fact about the store;
+    whether a file may be treated as a dataset image is a different question,
+    and :func:`merge_image_manifest` now answers it in one place. A review
+    measured what splitting it cost: the withheld set was passed at the two
+    READ call sites and omitted at the two manifest WRITERS, so a manager
+    running `sync_image_manifest` -- or importing a remote image -- during
+    somebody's open upload recorded that upload as a permanent dataset image
+    and committed it. Nothing in the signature made the omission visible,
+    because an optional argument that changes correctness reads as a tuning
+    knob.
     """
-    withheld = frozenset(withheld_paths or ())
     names = []
     for entry in entries:
         name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
@@ -405,8 +402,6 @@ def image_names_from_listing(
         if isinstance(entry, dict) and (
             entry.get("type") == "directory" or entry.get("is_dir")
         ):
-            continue
-        if f"{IMAGE_DIR}/{name}" in withheld:
             continue
         names.append(name)
     return names
@@ -417,6 +412,8 @@ def merge_image_manifest(
     listing_names: List[str],
     dims: Optional[Dict[str, List[int]]] = None,
     prune: bool = False,
+    *,
+    withheld_paths: Any,
 ) -> tuple:
     """Reconcile *stored* entries against the ``images/`` listing.
 
@@ -427,8 +424,34 @@ def merge_image_manifest(
     ``a.tif``) collapse to a single entry, the alphabetically last. Before
     0.10.0 they produced two identical-stem rows in the index, which no
     caller handled sensibly.
+
+    **``withheld_paths`` is REQUIRED and has no default**, which is the point
+    of it rather than an inconvenience. It holds artifact paths
+    (``images/<name>``) belonging to uploads that have not been finished -- see
+    :func:`withheld_upload_paths` -- and it governs BOTH halves of this
+    reconciliation, in opposite directions:
+
+    * a withheld name is never ADDED. A PUT object becomes a dataset image
+      through this function, so an upload that was never finished would
+      otherwise be an image with no size check ever applied to it;
+    * a withheld path is treated as PRESENT when pruning, so a stored entry on
+      that path is never DROPPED while an upload to it is open.
+
+    Both are needed and neither implies the other, which is exactly how the
+    defect arose: the rule used to live in :func:`image_names_from_listing`,
+    where it could only express the first half, so the pruning writer could not
+    use it -- and the two manifest writers therefore passed NO withheld set at
+    all. A review measured the consequence: one `sync_image_manifest` during
+    somebody's open upload wrote that upload into the stored manifest and
+    committed it, making an unchecked object a permanent image, which the
+    expiry sweep then deleted and left a dangling entry behind.
+
+    Required rather than defaulted because an omission here is silent and
+    changes correctness. A caller that has nothing withheld says so with
+    ``frozenset()``; a caller that forgot gets a `TypeError`.
     """
     dims = dims or {}
+    withheld = frozenset(withheld_paths or ())
     entries = {stem: dict(entry) for stem, entry in stored.items()}
     changed = False
 
@@ -439,6 +462,13 @@ def merge_image_manifest(
     }
     for name in sorted(listing_names):
         if name in covered:
+            continue
+        if f"{IMAGE_DIR}/{name}" in withheld:
+            # NEVER ADDED. The object is at `images/<name>` and the listing
+            # reports it, but no finishing call has vouched for it, so nothing
+            # has checked its size or its signature. Keyed by full path rather
+            # than by name because that is what a marker records; re-deriving
+            # it would be a second place for the two to disagree.
             continue
         stem = Path(name).stem
         if not stem:
@@ -470,6 +500,14 @@ def merge_image_manifest(
         for stem in list(entries):
             entry = entries[stem]
             if entry.get("state") != IMAGE_STATE_LOCAL:
+                continue
+            if entry.get("path", "") in withheld:
+                # TREATED AS PRESENT, the opposite direction from the add
+                # above, and the reason this set is passed here rather than
+                # filtered out of `listing_names` before the call. A filtered
+                # list would make a withheld path look ABSENT to this loop and
+                # drop a stored entry while an upload to it is open -- turning
+                # the fix for the writer into a different data loss.
                 continue
             if entry.get("path", "").split("/", 1)[-1] not in present:
                 del entries[stem]

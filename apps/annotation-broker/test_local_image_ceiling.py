@@ -27,6 +27,12 @@ import time
 import pytest
 
 import broker_core as core
+
+# Nothing is in flight, said explicitly. `merge_image_manifest` REQUIRES
+# `withheld_paths` and has no default, because an omission there is silent and
+# changes correctness -- a review measured both manifest writers omitting it
+# and recording somebody's unfinished upload as a permanent dataset image.
+NOTHING_WITHHELD = frozenset()
 from test_broker_ngff import bk
 from test_local_image_upload_route import ARTIFACT, _broker, _open_mint
 
@@ -201,7 +207,16 @@ def _store_broker(monkeypatch, store, *, ceiling):
 
     async def _read_json_file(_a, path, _default=None):
         if path == core.IMAGE_MANIFEST_PATH:
-            return {"manifest_version": core.IMAGE_MANIFEST_VERSION, "images": {}}
+            # THE STORED MANIFEST IS A REAL DOCUMENT, read back out of the same
+            # store a write puts it in. It used to be hard-coded empty, which
+            # made every manifest WRITE invisible to the next read -- so a test
+            # could not see `sync_image_manifest` recording an unfinished
+            # upload, which is the defect a review measured on this very path.
+            # A double that cannot represent the write cannot test the writer.
+            raw = store.objects.get(path)
+            if raw is None:
+                return {"manifest_version": core.IMAGE_MANIFEST_VERSION, "images": {}}
+            return json.loads(raw.decode("utf-8"))
         raw = store.objects.get(path)
         if raw is None:
             return _default
@@ -1605,3 +1620,194 @@ async def test_an_UNPAGINATED_server_does_not_over_claim_completeness(monkeypatc
     assert (
         complete is False
     ), "a single page at or above the server's default page was called complete"
+
+
+# ── round 11: the manifest WRITERS must not record an unfinished upload ──────
+#
+# The read reconciliation withheld an open upload; the two writers did not, and
+# they COMMIT. So one manager action during somebody's upload turned that
+# upload into a permanent dataset image -- size unchecked, signature unchecked
+# -- and the expiry sweep then deleted the object and left the entry dangling.
+# The rule now lives in one place (`merge_image_manifest`, with a REQUIRED
+# `withheld_paths`) and governs both directions: never ADD a withheld name,
+# never DROP a stored entry on a withheld path.
+
+
+def _stored_manifest(store):
+    """The manifest as it is stored, not as a read reconstructs it."""
+    raw = store.objects.get(core.IMAGE_MANIFEST_PATH)
+    return core.parse_image_manifest(json.loads(raw.decode("utf-8"))) if raw else {}
+
+
+@pytest.mark.asyncio
+async def test_SYNC_does_not_record_an_UNFINISHED_upload_as_an_image(monkeypatch):
+    """The measured hole, as the test that makes it RED.
+
+    Mint a name, PUT an oversized body, never finish. The object is in
+    `images/` and the listing reports it, but nothing has checked it. A manager
+    then runs `sync_image_manifest`, whose own docstring tells callers to run it
+    "after adding or removing image files" -- so this is an ordinary action, not
+    a contrived one. Before the fix that wrote the stem into the stored manifest
+    and committed it.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "big.png")
+    store.put(mint["put_url"], _png(10000))  # 156x the ceiling, never finished
+
+    before = await b._image_manifest(ARTIFACT)
+    assert "big" not in before, f"the unfinished upload was listed: {before}"
+
+    await b.sync_image_manifest(ARTIFACT, context=None)
+
+    assert "big" not in _stored_manifest(store), (
+        "sync_image_manifest wrote an unfinished upload into the STORED "
+        f"manifest: {_stored_manifest(store)}"
+    )
+    after = await b._image_manifest(ARTIFACT)
+    assert "big" not in after, f"the unfinished upload became an image: {after}"
+
+
+@pytest.mark.asyncio
+async def test_SYNC_still_records_a_FINISHED_upload(monkeypatch):
+    """The control, and it is not optional.
+
+    Without it, a `sync_image_manifest` that records NOTHING -- or that was
+    never called -- satisfies the test above. This asserts the same call writes
+    the stem once the upload is legitimately complete.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "ok.png")
+    store.put(mint["put_url"], _png(32))
+    out = await b.upload_local_image(
+        ARTIFACT, "ok.png", done=True, mint_id=mint["mint_id"]
+    )
+    assert out["committed"] is True, out
+
+    await b.sync_image_manifest(ARTIFACT, context=None)
+
+    assert "ok" in _stored_manifest(store), (
+        "sync_image_manifest recorded nothing at all, so the refusal above "
+        f"proves nothing: {_stored_manifest(store)}"
+    )
+
+
+def test_the_PRUNE_treats_a_withheld_path_as_PRESENT():
+    """The opposite direction, and the reason the withheld set goes INTO the
+    merge instead of being filtered out of the listing beforehand.
+
+    A pre-filtered list makes a withheld path look ABSENT to the pruning loop,
+    so the fix for the writer would have become a different data loss: a stored
+    entry deleted because an upload to the same path was in flight. The
+    docstring on the old filter warned about exactly this.
+
+    **Asserted on the function, not through a route, and that is deliberate.**
+    I tried to reach it through `sync_image_manifest` and measured that I
+    cannot: a stored entry on a withheld path is unreachable today, because the
+    mint refuses a stem already in the merged manifest, and both writers now
+    refuse to add a withheld name. So this is a contract on
+    `merge_image_manifest` rather than a repair of a live path -- and saying
+    that plainly is better than a route-level test that passes for a reason
+    unrelated to the clause. The guard stays because the contract is what the
+    next caller will rely on; an unreachable state is not the same as an
+    impossible one.
+    """
+    stored = {"keep": core.local_image_entry("keep.png")}
+
+    kept, _ = core.merge_image_manifest(
+        stored,
+        [],  # the listing does NOT report it
+        prune=True,
+        withheld_paths={"images/keep.png"},
+    )
+    assert "keep" in kept, f"a withheld path was pruned: {kept}"
+
+    # The control: with nothing withheld, the same call DOES prune it. Without
+    # this, a merge that never prunes anything would satisfy the line above.
+    dropped, _ = core.merge_image_manifest(
+        stored, [], prune=True, withheld_paths=NOTHING_WITHHELD
+    )
+    assert "keep" not in dropped, f"the prune stopped working altogether: {dropped}"
+
+
+@pytest.mark.asyncio
+async def test_the_REMOTE_IMPORT_does_not_record_an_unfinished_upload(monkeypatch):
+    """The second writer, reached from a different route.
+
+    `import_ngff_image` merges the listing and writes the manifest too, so an
+    unfinished upload in flight was recorded as an image by somebody else's
+    remote import. The probe is stubbed because this test is about the manifest
+    write, not about OME-Zarr.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    async def _probe(root, multiscale_path, origin):
+        return {
+            "width": 64,
+            "height": 48,
+            "dtype": "uint8",
+            "channels": ["C0"],
+            "levels": 1,
+            "content_hint": None,
+            "dataset_paths": ["0"],
+            "axis_roles": {"x": 1, "y": 0},
+            "level0_shape": [48, 64],
+            "axes": ["y", "x"],
+        }
+
+    monkeypatch.setattr(b, "_probe_ngff_source", _probe)
+
+    mint = await b.upload_local_image(ARTIFACT, "big.png")
+    store.put(mint["put_url"], _png(10000))  # never finished
+
+    await b.import_ngff_image(
+        ARTIFACT, "https://example.invalid/s.zarr", stem="remote1", context=None
+    )
+
+    stored = _stored_manifest(store)
+    assert "remote1" in stored, f"the import recorded nothing: {stored}"
+    assert (
+        "big" not in stored
+    ), f"a remote import swept an unfinished upload into the manifest: {stored}"
+
+
+def test_EVERY_manifest_merge_in_the_broker_passes_the_withheld_set():
+    """A structural pin, because the defect was an OMISSION at a call site.
+
+    Four call sites merge the manifest -- two reads and two writers -- and the
+    two writers were the ones that forgot. The argument is required at the
+    function, so an omission is a `TypeError` rather than silence; this asserts
+    the stronger thing, that no call site passes a literal empty set to make
+    that `TypeError` go away. Over the AST, so a call spanning several lines is
+    read as one call rather than as whatever a text search happened to match.
+    """
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).parent / "broker.py").read_text()
+    calls = [
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) == "merge_image_manifest"
+    ]
+    assert len(calls) == 4, f"expected 4 merge call sites, found {len(calls)}"
+    for call in calls:
+        kw = {k.arg: k for k in call.keywords}
+        assert "withheld_paths" in kw, (
+            f"broker.py:{call.lineno} merges the manifest without passing "
+            "withheld_paths"
+        )
+        value = kw["withheld_paths"].value
+        assert not (
+            isinstance(value, ast.Call)
+            and getattr(value.func, "id", None) == "frozenset"
+            and not value.args
+        ), (
+            f"broker.py:{call.lineno} passes an empty frozenset, which "
+            "satisfies the signature while withholding nothing"
+        )

@@ -561,7 +561,8 @@ class AnnotationBroker:
         withheld = await self._withheld_upload_paths(artifact_id)
         entries, _ = core.merge_image_manifest(
             core.parse_image_manifest(doc),
-            core.image_names_from_listing(listing, withheld),
+            core.image_names_from_listing(listing),
+            withheld_paths=withheld,
             dims=dims,
         )
         self._image_manifest_cache[artifact_id] = (time.time(), entries)
@@ -1564,11 +1565,21 @@ class AnnotationBroker:
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
+            # THE WITHHELD SET IS PASSED HERE TOO, and omitting it was a
+            # measured data-loss hole rather than an oversight about style.
+            # This writes the stored manifest and COMMITS, so an unfinished
+            # upload reconciled in here became a permanent dataset image --
+            # size unchecked, signature unchecked -- just because a manager ran
+            # this call while somebody's upload was open. The expiry sweep then
+            # deleted the object and left the entry behind. It governs the
+            # pruning half as well: a withheld path counts as present, so this
+            # call cannot drop a stored entry on account of an open upload.
             entries, changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
                 core.image_names_from_listing(listing),
                 dims=dict(meta.get("image_dims") or {}),
                 prune=True,
+                withheld_paths=await self._withheld_upload_paths(artifact_id),
             )
             if changed:
 
@@ -1926,10 +1937,18 @@ class AnnotationBroker:
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
+            # THE WITHHELD SET IS PASSED HERE TOO. This writes the stored
+            # manifest and commits, so without it an unfinished upload that
+            # happened to be in flight was swept into the manifest as a
+            # permanent image by somebody else's remote import -- the same
+            # measured hole as `sync_image_manifest`, reached from a second
+            # route. It also keeps the `already an image` check below honest:
+            # a withheld stem is not an image of this dataset yet.
             entries, _ = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
                 core.image_names_from_listing(listing),
                 dims=dict(meta.get("image_dims") or {}),
+                withheld_paths=await self._withheld_upload_paths(artifact_id),
             )
             if stem in entries:
                 raise ValueError(
@@ -2559,7 +2578,8 @@ class AnnotationBroker:
             # for the purposes of not clobbering it here.
             entries, _changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
-                core.image_names_from_listing(listing, withheld_paths=withheld),
+                core.image_names_from_listing(listing),
+                withheld_paths=withheld,
             )
             existing = entries.get(stem)
             if isinstance(existing, dict):
@@ -2774,6 +2794,19 @@ class AnnotationBroker:
         # path, this mint id, unexpired), checked above, so the filename is a
         # lookup key and confers nothing. Nothing here paginates, so nothing
         # here can be short.
+        # ONE KNOWN WRINKLE OF REUSING A FILENAME, read out of Hypha rather
+        # than measured here, and recorded so the next reader does not have to
+        # rediscover it. Removing a COMMITTED path appends a `_remove` entry to
+        # the staging list, and a later put_file to the SAME path is not added,
+        # because the staging check matches on path alone and finds that entry.
+        # So after an abandoned upload's object and marker are published by
+        # somebody's commit and then swept, a re-upload of the same name --
+        # before any further commit -- is still hidden from staged listings, and
+        # its finish reads the size as unreadable and refuses ONCE. That
+        # refusal's own discard and marker removal clear the flags, so the
+        # retry works. One spurious refusal, no loss and no bypass. It applies
+        # to object paths too, which were already reused; the path-keyed marker
+        # only adds a second filename with the same property.
         own = core.upload_marker_path_for_object(path)
         if own is None or not await self._remove_marker_file(artifact_id, own):
             raise RuntimeError(
