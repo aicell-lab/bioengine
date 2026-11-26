@@ -1778,4 +1778,12 @@ def run_config(session_id: str) -> Dict[str, Any]:
         params = read_training_params(session_id)
     except Exception:
         return {}
-    return config_for_display(params)
+    # REDACTED here too, so the local and shared paths are identical by
+    # construction rather than by the current contents of the params. A review
+    # measured the difference: a presigned URL inside an allow-listed field was
+    # stripped on the shared path and shown in full on the local one. It cannot
+    # happen today -- the only free-form allow-listed field is the pool
+    # provenance, and the one place that builds it uses two ids and no URL --
+    # but "cannot happen today" is a fact about today's callers, and the
+    # equality the shared listing rests on should not depend on it.
+    return redact_urls(config_for_display(params))

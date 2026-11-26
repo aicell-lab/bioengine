@@ -212,6 +212,13 @@ def test_a_run_LISTED_BOTH_WAYS_comes_back_IDENTICAL(local):
                 "train_images": "/home/bioengine/apps/x/imgs",
                 "init_checkpoint": "/models/u1/ckpt.pth",
                 "a_field_added_next_year": "whatever",
+                # An allow-listed field carrying a presigned URL. This is what
+                # made the two paths differ: the shared one redacted it and
+                # the local one did not. It cannot arise from today's callers,
+                # which is why the equality must not depend on them.
+                "pool_provenance": {
+                    "src": "https://s3.example/p.zip?X-Amz-Signature=abc123"
+                },
             }
         )
     )
