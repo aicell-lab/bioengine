@@ -22,6 +22,7 @@ clause 1 on its own.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import time
 
@@ -64,16 +65,78 @@ def writable_store(tmp_path, monkeypatch):
     return root
 
 
+def _refuses_writes(root: pathlib.Path) -> bool:
+    """Whether a write INSIDE `root` actually fails, measured by doing one.
+
+    The fixture below cannot assume its own mechanism worked, so it asks.
+    """
+    probe = root / f".fixture-probe-{os.getpid()}"
+    try:
+        probe.write_text("")
+    except OSError:
+        return True
+    probe.unlink()
+    return False
+
+
 @pytest.fixture()
 def read_only_store(tmp_path, monkeypatch):
     """A store that EXISTS and refuses writes — the shape that fooled the old
-    check, since `mkdir(exist_ok=True)` succeeds on it."""
+    check, since `mkdir(exist_ok=True)` succeeds on it.
+
+    ⚠ `chmod(0o555)` ALONE DOES NOT MAKE A STORE UNWRITABLE FOR EVERY CALLER.
+    Root — and anything else holding CAP_DAC_OVERRIDE — ignores the mode
+    entirely, so the store happily accepts writes and `store_status()` reports
+    `writable: True`. CI runs as root: measured on this branch, the three tests
+    using this fixture failed under `/tmp/pytest-of-root/...` with
+    `{'writable': True, 'detail': '... accepts writes'}` while passing locally
+    as an ordinary user. A fixture that silently fails to create the condition
+    makes every test built on it assert something that cannot happen.
+
+    So the mechanism is CHECKED and escalated. If the mode is bypassed, the
+    directory is replaced by a regular FILE: a write inside it then fails with
+    ENOTDIR for every uid, which is the same observable the probe must report —
+    it has to ATTEMPT a write rather than trust that the path exists. The
+    fixture then refuses to yield at all unless the store really does reject a
+    write, so this can never again pass a writable store to a test that asserts
+    otherwise.
+    """
     root = tmp_path / "sessions"
     root.mkdir()
     root.chmod(0o555)
+    if not _refuses_writes(root):
+        root.chmod(0o755)
+        root.rmdir()
+        root.write_text("")  # a non-directory: ENOTDIR binds root too
+    assert _refuses_writes(root), (
+        f"the fixture could not make {root} refuse a write, so every test using "
+        f"it would assert a condition that does not hold"
+    )
     monkeypatch.setattr(training, "sessions_root", lambda: root)
     yield root
+    if root.is_dir():
+        root.chmod(0o755)
+
+
+def test_the_FIXTURE_can_refuse_writes_even_where_the_file_MODE_is_ignored(tmp_path):
+    """THE CONTROL on the fixture above, and on why it is not just a chmod.
+
+    Without this, the escalation path is only exercised on a machine that
+    happens to run the suite as root — which is CI, and not wherever this is
+    being read. It asserts both halves: that the mode mechanism is detectably
+    insufficient when bypassed, and that the fallback refuses regardless.
+    """
+    root = tmp_path / "s"
+    root.mkdir()
+    root.chmod(0o555)
+
+    # Simulate a caller that ignores the mode, which is what root does.
     root.chmod(0o755)
+    assert not _refuses_writes(root), "the mode mechanism was not actually bypassed"
+
+    root.rmdir()
+    root.write_text("")
+    assert _refuses_writes(root), "the fallback does not refuse writes either"
 
 
 # ── the runtimes answer for themselves ──────────────────────────────────────
