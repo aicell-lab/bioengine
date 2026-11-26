@@ -51,13 +51,25 @@ class FakeAM:
     changed and a fake without those fields would make that untestable.
     """
 
-    def __init__(self, *, fail_commit_times=0, fail_list=False):
+    def __init__(
+        self,
+        *,
+        fail_commit_times=0,
+        fail_list=False,
+        page_size=None,
+        ignores_offset=False,
+    ):
         self.calls = []
+        self.list_asks = []  # (dir_path, limit, offset) as ASKED, not as served
         self.files = {}  # full path -> bytes-as-str
         self.stamps = {}  # full path -> (size, last_modified)
         self.versions = ["v0"]
         self._fail_commit_times = fail_commit_times
         self._fail_list = fail_list
+        #: Cap the served page BELOW the caller's limit, as a real store may.
+        self.page_size = page_size
+        #: Serve page one forever, as a store that drops `offset` would.
+        self.ignores_offset = ignores_offset
         self._clock = 1000.0
 
     # -- the calls the app makes ------------------------------------------
@@ -75,8 +87,25 @@ class FakeAM:
             raise RuntimeError("nothing staged — another writer committed first")
         assert len(self.versions) == 1  # measured: a commit adds no version
 
-    async def list_files(self, artifact_id=None, dir_path=None, **kw):
+    async def list_files(
+        self, artifact_id=None, dir_path=None, limit=1000, offset=0, **kw
+    ):
+        """A PAGING listing, because the real one pages.
+
+        The server's own contract is `limit` defaulting to 1000 with a ceiling
+        of 10000, plus `offset`. A double that served the whole directory in
+        one call would model a server that does not exist, and every paging
+        defect passes against it -- which is exactly how the unpaged read
+        survived until someone read the parameter list.
+
+        `page_size` lets a test cap the limit BELOW what the caller asked for,
+        which the real server may do; `ignores_offset` models a store that
+        serves page one forever. Both are recorded as ASKED-for values in
+        `list_asks`, not just as served sizes, because the whole point is that
+        those two differ.
+        """
         self.calls.append(("list_files", artifact_id, dir_path))
+        self.list_asks.append((dir_path, limit, offset))
         if self._fail_list:
             raise RuntimeError("the artifact could not be listed")
         prefix = f"{dir_path}/" if dir_path else ""
@@ -91,7 +120,9 @@ class FakeAM:
             out.append(
                 {"type": "file", "name": rest, "size": size, "last_modified": mtime}
             )
-        return out
+        served = min(limit, self.page_size) if self.page_size else limit
+        start = 0 if self.ignores_offset else offset
+        return out[start : start + served]
 
     async def get_file(self, artifact_id=None, file_path=None, **kw):
         self.calls.append(("get_file", artifact_id, file_path))

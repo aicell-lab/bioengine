@@ -1657,6 +1657,13 @@ class EntryApp:
     #: this only bounds the gap for a listing that arrives between passes.
     RUNS_CACHE_TTL_S = 30.0
 
+    #: How many entries to ask the artifact store for per page. A class
+    #: attribute so a test can set it to a handful and exercise the loop with
+    #: tens of records instead of thousands. The server's own default is 1000
+    #: and its ceiling is 10000, so asking for the maximum is not a fix -- it
+    #: is a higher cap, with the same silent truncation one threshold up.
+    RUNS_LIST_PAGE = 1000
+
     # Class-level fallbacks for the cache, so a published method never raises
     # AttributeError on an instance whose __init__ did not run. That is not a
     # hypothetical: a half-constructed instance is how the suite exercises a
@@ -1769,6 +1776,74 @@ class EntryApp:
                 return False
         return False
 
+    async def _list_run_record_files(self, am, store) -> tuple:
+        """``(entries, complete)`` for a deployment's record directory.
+
+        **A TUPLE, AND THAT IS THE POINT.** `list_files` is paginated: the
+        server's own parameters are ``limit`` defaulting to **1000** with a
+        ceiling of **10000**, plus an ``offset``, and it returns a bare list of
+        ``{name, type, size, last_modified}``. There is nowhere in that answer
+        for a completeness flag to live, so a single call is a PAGE and not a
+        directory, and a caller handed a bare list cannot tell "all of them"
+        from "as many as I could get". Returning a tuple makes a caller that
+        ignores the second element fail loudly instead of quietly reading a
+        subset.
+
+        **The loop stops on an EMPTY page, never a SHORT one.** A page shorter
+        than the limit asked for is an ordinary answer -- the server may cap the
+        limit below the ask -- so treating "shorter than requested" as "that is
+        all of them" reintroduces the incomplete read one layer down.
+
+        **Progress is measured by NEW NAMES, not by page length.** A server that
+        ignored ``offset`` would serve page one forever; that terminates the
+        loop with ``complete=False`` and a warning rather than spinning. The
+        check counts names not seen before across ALL entries, including
+        directories and non-record files, because a page made entirely of those
+        is progress even though it contributes no records.
+
+        Deliberately NOT bounded by an arbitrary maximum: a cap here would be
+        the very defect this removes. The directory holds one small document per
+        run.
+        """
+        import training
+
+        dir_path = training.run_record_dir(store)
+        entries: Dict[str, tuple] = {}
+        seen: set = set()
+        offset = 0
+        while True:
+            page = await am.list_files(
+                artifact_id=training.RUNS_ARTIFACT_ID,
+                dir_path=dir_path,
+                limit=self.RUNS_LIST_PAGE,
+                offset=offset,
+            )
+            page = page or []
+            if not page:
+                return entries, True
+            fresh = 0
+            for e in page:
+                if not isinstance(e, dict):
+                    continue
+                name = e.get("name")
+                if not isinstance(name, str):
+                    continue
+                if name not in seen:
+                    seen.add(name)
+                    fresh += 1
+                if e.get("type") == "directory" or not name.endswith(".json"):
+                    continue
+                entries[name] = (e.get("size"), e.get("last_modified"))
+            if not fresh:
+                logger.warning(
+                    f"the run record listing stopped making progress at offset "
+                    f"{offset} ({len(seen)} name(s) seen); the store may be "
+                    "ignoring `offset`, so this listing is NOT known to be "
+                    "complete"
+                )
+                return entries, False
+            offset += len(page)
+
     async def _read_run_records(
         self, *, max_age_s: Optional[float] = None
     ) -> Optional[Dict[str, Dict[str, Any]]]:
@@ -1820,10 +1895,7 @@ class EntryApp:
 
         try:
             am = await self._runs_artifact_manager()
-            listing = await am.list_files(
-                artifact_id=training.RUNS_ARTIFACT_ID,
-                dir_path=training.run_record_dir(store),
-            )
+            entries, listing_complete = await self._list_run_record_files(am, store)
         except Exception as exc:
             logger.warning(
                 f"the shared run history could not be listed "
@@ -1832,21 +1904,28 @@ class EntryApp:
             )
             return None
 
-        entries = {}
-        for e in listing or []:
-            if not isinstance(e, dict) or e.get("type") == "directory":
-                continue
-            name = e.get("name")
-            if isinstance(name, str) and name.endswith(".json"):
-                entries[name] = (e.get("size"), e.get("last_modified"))
-
         cached = dict(self._runs_cache or {})
         meta = dict(self._runs_meta)
         # A record removed from the artifact leaves the cache with it, so a
         # deleted run does not live on in this replica's answer.
-        for gone in set(meta) - set(entries):
-            meta.pop(gone, None)
-            cached.pop(gone[: -len(".json")], None)
+        #
+        # ONLY WHEN THE LISTING IS KNOWN WHOLE. Absence from an INCOMPLETE
+        # listing is not evidence of deletion, and this is the sharper half of
+        # the paging defect: a truncated page would not merely shorten the
+        # answer, it would evict every already-known run that fell past the
+        # page and drop it from the history this replica serves. Keeping the
+        # cache is the safe direction -- a run that really was deleted lingers
+        # until a listing that can be trusted says so.
+        if listing_complete:
+            for gone in set(meta) - set(entries):
+                meta.pop(gone, None)
+                cached.pop(gone[: -len(".json")], None)
+        else:
+            logger.warning(
+                "the shared run history listing could not be proven complete, "
+                "so no record is being evicted from the cache; the answer may "
+                "omit runs this replica has never seen"
+            )
 
         unreadable = fetched = 0
         for name, stamp in entries.items():
@@ -2698,16 +2777,21 @@ class EntryApp:
         verified, verify_error = {}, None
         try:
             am = await self._runs_artifact_manager()
-            listing = await am.list_files(
-                artifact_id=training.RUNS_ARTIFACT_ID,
-                dir_path=training.run_record_dir(store),
-            )
-            for e in listing or []:
-                if not isinstance(e, dict) or e.get("type") == "directory":
-                    continue
-                fname = e.get("name")
-                if not (isinstance(fname, str) and fname.endswith(".json")):
-                    continue
+            # PAGED, AND THE COMPLETENESS IS CARRIED, NOT INFERRED. A read-back
+            # that stopped at the first page would compare the plan against a
+            # SUBSET of the artifact. That direction happens to fail closed
+            # here -- an unseen id has no hash and lands in `mismatched` -- but
+            # it fails closed while blaming the records, reporting as corrupt a
+            # set of documents that are in fact present and correct. Saying
+            # instead that the READ could not be proven whole is the same
+            # refusal with the true reason attached.
+            listing, listing_complete = await self._list_run_record_files(am, store)
+            if not listing_complete:
+                raise RuntimeError(
+                    "the read-back listing could not be proven complete, so the "
+                    "artifact's contents cannot be compared against the plan"
+                )
+            for fname in listing:
                 sid = fname[: -len(".json")]
                 if sid not in plan["hashes"]:
                     # Another deployment's or an older run's record. Not part of

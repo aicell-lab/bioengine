@@ -68,9 +68,15 @@ class FakeAM:
     fake that only recorded calls could not exercise the check at all.
     """
 
-    def __init__(self, fail_list=False):
+    def __init__(self, fail_list=False, page_size=None, ignores_offset=False):
         self.files = {}  # full path -> text
         self.fail_list = fail_list
+        #: Serve at most this many entries per call, as the real store does.
+        #: `None` means "no cap of my own" -- the caller's limit decides.
+        self.page_size = page_size
+        #: Serve page one forever, as a store that dropped `offset` would.
+        self.ignores_offset = ignores_offset
+        self.list_asks = []  # (dir_path, limit, offset) as ASKED, not as served
 
     def store(self, path, text):
         self.files[path] = text
@@ -84,11 +90,26 @@ class FakeAM:
     async def commit(self, artifact_id=None, **kw):
         pass
 
-    async def list_files(self, artifact_id=None, dir_path=None, **kw):
+    async def list_files(
+        self, artifact_id=None, dir_path=None, limit=1000, offset=0, **kw
+    ):
+        """A PAGING listing, because the real one pages.
+
+        This fake used to return the whole directory on every call, which
+        models a server that does not exist: the real `list_files` defaults to
+        a 1000-entry page, caps at 10000, and takes an `offset`. Against the
+        old fake, a read-back that stopped at page one was indistinguishable
+        from one that followed the pagination, so the truncation this row is
+        about could not have been caught here.
+
+        It records what each call ASKED for, not only what was served, because
+        the entire defect is that those two differ.
+        """
         if self.fail_list:
             raise RuntimeError("the artifact could not be listed")
+        self.list_asks.append((dir_path, limit, offset))
         prefix = f"{dir_path}/"
-        return [
+        rows = [
             {
                 "type": "file",
                 "name": p[len(prefix) :],
@@ -98,6 +119,9 @@ class FakeAM:
             for p, t in sorted(self.files.items())
             if p.startswith(prefix)
         ]
+        served = min(limit, self.page_size) if self.page_size else limit
+        start = 0 if self.ignores_offset else offset
+        return rows[start : start + served]
 
     async def get_file(self, artifact_id=None, file_path=None, **kw):
         return f"https://download.example/{file_path}"
