@@ -43,6 +43,7 @@ it, which is what makes it the right lever, but an app is free to ignore it.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import time
 from pathlib import Path
@@ -51,7 +52,6 @@ import pytest
 
 from bioengine._app import replica_init
 from bioengine.apps.builder import AppBuilder
-
 
 # ─────────────────────────── leg 1: the builder ────────────────────────────
 
@@ -630,3 +630,207 @@ def test_the_timeout_message_CARRIES_the_errno_even_when_an_age_is_known(
     msg = str(ei.value)
     assert "Directory not empty" in msg, f"the errno never reached the message: {msg}"
     assert "held by another replica" in msg, f"the age was dropped instead: {msg}"
+
+
+# ───────── leg 5: two gaps the superseded sibling PR identified, adapted ─────────
+#
+# A sibling pull request proposed a different fix for the same defect and was closed
+# unmerged once this one superseded it, with its ordering change folded in here. Two of
+# its test ideas were NOT folded in, and neither is covered by anything above:
+#
+#   * the claim directory being UNCREATABLE at all (not held by a peer — mkdir itself
+#     failing, as it would on a read-only or quota-exhausted store);
+#   * genuine MUTUAL EXCLUSION between two concurrent replicas.
+#
+# Its own versions could not be applied: they assert a design that was rejected (a
+# `.materialising` path, an `errno=` message format, a `_CLAIM_POLL_SECONDS` constant),
+# so they would fail against the code that actually landed. These are the same two
+# properties written against the landed implementation.
+
+
+def test_a_claim_that_CANNOT_BE_CREATED_fails_loudly_naming_the_path(
+    monkeypatch, tmp_path
+):
+    """mkdir failing outright is not the same as a peer holding the claim.
+
+    `FileExistsError` means wait; every other `OSError` from that mkdir means the store
+    will not accept a claim at all — a read-only remount, an exhausted quota, a vanished
+    mount. That must raise, name the path, and carry the errno, because silence is what
+    made the original defect expensive: a replica that proceeds unclaimed looks healthy
+    and corrupts a shared tree instead.
+    """
+    import errno as _errno
+
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    real_mkdir = Path.mkdir
+
+    def refusing_mkdir(self, *a, **kw):
+        if self.name == ".claim":
+            raise OSError(_errno.EROFS, "Read-only file system")
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", refusing_mkdir)
+    # Bound the wait. On correct code the raise is immediate, so this changes nothing --
+    # but a regression that SWALLOWS the error does not proceed unclaimed, it spins until
+    # the deadline, and with the shipped 1200 s bound that turns this arm into a
+    # twenty-minute hang instead of a failure. Measured while building the mutant control
+    # for this very test: the run had to be killed. A test that hangs on the defect it
+    # guards is a test nobody will keep.
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 1)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.05)
+    with pytest.raises(RuntimeError) as ei:
+        replica_init.setup_replica_environment()
+    msg = str(ei.value)
+    assert ".claim" in msg, f"the error does not name the claim path: {msg}"
+    assert "Read-only file system" in msg, f"the error does not carry the errno: {msg}"
+    assert calls == [], "it synced despite being unable to claim"
+
+
+def test_two_concurrent_replicas_NEVER_SYNC_AT_ONCE(monkeypatch, tmp_path):
+    """The property the claim exists for, and the only arm here that is really concurrent.
+
+    THE INVARIANT IS NON-OVERLAP, NOT DEDUPLICATION — and asserting the wrong one would
+    fail against correct code. The loser acquires the claim once the winner releases it,
+    and (since the marker fast path only applies to a replica that waited) a second sync
+    is legitimate. What must never happen is two syncs IN FLIGHT AT ONCE over one
+    `source/`, because that is what tears the tree, and it tears it quietly.
+
+    So this records each sync's [start, end] and asserts no two intervals overlap.
+    """
+    import threading
+
+    app_dir, _calls, _held = _sync_env(monkeypatch, tmp_path)
+    spans, lock = [], threading.Lock()
+
+    def slow_sync(files_url, version, token, source, snapshot_path, logger):
+        t0 = time.monotonic()
+        time.sleep(0.4)
+        Path(source).mkdir(parents=True, exist_ok=True)
+        with lock:
+            spans.append((t0, time.monotonic()))
+
+    monkeypatch.setattr(replica_init, "_sync_source_from_hypha", slow_sync)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.02)
+    # The wait MUST be bounded here. Left at the shipped value, a regression that never
+    # releases the claim makes the loser wait the full interval: the arm then measured one
+    # replica, passed, and kept a non-daemon thread alive for twenty minutes. A guard that
+    # reports PASSED for a run whose second replica never finished is worse than no guard.
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 5)
+    errors = []
+
+    def run():
+        try:
+            replica_init._ensure_source(app_dir, "1.2.3", logging.getLogger("t"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    # Both replicas must have FINISHED. join(timeout=...) returns whether or not the thread
+    # ended, so without this a hung loser is indistinguishable from a fast one, and the
+    # non-overlap assertion below would run over a single interval and trivially hold.
+    alive = [t for t in threads if t.is_alive()]
+    assert not alive, (
+        f"{len(alive)} replica thread(s) were still running after join: the claim was never "
+        "released, so this run measured fewer replicas than it started and proves nothing"
+    )
+    assert not errors, f"a replica raised: {errors}"
+    # ONE span is legitimate and must stay allowed: `_ensure_source` trusts the version marker
+    # only for a replica that actually WAITED, so the loser reuses the winner's tree instead of
+    # re-syncing. Requiring two would assert against the design. Non-overlap is then trivially
+    # true for a single interval — which is exactly why the liveness assertion above is what
+    # carries this arm: it proves both replicas FINISHED, so one span means the loser reused
+    # the marker rather than that it hung and was never measured.
+    assert len(spans) >= 1, "neither replica synced, so nothing was measured"
+    overlaps = [
+        (a, b)
+        for i, a in enumerate(spans)
+        for b in spans[i + 1 :]
+        if a[0] < b[1] and b[0] < a[1]
+    ]
+    assert (
+        not overlaps
+    ), f"two syncs were in flight at once over one source/: {overlaps}"
+
+
+def test_the_bootstrap_failure_message_POINTS_AT_THE_REAL_CAUSE(monkeypatch, tmp_path):
+    """The finder swallows a bootstrap failure into a printed traceback, so that print is the
+    only thing a reader gets. It must report where the cause is.
+
+    Without it the traceback reads as "source missing from sys.path" and the read-only write
+    that follows looks like a separate fault — which is how the original defect stayed
+    unexplained for eleven days.
+
+    THIS ASSERTS THE PRINTED OUTPUT, not the source text, and the difference is the whole
+    point. A structural check over the message literal is beaten by any rewrite that keeps the
+    right tokens: one that says the variables are set AFTER the sync "never BEFORE" still
+    contains "BEFORE" and still calls environ.get twice, and one that formats the values away
+    with "%.0s" still has the environ.get calls while printing nothing. Both of those pass a
+    structural guard and say the opposite of, or nothing about, the fact the clause asks for.
+
+    So the arm drives the finder: it makes the bootstrap raise, calls find_spec for a module
+    nothing can resolve, and reads stdout. HOME is set to a sentinel and TMPDIR is removed, so
+    the assertions below can only hold if the message prints the values it read.
+
+    The sentinel also guards against the wrong copy of bioengine: if the installed package is
+    imported instead of the checkout, its older message cannot contain this sentinel and the
+    arm fails rather than passing against code that is not under test.
+    """
+    import contextlib
+    import io
+    import sys as _sys
+
+    import bioengine
+
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    sentinel = str(tmp_path / "SENTINEL-home-c9f31a")
+    monkeypatch.setenv("BIOENGINE_APP_DIR", str(app_dir))
+    monkeypatch.setenv("HOME", sentinel)
+    monkeypatch.delenv("TMPDIR", raising=False)
+
+    def _raise() -> None:
+        raise RuntimeError("deliberate bootstrap failure")
+
+    monkeypatch.setattr(replica_init, "setup_replica_environment", _raise)
+
+    before = list(_sys.meta_path)
+    try:
+        bioengine._install_replica_bootstrap_finder()
+        assert len(_sys.meta_path) == len(before) + 1, (
+            "the finder was not installed, so nothing below exercises the message. "
+            "BIOENGINE_APP_DIR is set, which is its only precondition."
+        )
+        finder = _sys.meta_path[-1]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            finder.find_spec("definitely_not_a_module_xyz", None)
+        out = buf.getvalue()
+    finally:
+        _sys.meta_path[:] = before
+
+    assert (
+        "replica source bootstrap failed" in out
+    ), f"the finder printed no bootstrap-failure message at all; got {out[:200]!r}"
+    # The VALUES must be printed. A message that reads os.environ and then discards the
+    # values with a zero-width format is the mutant this catches.
+    assert sentinel in out, (
+        f"the message does not print the HOME it read (expected {sentinel!r}). A reader cannot "
+        f"check an environment claim against a traceback, which never shows env values. Got: {out[:300]!r}"
+    )
+    assert "TMPDIR=<unset>" in out, (
+        f"TMPDIR was removed from the environment and the message does not report it as unset, "
+        f"so it is not reporting what it read. Got: {out[:300]!r}"
+    )
+    # …and the claim itself, so a message that states the OPPOSITE in other words is RED even
+    # though it contains every keyword.
+    assert "BEFORE syncing source" in out, (
+        f"the message no longer states that the redirection happens BEFORE the source sync. That "
+        f"is the fact that makes an unset HOME point at an earlier failure rather than at the "
+        f"eventual read-only write. Got: {out[:300]!r}"
+    )
