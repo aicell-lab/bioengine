@@ -75,6 +75,26 @@ SERVER_URL = "https://hypha.aicell.io"
 # as UNHEALTHY by this check rather than timing the check itself out. Matches
 # annotation-broker's `_HEALTH_CALL_TIMEOUT_S`, which guards the same shape.
 _HEALTH_CALL_TIMEOUT_S = 15.0
+
+# How long `get_training_capabilities` waits for a backend's store verdict, and
+# how long it then stops asking a backend that did not answer.
+#
+# BOTH NUMBERS EXIST BECAUSE THIS METHOD IS POLLED BY THE ANNOTATE PAGE, and a
+# review measured what the first version cost: with VRAM declared, both backends
+# enabled and one runtime whose `ping` hangs, the call took 10.01 s and returned
+# no verdict anyway. Two faults, fixed separately. The views are now gathered
+# concurrently, so the worst case is ONE timeout rather than one per backend;
+# and the timeout is 2 s, matching the readiness probe, because `ping` reports a
+# cached verdict and does no I/O, so a runtime that is up answers in
+# milliseconds and 5 s only lengthened the wait for one that is not.
+#
+# The negative window is the other half. A cluster with fewer GPUs than enabled
+# backends leaves a backend UPSCALING indefinitely -- that is the permanent
+# state this method's own docstring describes, not a blip -- so retrying it on
+# every poll would pay the timeout forever. 30 s is short enough that a runtime
+# coming up is reflected within one or two polls.
+_STORE_VIEW_PING_TIMEOUT_S = 2.0
+_STORE_VIEW_UNREACHABLE_FOR_S = 30.0
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
@@ -546,6 +566,13 @@ class EntryApp:
         # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
         # process. Raising max_replicas voids it and needs a pool-side lease instead.
         self._pool_locks: Dict[str, asyncio.Lock] = {}
+        # When each backend's `ping` last failed to answer, so the POLLED
+        # capabilities method stops asking a runtime that is not there. An
+        # under-GPU'd cluster leaves a backend UPSCALING permanently, and that
+        # is not a transient: without this, every poll pays the full timeout
+        # forever. Per-instance rather than class-level, so two replicas cannot
+        # share one another's negative verdict.
+        self._store_view_unreachable_at: Dict[str, float] = {}
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -737,6 +764,22 @@ class EntryApp:
             )
             return {}
 
+    def _store_view_failures(self) -> Dict[str, float]:
+        """When each backend's store `ping` last failed, created on first use.
+
+        Reached through an accessor rather than read off the attribute directly
+        because this is a CACHE, "no failures recorded yet" is the right answer
+        for an instance that has no history, and several call sites build this
+        class without running `__init__`. Crashing one of them with an
+        AttributeError would turn a missing optimisation into a broken status
+        method -- which it did, once, before this accessor existed.
+        """
+        failures = getattr(self, "_store_view_unreachable_at", None)
+        if failures is None:
+            failures = {}
+            self._store_view_unreachable_at = failures
+        return failures
+
     async def _backend_store_view(self, backend: str) -> Dict[str, Any]:
         """A backend's store verdict for the STATUS surface, from the cache.
 
@@ -749,19 +792,41 @@ class EntryApp:
 
         `{}` means "could not ask", which is a third answer and is reported as
         `writable: None` rather than collapsed into either verdict.
+
+        BOUNDED, AND IT STOPS ASKING A BACKEND THAT IS NOT THERE. See
+        `_STORE_VIEW_PING_TIMEOUT_S` for the measurement that forced both: the
+        caller is polled, and a backend left UPSCALING by an under-GPU'd cluster
+        never answers, so an unconditional ping per poll is an unbounded cost
+        for an answer that will not arrive. A backend that failed is skipped for
+        `_STORE_VIEW_UNREACHABLE_FOR_S` and reports the same `{}` it would have
+        reported after waiting -- the ANSWER is unchanged, only the waiting is.
         """
+        failures = self._store_view_failures()
+        last_failed = failures.get(backend)
+        if (
+            last_failed is not None
+            and (time.time() - last_failed) < _STORE_VIEW_UNREACHABLE_FOR_S
+        ):
+            return {}
         probe = "cpsam" if backend == "cellpose" else None
         try:
             runtime = self._runtime_for(probe)
-            out = await asyncio.wait_for(runtime.ping(), timeout=5.0)
-            store = (out or {}).get("store")
-            return store if isinstance(store, dict) else {}
+            out = await asyncio.wait_for(
+                runtime.ping(), timeout=_STORE_VIEW_PING_TIMEOUT_S
+            )
         except Exception as exc:
+            failures[backend] = time.time()
             logger.warning(
                 f"could not read the {backend} runtime's store verdict: "
-                f"{type(exc).__name__}: {str(exc)[:120]}"
+                f"{type(exc).__name__}: {str(exc)[:120]}. Not asking it again "
+                f"for {_STORE_VIEW_UNREACHABLE_FOR_S:.0f}s."
             )
             return {}
+        # Cleared on success, so a runtime that comes back is asked again
+        # without waiting out the window.
+        failures.pop(backend, None)
+        store = (out or {}).get("store")
+        return store if isinstance(store, dict) else {}
 
     async def _require_runtime_store_writable(
         self, model_type: Optional[str] = None
@@ -1557,16 +1622,6 @@ class EntryApp:
         ``UPSCALING``, which never times out."""
         import training
 
-        microsam = (
-            await self._gpu_view("microsam")
-            if "microsam" in self._enabled_backends
-            else {}
-        )
-        cellpose = (
-            await self._gpu_view("cellpose")
-            if "cellpose" in self._enabled_backends
-            else {}
-        )
         # THE RUN STORE, per backend. A runtime replica has its own HOME, so a
         # backend can have a perfectly good GPU and still be unable to write a
         # single run record -- which is what happened in production while this
@@ -1574,11 +1629,31 @@ class EntryApp:
         # that the status half of this row's clause 1, and it was right: the
         # refusal at `start_training` tells a user who has already committed to
         # a run, while the page reads THIS.
-        stores = {
-            b: await self._backend_store_view(b)
-            for b in ("microsam", "cellpose")
-            if b in self._enabled_backends
-        }
+        #
+        # EVERY VIEW IS GATHERED CONCURRENTLY, and the first version of this
+        # awaited them one after another. A review measured what that cost: with
+        # VRAM declared, both backends enabled and one runtime whose `ping`
+        # hangs, the call took 10.01 s and still returned no store verdict. The
+        # declared path exists precisely to answer CPU-side without waking a
+        # GPU, and serialising four awaits turned the page's poll into the sum
+        # of every timeout. Concurrently the worst case is the LONGEST one, not
+        # the sum -- and with VRAM declared the GPU views cost nothing at all,
+        # so what is left is a single bounded store probe.
+        enabled = [b for b in ("microsam", "cellpose") if b in self._enabled_backends]
+
+        async def _nothing() -> Dict[str, Any]:
+            return {}
+
+        gpu_order = ("microsam", "cellpose")
+        views = await asyncio.gather(
+            *(
+                self._gpu_view(b) if b in self._enabled_backends else _nothing()
+                for b in gpu_order
+            ),
+            *(self._backend_store_view(b) for b in enabled),
+        )
+        microsam, cellpose = views[0], views[1]
+        stores = dict(zip(enabled, views[len(gpu_order) :]))
 
         models = []
         for m in ModelType.__args__:

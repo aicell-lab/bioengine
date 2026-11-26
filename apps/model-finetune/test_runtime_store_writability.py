@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import time
 
 import pytest
 
@@ -377,10 +378,10 @@ class _PingRuntime:
         return self._store
 
 
-def _caps_entry(monkeypatch, store, *, backends=("cellpose",), fail=False):
+def _caps_entry(monkeypatch, store, *, backends=("cellpose",), fail=False, runtime=None):
     cls = _entry_class()
     inst = cls.__new__(cls)
-    rt = _PingRuntime(store, fail=fail)
+    rt = runtime if runtime is not None else _PingRuntime(store, fail=fail)
     inst._enabled_backends = set(backends)
     inst._runtime_for = lambda model_type=None: rt
     # The two deploy-time declarations `_gpu_view` reads. Set explicitly
@@ -388,8 +389,37 @@ def _caps_entry(monkeypatch, store, *, backends=("cellpose",), fail=False):
     # so the only thing that can make a model untrainable here is the store.
     inst.declared_gpu_memory_mb = 40000
     inst.declared_gpu_device = "declared-for-test"
+    # This instance skips __init__, so the state the method uses is set here
+    # rather than left to an AttributeError. Empty means "no backend has been
+    # found unreachable yet", which is what a fresh replica has.
+    inst._store_view_unreachable_at = {}
     inst._rt = rt
     return inst
+
+
+class _HungRuntime:
+    """A runtime whose `ping` never answers.
+
+    The permanent case on a cluster with fewer GPUs than enabled backends: the
+    deployment sits UPSCALING and the handle's call never returns. Not an
+    exception and not slow -- it does not come back at all, which is why only a
+    timeout bounds it.
+    """
+
+    def __init__(self):
+        self.pings = 0
+        self.store_status_calls = 0
+
+    async def ping(self):
+        self.pings += 1
+        await asyncio.Event().wait()  # forever
+
+    async def store_status(self, max_age_s=None):
+        self.store_status_calls += 1
+        await asyncio.Event().wait()
+
+    async def gpu_memory_info(self):
+        await asyncio.Event().wait()
 
 
 @pytest.mark.asyncio
@@ -443,6 +473,160 @@ async def test_a_runtime_that_cannot_be_ASKED_is_not_reported_as_either(monkeypa
     assert caps["stores"]["cellpose"]["writable"] is None, caps["stores"]
     for m in [m for m in caps["models"] if m["backend"] == "cellpose"]:
         assert m["trainable"] is not False or "store" not in m["reason"], m
+
+
+# ── what the status surface COSTS, because the page polls it ───────────────
+#
+# Review round 2's finding 3, as tests. Adding the store view made this method
+# ping every enabled runtime, and the first version did it one await after
+# another with a 5 s timeout each -- so with VRAM declared, both backends
+# enabled and one hung runtime it took 10.01 s and returned no verdict anyway.
+# The declared path exists to answer CPU-side without waking a GPU, so that was
+# a regression in the exact case the path was built for.
+#
+# A BOUND, NOT A STOPWATCH READING. These assert an upper bound comfortably
+# below the broken behaviour and comfortably above the fixed one, so they fail
+# on the regression returning and do not fail on a loaded machine.
+
+
+@pytest.mark.asyncio
+async def test_CAPABILITIES_IS_BOUNDED_against_a_HUNG_runtime(monkeypatch):
+    """The measured regression, as a failing condition.
+
+    Two enabled backends and a runtime that never answers. Serialised at 5 s
+    each this was 10 s; gathered and bounded it is one timeout.
+    """
+    import entry
+
+    hung = _HungRuntime()
+    inst = _caps_entry(
+        monkeypatch, None, backends=("microsam", "cellpose"), runtime=hung
+    )
+
+    started = asyncio.get_running_loop().time()
+    caps = await inst.get_training_capabilities()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    # AN ABSOLUTE BOUND, not one derived from the timeout constant. Deriving it
+    # would make the test rise with the thing it is meant to constrain: a change
+    # putting the timeout back to 5 s would also move the bound to 6 s and pass.
+    # 3 s is comfortably above the fixed behaviour (one 2 s timeout) and
+    # comfortably below the measured regression (10.01 s).
+    BOUND_S = 3.0
+    assert elapsed < BOUND_S, (
+        f"capabilities took {elapsed:.2f}s against a hung runtime, over the "
+        f"{BOUND_S:.1f}s bound. Serialised per-backend awaits at 5s each were "
+        "measured at 10.01s for this exact case."
+    )
+    # And the configured timeout is small enough that the bound is not merely
+    # met by luck on a fast machine.
+    assert entry._STORE_VIEW_PING_TIMEOUT_S <= 2.0, entry._STORE_VIEW_PING_TIMEOUT_S
+    # And the answer is the honest one: could not ask, not a verdict. Compared
+    # against `None` explicitly rather than falsily -- `False` is also falsy and
+    # is the OPPOSITE claim, so a `not ...` test here would accept the one
+    # answer this row exists to keep out.
+    for backend in ("microsam", "cellpose"):
+        assert caps["stores"][backend]["writable"] is None, caps["stores"]
+
+
+@pytest.mark.asyncio
+async def test_the_views_are_GATHERED_not_awaited_one_after_another(monkeypatch):
+    """The mechanism, independent of wall-clock.
+
+    A timing bound alone could be met by shortening the timeout while keeping
+    the awaits serial, which is only a smaller version of the same bug. This
+    asserts both backends were in flight AT ONCE: each ping records how many
+    were running when it started, and a serial implementation can never see
+    more than one.
+    """
+    inflight = {"now": 0, "max": 0}
+
+    class _CountingRuntime:
+        def __init__(self):
+            self.pings = 0
+            self.store_status_calls = 0
+
+        async def ping(self):
+            self.pings += 1
+            inflight["now"] += 1
+            inflight["max"] = max(inflight["max"], inflight["now"])
+            try:
+                await asyncio.sleep(0.05)
+                return {"status": "ok", "store": {"writable": True, "detail": "ok"}}
+            finally:
+                inflight["now"] -= 1
+
+    inst = _caps_entry(
+        monkeypatch, None, backends=("microsam", "cellpose"), runtime=_CountingRuntime()
+    )
+    await inst.get_training_capabilities()
+    assert inflight["max"] == 2, (
+        f"at most {inflight['max']} store view(s) were in flight at once; the "
+        "two backends were awaited one after another"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_backend_that_did_not_answer_IS_NOT_ASKED_AGAIN_immediately(
+    monkeypatch,
+):
+    """The other half, and the one that matters for a POLLED method.
+
+    An under-GPU'd cluster leaves a backend UPSCALING indefinitely, so a bound
+    paid once per poll is still a bound paid forever. The first poll pays the
+    timeout; the next polls inside the window must not.
+    """
+    import entry
+
+    hung = _HungRuntime()
+    inst = _caps_entry(monkeypatch, None, backends=("cellpose",), runtime=hung)
+
+    await inst.get_training_capabilities()
+    assert hung.pings == 1, hung.pings
+
+    started = asyncio.get_running_loop().time()
+    await inst.get_training_capabilities()
+    second = asyncio.get_running_loop().time() - started
+
+    assert hung.pings == 1, f"the hung runtime was asked again ({hung.pings} pings)"
+    assert second < 0.5, f"the second poll still took {second:.2f}s"
+
+    # THE CONTROL on that window: once it lapses the backend IS asked again, so
+    # a runtime that comes up is not written off permanently.
+    inst._store_view_unreachable_at["cellpose"] = (
+        time.time() - entry._STORE_VIEW_UNREACHABLE_FOR_S - 1
+    )
+    await inst.get_training_capabilities()
+    assert hung.pings == 2, (
+        "the backend was never asked again after the window lapsed, so an "
+        "unreachable runtime would be written off for the life of the replica"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_that_ANSWERS_is_not_penalised_by_an_earlier_failure(
+    monkeypatch,
+):
+    """The success path clears the mark. Without this a single blip would
+    suppress the store verdict for the whole window, which is the fault this
+    row exists to report."""
+    inst = _caps_entry(monkeypatch, {"writable": True, "detail": "ok"})
+    inst._store_view_unreachable_at["cellpose"] = time.time() - 1  # inside the window
+
+    # Inside the window it is skipped, so the verdict is "could not ask" --
+    # which the method reports as `writable: None`, the same third answer an
+    # unreachable runtime gets, rather than as a verdict.
+    caps = await inst.get_training_capabilities()
+    assert caps["stores"]["cellpose"]["writable"] is None, caps["stores"]
+    assert inst._rt.pings == 0, "the skipped backend was pinged anyway"
+
+    # ... and once the mark is gone the real verdict comes back and STAYS back.
+    inst._store_view_unreachable_at.clear()
+    caps = await inst.get_training_capabilities()
+    assert caps["stores"]["cellpose"]["writable"] is True, caps["stores"]
+    assert "cellpose" not in inst._store_view_unreachable_at
+    caps = await inst.get_training_capabilities()
+    assert caps["stores"]["cellpose"]["writable"] is True, caps["stores"]
 
 
 # ── the gate is REACHED, not merely present in the source ──────────────────
