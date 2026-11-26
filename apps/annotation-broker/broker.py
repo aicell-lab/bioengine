@@ -1589,7 +1589,17 @@ class AnnotationBroker:
         # was ever public and never shrink. The authority is walked anyway, so
         # this costs one set difference.
         live_ids = {m["artifact_id"] for m in metas}
-        for gone in [k for k in self._public_card_cache if k not in live_ids]:
+        # THE UNION OF BOTH DICTS, not the cache's keys. A review found the leak:
+        # iterating the CACHE means an artifact whose read never SUCCEEDED has no
+        # cache entry, so its key never comes up and its lock is never dropped --
+        # one asyncio.Lock left behind per such id, in an app that runs for weeks.
+        # The `pop` on the lock was already here and was simply unreachable for
+        # exactly the ids that needed it.
+        for gone in [
+            k
+            for k in set(self._public_card_cache) | set(self._public_card_locks)
+            if k not in live_ids
+        ]:
             self._public_card_cache.pop(gone, None)
             self._public_card_locks.pop(gone, None)
 

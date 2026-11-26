@@ -401,3 +401,46 @@ async def test_THE_WAITER_GETS_THE_WINNERS_ANSWER_not_a_second_read(
     await asyncio.gather(*(b.list_public_datasets() for _ in range(4)))
 
     assert b._tam.calls["read"] == 1, b._tam.calls
+
+
+async def test_A_LOCK_FOR_AN_ID_WHOSE_READ_NEVER_SUCCEEDED_IS_ALSO_EVICTED(
+    monkeypatch, tmp_path
+):
+    """The leak a review found, and the reason it was invisible.
+
+    The eviction already popped the lock — but it iterated the CACHE's keys, and
+    an artifact whose read never SUCCEEDED has no cache entry, so its key never
+    came up. One `asyncio.Lock` was left behind per such id, for ever, in an app
+    that runs for weeks. The `pop` was there and unreachable for exactly the ids
+    that needed it, which is why every other eviction test passed.
+
+    Driven through the shipped method: a failing read creates the lock and no
+    card, then the dataset is unpublished, then the gallery is read again.
+    """
+    b = _broker(monkeypatch, tmp_path, 2)
+
+    async def _always_fails(artifact_id=None, **_kw):
+        b._tam._tick("read")
+        raise RuntimeError("the artifact manager is down")
+
+    monkeypatch.setattr(b._tam, "read", _always_fails)
+    await b.list_public_datasets()
+
+    assert b._public_card_cache == {}, "a failed read must cache nothing"
+    assert set(b._public_card_locks) == {
+        "bioimage-io/pub-000",
+        "bioimage-io/pub-001",
+    }, b._public_card_locks
+
+    meta = core.read_metadata("bioimage-io/pub-000", root=tmp_path)
+    meta["public"] = False
+    core.write_metadata(meta, root=tmp_path)
+
+    await b.list_public_datasets()
+
+    assert (
+        "bioimage-io/pub-000" not in b._public_card_locks
+    ), "the lock for an unpublished id whose read never succeeded is leaked"
+    assert (
+        "bioimage-io/pub-001" in b._public_card_locks
+    ), "the still-public id's lock must NOT be dropped"
