@@ -847,3 +847,84 @@ def test_the_too_small_message_declines_a_spec_04_descriptor() -> None:
     """There is no actionable sentence to offer about axes we cannot read."""
     too_small = _load_fn("_fixed_extent_too_small")
     assert too_small(_v04_descr(), _sample(512, 512)) is None
+
+
+def _branch_with_real_predicates(descr: Any, sample: Any, cellpose: bool = False) -> str:
+    """Evaluate the REAL chain conditions with the REAL predicates loaded from the script.
+
+    ``_selected_branch`` injects booleans, which pins the chain's SHAPE but cannot show what a
+    particular descriptor does to it. This drives the shipped predicates themselves.
+    """
+    env: Dict[str, Any] = {
+        "cellpose": cellpose,
+        "default_blocksize_parameter": None,
+        "_fits_whole": _load_fits_whole(),
+        "_all_space_axes_fixed": _load_fn("_all_space_axes_fixed"),
+        "pipeline": type("P", (), {"model_description": descr})(),
+        "sample": sample,
+    }
+    for cond, branch in _dispatch_chain():
+        if cond is None:
+            return branch
+        if eval(cond, dict(env)):  # noqa: S307 - the condition is our own source
+            return branch
+    return "none"
+
+
+def test_a_spec_04_descriptor_reaches_the_final_else_through_the_REAL_chain() -> None:
+    """The restored path, driven rather than reasoned about.
+
+    The other 0.4 tests assert each predicate in isolation; this one feeds a 0.4 descriptor to the
+    real predicates through the real chain conditions and names the branch it lands on. That is the
+    branch an unguarded build cannot reach, because it raises before deciding.
+    """
+    assert _branch_with_real_predicates(_v04_descr(), _sample(512, 512)) == "final-else"
+
+
+def test_a_real_05_descriptor_still_reaches_skip_padding_through_the_REAL_chain() -> None:
+    """The paired control: the guard must not quietly disable the skip path for 0.5.
+
+    Without this, a guard that declined EVERYTHING would pass every 0.4 test above.
+    """
+    assert _branch_with_real_predicates(_fixed_256_model(), _sample(256, 256)) == "skip-padding"
+
+
+class _IdButStringAxes:
+    """Has ``id``, but ``axes`` is a string. Isolates the str check in the guard."""
+
+    def __init__(self) -> None:
+        self.id = "input0"
+        self.axes = "bcyx"
+
+
+class _IdAndListButAxisHasNoType:
+    """Has ``id`` and a LIST of axes, but the axis objects carry no ``.type``."""
+
+    def __init__(self) -> None:
+        self.id = "input0"
+        self.axes = [object(), object()]
+
+
+def test_the_guard_rejects_string_axes_even_when_id_is_present() -> None:
+    """A string-axes input is rejected even when ``id`` is present.
+
+    This pins the OUTCOME, not one arm. Measured by mutation: deleting the
+    ``isinstance(axes, str)`` arm leaves this GREEN, because iterating a string yields characters
+    and the ``hasattr(axis, "type")`` arm below rejects them. The two arms overlap by construction
+    and no input can separate them, so claiming this test isolates the string check would be
+    false. What it does pin is that ``id`` alone is not enough to be accepted.
+    """
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_Descr([_IdButStringAxes()])) is False
+
+
+def test_the_guard_rejects_axis_objects_without_a_type_attribute() -> None:
+    """Isolates the last check, for the same reason as the one above."""
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_Descr([_IdAndListButAxisHasNoType()])) is False
+
+
+def test_the_guard_accepts_a_real_05_shaped_descriptor() -> None:
+    """The positive arm: a guard that rejected everything would pass all four tests above."""
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_fixed_256_model()) is True

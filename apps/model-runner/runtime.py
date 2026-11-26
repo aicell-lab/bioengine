@@ -199,6 +199,12 @@ def _axes_are_objects(descr):
         if getattr(ipt, "id", None) is None:
             return False
         axes = getattr(ipt, "axes", None)
+        # The ``str`` arm is a FAST, EXPLICIT rejection of the 0.4 shape, and it is
+        # deliberately redundant: delete it and the loop below still rejects, because
+        # iterating a string yields CHARACTERS and a character has no ``.type``. No
+        # input can distinguish the two arms, so no test can pin this one alone --
+        # it earns its place by naming the 0.4 shape at the point of decision, not by
+        # changing any answer.
         if axes is None or isinstance(axes, str):
             return False
         for axis in axes:
