@@ -1830,7 +1830,6 @@ PUBLIC_DATASET_FIELDS = (
     "name",
     "description",
     "image_count",
-    "owner_display",
 )
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -1863,19 +1862,27 @@ def iter_public_metadata(root: Optional[Path] = None) -> List[Dict[str, Any]]:
     return out
 
 
-def owner_display(metadata: Dict[str, Any]) -> Optional[str]:
-    """A display string for the owner that is NEVER an email address.
-
-    Broker metadata stores ``{"id", "email"}`` and nothing resembling a name,
-    so the id is the only non-email identifier available. When the id is
-    itself an address -- some logins record one -- there is nothing publishable
-    and this returns ``None`` rather than inventing something.
-    """
-    owner = metadata.get("owner") or {}
-    ident = owner.get("id")
-    if isinstance(ident, str) and ident and not _EMAIL_RE.search(ident):
-        return ident
-    return None
+# THE GALLERY CARD NAMES NO OWNER, and that is a decision rather than an
+# omission.
+#
+# An earlier version published the owner's id -- `github|…` -- on the grounds
+# that it is not an email address and that broker metadata holds nothing else.
+# Both halves were true and the conclusion was still wrong. The requirement for
+# this method is "no emails AND no user ids", and the id is a stable account
+# identifier for a named individual: the one measured on the live gallery was
+# the same id that holds the collection's `"*"` grant. Publishing it on a page
+# anyone can read is a smaller version of the exposure this gallery exists to
+# replace.
+#
+# What was never priced was the third option. A display name does not exist to
+# offer instead -- measured on the live artifact, `manifest.owner` is `{id,
+# email}` and `created_by` is the id, with nothing name-like anywhere -- so the
+# choice was only ever "an account id" or "no owner", and no owner is the one
+# that meets the requirement. The card loses a line; nobody loses an identifier.
+#
+# There is deliberately no `owner_display` helper left to call. A function that
+# returned `None` would be a slot for somebody to fill back in later with
+# whatever identifier is to hand, which is exactly how this field arrived.
 
 
 def public_dataset_entry(
@@ -1887,16 +1894,19 @@ def public_dataset_entry(
 ) -> Dict[str, Any]:
     """Project one public dataset down to its gallery card.
 
-    Every value is scrubbed for email addresses on the way out, not just the
-    owner field: ``name`` and ``description`` are free text an owner typed and
-    could contain one.
+    **No owner field** -- see the block comment above for why the card names
+    nobody. ``metadata`` is still the argument because it carries the
+    ``artifact_id``; nothing identifying is read out of it.
+
+    Every value is still scrubbed for email addresses on the way out, and that
+    is not redundant now the owner is gone: ``name`` and ``description`` are
+    free text an owner typed and either could contain an address.
     """
     entry = {
         "artifact_id": metadata.get("artifact_id"),
         "name": _scrub_emails(name),
         "description": _scrub_emails(description),
         "image_count": image_count,
-        "owner_display": _scrub_emails(owner_display(metadata)),
     }
     return {k: entry.get(k) for k in PUBLIC_DATASET_FIELDS}
 
