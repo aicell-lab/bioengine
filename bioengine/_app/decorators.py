@@ -246,6 +246,16 @@ def app(
             zero.
         memory_mb: Soft memory cap in megabytes. Converted to Ray's bytes
             convention internally.
+
+            The amount the app RESERVES on a node is larger than this: the
+            application's ProxyDeployment -- one per application, not one per
+            deployment -- adds a fixed
+            ``proxy_memory_in_gb`` (default 0.5 GiB = 512 MiB) on top, and
+            scheduling is checked against the total. So ``memory_mb=4096``
+            needs 4608 MiB free, and asking for exactly a node's advertised
+            memory is refused. The proxy's share is a FIXED amount, not a
+            percentage -- at 2048 MiB it is 25% of the request and at 8192
+            it is 6.25%.
         pip: Additional pip requirements for the replica's runtime_env on
             top of BioEngine's baseline (``hypha-rpc``, plus the bioengine
             source itself via ``py_modules`` rather than pip). Mutually

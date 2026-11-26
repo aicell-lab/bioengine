@@ -1244,6 +1244,74 @@ class AnnotationBroker:
         await self._apply_permissions(artifact_id, meta)
         return meta
 
+    @bioengine.method()
+    async def list_public_datasets(self) -> List[Dict[str, Any]]:
+        """The public gallery: datasets whose owner called ``set_public(True)``.
+
+        Callable by anyone, including an anonymous visitor, because that is
+        who the gallery is for. It takes no ``context`` at all -- there is no
+        identity-dependent behaviour here, and a method that cannot see who is
+        calling cannot accidentally vary by caller.
+
+        **Served from the broker's OWN flag**, the same one ``resolve_role``
+        consults when it decides whether an anonymous caller may read a
+        dataset. That is deliberate: a gallery built on any other source could
+        advertise a dataset the read path then refuses, or hide one it would
+        happily serve. It also means the gallery works regardless of the
+        parent collection's permissions -- the broker reads the artifacts with
+        the app's own credential, and an anonymous visitor never touches the
+        artifact manager directly.
+
+        **No email addresses, and NO OWNER AT ALL.** The response is an
+        allow-list of fields and every string in it is scrubbed on the way out,
+        because a name or a description is free text somebody typed.
+
+        The card names nobody. An earlier version published the owner's account
+        id on the grounds that it is not an email address, which was true and
+        still wrong: the requirement is no emails AND no user ids, and the id
+        measured on the live gallery was a named individual's real account --
+        the same one holding the collection's `"*"` grant. No display name
+        exists to offer instead, so the choice was "an account id" or "no
+        owner". See the block comment above `public_dataset_entry` in
+        broker_core for the measurement behind that.
+
+        One artifact read per public dataset, for the name, description and
+        image count. That is proportional to the number of PUBLIC datasets
+        rather than to all of them, and a dataset whose artifact cannot be
+        read is listed with whatever is known rather than dropped -- a
+        gallery that silently shrinks is worse than one with a sparse card.
+        """
+        entries: List[Dict[str, Any]] = []
+        for meta in core.iter_public_metadata(STATE_ROOT):
+            artifact_id = meta["artifact_id"]
+            name = description = None
+            image_count = None
+            try:
+                art = await self._am.read(artifact_id=artifact_id)
+                manifest = (art or {}).get("manifest") or {}
+                name = manifest.get("name")
+                description = manifest.get("description")
+            except Exception:
+                # Deliberately not logged per dataset: the id comes from the
+                # broker's own state, but the read is a network call and a
+                # transient failure must not turn the gallery into a log
+                # amplifier. The sparse card is the whole response.
+                pass
+            try:
+                manifest_images = await self._image_manifest(artifact_id)
+                image_count = len(manifest_images)
+            except Exception:
+                pass
+            entries.append(
+                core.public_dataset_entry(
+                    meta,
+                    name=name,
+                    description=description,
+                    image_count=image_count,
+                )
+            )
+        return entries
+
     @bioengine.method(context=True)
     async def set_public(
         self,
@@ -1867,6 +1935,153 @@ class AnnotationBroker:
         return {"already": False, "stem": stem, **entries[stem]}
 
     @bioengine.method(context=True)
+    async def upload_local_image(
+        self,
+        artifact_id: str = Field(..., description="Dataset artifact id."),
+        filename: str = Field(
+            ...,
+            description=(
+                "Final filename component of the image, with extension: "
+                "'scan01.png'. Not a path."
+            ),
+        ),
+        done: bool = Field(
+            False,
+            description=(
+                "False to start (returns a presigned PUT URL), true to finish "
+                "(verifies the bytes landed and commits them)."
+            ),
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Presigned PUT for ONE local image, in two calls.
+
+        This is the only route by which an image the user holds locally can
+        enter a dataset without mounting a folder. A browser without the File
+        System Access API cannot mount one, and the mount is what registers
+        the data-provider service every other upload route goes through, so
+        without this such a browser could open and annotate somebody else's
+        data but could never contribute its own.
+
+        Call once with ``done=False``:
+
+            {"already": false, "stem", "path", "put_url", "max_bytes"}
+            {"already": true,  "stem", "path"}   # that stem is already an image
+
+        then, after the PUT lands, once with ``done=True``.
+
+        As with ``materialise_image`` the PUT must send the body **bare, with
+        no Content-Type header**: the presigned signature covers that header,
+        so setting it is a 403.
+
+        **The manifest entry is not written here.** The object lands at
+        ``images/<stem><ext>`` and the ordinary listing reconciliation turns
+        it into a ``local`` entry, which is exactly what happens to an image
+        uploaded through a mount. Writing the entry here instead would be a
+        second code path that could drift from that one; leaving it to the
+        reconciliation is what makes the two indistinguishable afterwards,
+        rather than merely similar.
+
+        Requires the manager role: this adds data to somebody's dataset, where
+        materialising only converts an image the dataset already has.
+        """
+        artifact_id = self._canonical_id(artifact_id)
+        self._require_role(context, artifact_id, "manager")
+        stem, ext = core.split_local_image_filename(filename)
+        name = f"{stem}{ext}"
+        path = f"images/{name}"
+
+        if not done:
+            # Past the TTL cache deliberately: "is this stem taken?" is
+            # exactly the question a cached answer gets wrong, and the cost of
+            # getting it wrong is overwriting an image somebody else uploaded.
+            #
+            # The manifest ALONE is not the dataset's image list, and reading
+            # only it was a real defect rather than a hypothetical one. The
+            # list is the manifest reconciled against the `images/` listing,
+            # which is exactly why this route can leave the entry to that
+            # reconciliation -- and therefore exactly why its own earlier
+            # uploads are NOT in the manifest it would have read. Two ways that
+            # bit:
+            #
+            #   * `images/scan01.png` present but not yet in the manifest read
+            #     as free, so the mint handed out a URL for that same path and
+            #     the upload replaced the image, orphaning its annotations;
+            #   * `scan01.tif` present and `scan01.png` uploaded collapsed into
+            #     ONE stem entry, so depending on the extensions either the new
+            #     image never appeared or it silently replaced the one the
+            #     annotations were drawn on.
+            #
+            # Reconciling here asks the same question the readers ask, so the
+            # answer cannot disagree with them.
+            doc = await self._read_json_file(
+                artifact_id, core.IMAGE_MANIFEST_PATH, None
+            )
+            listing = await self._list_files_safe(artifact_id, "images")
+            # prune=False: this is a read, and pruning is for the writer that
+            # owns the manifest. A stem whose file has gone is still "taken"
+            # for the purposes of not clobbering it here.
+            entries, _changed = core.merge_image_manifest(
+                core.parse_image_manifest(doc),
+                core.image_names_from_listing(listing),
+            )
+            existing = entries.get(stem)
+            if isinstance(existing, dict):
+                # Refused rather than overwritten, and reported as "already"
+                # rather than as an error, because the caller uploading a
+                # whole folder should be able to skip this one and carry on.
+                # A stem is the manifest key, so re-using one would replace a
+                # different image -- possibly a remote source, possibly one
+                # with annotations already drawn against it.
+                return {
+                    "already": True,
+                    "stem": stem,
+                    "path": existing.get("path"),
+                }
+
+            put_url_holder: Dict[str, str] = {}
+
+            async def _mint():
+                put_url_holder["url"] = await self._am.put_file(
+                    artifact_id, file_path=path
+                )
+
+            await self._ensure_staged(artifact_id, _mint)
+            return {
+                "already": False,
+                "stem": stem,
+                "path": path,
+                "put_url": put_url_holder["url"],
+                "max_bytes": core.MAX_LOCAL_IMAGE_BYTES,
+            }
+
+        # A presigned PUT reports success from S3, not from the artifact
+        # manager, so the client saying it uploaded an image is not evidence
+        # that an image is there. Check the signature against the extension
+        # the caller declared before anything records a readable image at this
+        # path: an error page or a truncated body stored under a .png name
+        # would otherwise become a dataset image that fails to open later,
+        # with nothing pointing back here.
+        head = await self._object_head(artifact_id, path, 8)
+        if not core.header_matches_ext(ext, head):
+            raise ValueError(
+                f"The bytes at '{path}' are not a {ext.lstrip('.').upper()} "
+                f"image. The upload did not land, or something other than the "
+                f"file was stored. Re-run with done=False and PUT again, "
+                f"sending the body with no Content-Type header."
+            )
+        await self._commit_tolerating_pending_uploads(artifact_id)
+        # Drop the cached image list. Every other route that adds or removes an
+        # image refreshes it; without this the next `get_dataset_index` can be
+        # served a list computed up to `MANIFEST_CACHE_TTL_S` ago and leave out
+        # the image that was just uploaded -- so the caller is told the upload
+        # succeeded and then cannot see it. Popped rather than rewritten
+        # because this route does not build `entries`: the reconciliation does,
+        # and the next read will do it with the new file present.
+        self._image_manifest_cache.pop(artifact_id, None)
+        return {"already": False, "stem": stem, "path": path, "committed": True}
+
+    @bioengine.method(context=True)
     async def create_label(
         self,
         artifact_id: str = Field(..., description="Dataset artifact id."),
@@ -2062,10 +2277,18 @@ class AnnotationBroker:
           presigned as before. The pre-0.10.0 shape is a subset of this one,
           so a stale frontend still renders local images.
         * ``{"stem", "kind": "ngff", "store_root", "multiscale_path",
-          "region"}`` -- a remote OME-Zarr source the browser reads directly.
-          ``region`` is null unless the image was imported as a patch of a
-          whole-slide source, in which case it is the crop, in level-0 pixels,
-          that the reader must confine itself to.
+          "region", "planes", "level0_shape"}`` -- a remote OME-Zarr source the
+          browser reads directly. ``region`` is null unless the image was
+          imported as a patch of a whole-slide source, in which case it is the
+          crop, in level-0 pixels, that the reader must confine itself to.
+          ``planes`` is which slice of each non-spatial axis the annotation
+          belongs to, by axis NAME, or null when none was recorded; and
+          ``level0_shape`` is the level-0 dataset shape the per-level plane
+          index is derived from, or null. Note it is POSITIONAL and the axis
+          names are NOT returned, so a reader must take axis order from the
+          store's own ``multiscales`` metadata. Both are needed together: a pyramid
+          that resamples z has a different index per level for the same
+          physical slice, and neither value alone lets a reader work out which.
 
         For a remote source any credential is spliced in **here**, after the
         role check, and never stored in the artifact (design §12).
@@ -2083,12 +2306,35 @@ class AnnotationBroker:
                 )
             store_root = source.get("store_root") or ""
             credential = (meta.get("ngff_credentials") or {}).get(store_root)
+            layout = source.get("layout") or {}
             return {
                 "stem": image_stem,
                 "kind": "ngff",
                 "store_root": core.apply_store_credential(store_root, credential),
                 "multiscale_path": source.get("multiscale_path"),
                 "region": source.get("region"),
+                # Both recorded at import and both needed by the viewer to pick
+                # the right slice at every pyramid level. `planes` says which
+                # slice of each non-spatial axis the annotation belongs to;
+                # `level0_shape` is what a level's own plane index is derived
+                # FROM, since a pyramid that resamples z has a different index
+                # per level for the same physical slice.
+                #
+                # Dropping them here is not cosmetic. On a z-downsampled store
+                # each level otherwise pins its own middle slice, so a region
+                # recorded at z 4 of 9 is drawn at level 1 index 2 -- which
+                # covers level-0 slices 4.5 to 6.75 and does not include 4. The
+                # annotation would be made on one slice and the record would
+                # name another, which is the mispairing the plane exists to
+                # prevent, reappearing one level down.
+                #
+                # NULL rather than absent when unrecorded: a 2-D source has no
+                # plane to report, and the viewer distinguishes "no plane, draw
+                # the only slice" from "plane unknown, refuse". An absent key
+                # and an explicit null are the same thing over this transport,
+                # but the explicit form is what the shape above documents.
+                "planes": source.get("planes") or None,
+                "level0_shape": layout.get("level0_shape") or None,
             }
 
         read_url = await self._am.get_file(

@@ -602,6 +602,59 @@ class EntryApp:
         # CPU-only methods stay served when the runtime is down/scaling.
         if self._s3 is None:
             raise RuntimeError("S3 storage service not connected")
+
+        # The run store has to be WRITABLE, and this replica is the only thing
+        # that can find out -- so this probe writes, rather than asking whether
+        # the directory exists. Every run-touching method resolves it, so a replica
+        # that cannot reach it serves none of them -- but it answers everything
+        # else perfectly well, so without this check Serve sees a healthy actor
+        # and leaves it in the routing table.
+        #
+        # Measured 2026-11-25: a replica whose `Path.home()` was `/home/ray` on
+        # a read-only filesystem reported RUNNING with every deployment HEALTHY
+        # while `start_training`, `list_training_sessions` and
+        # `get_training_status` all failed identically. `get_training_capabilities`
+        # still worked, which is why nothing looked wrong from outside.
+        #
+        # Raising makes Serve replace the replica, which is the remedy this
+        # method already relies on for a dead Hypha connection below. Do NOT
+        # read that as "rescheduling fixes this": the broken replica and a
+        # working one had the SAME read-only /home/ray, and what differed was
+        # whether the per-application HOME override took effect inside the
+        # process (`bioengine/_app/replica_init.py` sets HOME to the app's own
+        # directory on the shared mount). So replacement helps only if that
+        # failure was transient; if it is not, the replica keeps failing this
+        # check and the app reports UNHEALTHY, which is the honest outcome and
+        # the one this issue asks for. Cheap either way: the records a caller
+        # polls are on disk, so a teardown between calls is invisible to the
+        # frontend.
+        #
+        # The probe WRITES. `sessions_root()` alone proves only that the
+        # directory could be created, and `mkdir(exist_ok=True)` succeeds on a
+        # directory that already exists however read-only it is -- Linux reports
+        # EEXIST before EROFS. A store that exists and refuses writes is exactly
+        # this issue's symptom, so checking creatability would have passed the
+        # replica that provoked the report.
+        #
+        # Off the event loop and time-limited, like the echo probe below: this
+        # is a synchronous round trip to an NFS mount, and a hung mount would
+        # otherwise block the whole replica's loop and fail only via Serve's own
+        # 30s timeout, with the less specific failure that probe exists to avoid.
+        import training
+
+        loop = asyncio.get_event_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, training.assert_sessions_root_writable),
+                timeout=_HEALTH_CALL_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"training-run store did not answer a write within "
+                f"{_HEALTH_CALL_TIMEOUT_S:.0f}s; treating the mount as hung"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"training-run store unusable: {exc}") from exc
         # The `is None` test above cannot fail on a DEAD handle. hypha_rpc pins a proxy
         # to one client instance of the server; when that instance is gone every call
         # fails at send time forever while the websocket underneath happily reconnects.
@@ -1274,22 +1327,49 @@ class EntryApp:
     async def _preparing_heartbeat(
         self, session_id: str, interval: float = 60.0
     ) -> None:
-        """Refresh status.json's ``updated_at`` while a run is still PREPARING.
+        """Refresh status.json's ``updated_at`` while a run is PREPARING or QUEUED.
 
         Nothing between the PREPARING write and the runtime's TRAINING write
         reports progress — input resolution, a cold runtime replica coming up,
         the GPU lock — so on a cold instance that span can exceed
         STATUS_STALE_SECONDS and get_status sweeps a healthy run to STOPPED.
-        Exits as soon as the status moves on, so a wedged TRAINING run is still
-        swept; the worker's own heartbeat covers that phase.
+
+        **QUEUED is covered too, and that is not cosmetic.** The semaphore
+        caps concurrent trainings at one by default, so a second run waits here
+        for as long as the first one trains — routinely far longer than the
+        stale window. Nothing else refreshes the record in that phase, so
+        without this the operator listing marks a perfectly healthy queued run
+        as stale, i.e. "probably dead", and the obvious response to that is to
+        stop somebody's valid job. Covering QUEUED is what makes a stale QUEUED
+        record mean what it claims: the replica that was waiting is gone.
+
+        Exits as soon as the status moves beyond those two, so a wedged
+        TRAINING run is still swept; the worker's own heartbeat covers that
+        phase.
+
+        **BEST-EFFORT, like every other heartbeat**, and the raising
+        `write_status` here was a defect rather than a choice. The record lock
+        makes that function raise when the mutex cannot be taken or the record
+        will not parse, which is right for a terminal write and wrong for a
+        heartbeat -- so `write_status_best_effort` exists for exactly these call
+        sites. This one runs as a detached task, so an exception ends it
+        silently and nothing restarts it: `updated_at` stops advancing and the
+        run it was protecting is reported stale, which is the failure this
+        function exists to prevent, arrived at from the other side. Measured
+        with the mutex held and the wait shortened: the task ended with
+        `RunRecordLockTimeout` and the healthy QUEUED run then read
+        `stale: True`. The QUEUED span can be hours, so the window is wide.
         """
         import training
 
         while True:
             await asyncio.sleep(interval)
-            if training.read_status(session_id).get("status") != "PREPARING":
+            if training.read_status(session_id).get("status") not in (
+                "PREPARING",
+                "QUEUED",
+            ):
                 return
-            training.write_status(session_id)
+            training.write_status_best_effort(session_id)
 
     async def _run_training(
         self,
@@ -1360,7 +1440,10 @@ class EntryApp:
             # one replica, not two.
             # The semaphore caps concurrent trainings (default 1); extra runs wait
             # here. QUEUED is exempt from the PREPARING/TRAINING stale-window sweep,
-            # so a session waiting here is not false-flagged STOPPED.
+            # so a session waiting here is not false-flagged STOPPED -- but the
+            # record still has to be refreshed while it waits, or the operator
+            # listing reports a healthy queued run as stale. That is what
+            # `_preparing_heartbeat` covers; it runs through this phase.
             if self._training_sem.locked():
                 training.write_status(
                     session_id,
@@ -1591,6 +1674,18 @@ class EntryApp:
             None,
             description="Continue fine-tuning from a prior session's checkpoint (same model_type).",
         ),
+        dataset_artifact_id: Optional[str] = Field(
+            None,
+            description="The dataset artifact this run is trained on, e.g. "
+            "'my-workspace/my-dataset'. Recorded on the run, and it decides who may "
+            "COLLABORATE on it: the run's owner always, plus anyone who owns or manages "
+            "this dataset, so a colleague can list the run and continue training from its "
+            "checkpoint. It does NOT widen stopping, exporting or contributing, which stay "
+            "with the run's owner and `bioimage-io` administrators. You must own or manage "
+            "the dataset you name — naming one you do not is refused, so a run cannot be "
+            "placed into another team's listing. Omit it for a private run with no "
+            "collaborators.",
+        ),
         init_checkpoint: Optional[str] = Field(
             None,
             description="Start fine-tuning from an existing checkpoint given as an "
@@ -1657,20 +1752,45 @@ class EntryApp:
                 "they select different starting checkpoints."
             )
 
-        # Resuming reads ANOTHER RUN'S CHECKPOINT, so it is gated like the other
-        # calls keyed by a session id: the run's own caller, or a `bioimage-io`
-        # admin. It does not CHANGE the other run, which is why it is not a
-        # mutating call -- but it takes that run's trained weights and continues
-        # from them, so the resulting model derives from a checkpoint the caller
-        # was never granted. "You shared the id so you shared the history" is a
-        # far easier thing to accept than "you shared the id so you shared the
-        # weights", and only the first is the documented position.
+        # A claimed dataset is VERIFIED before it is recorded. Without this a
+        # caller could name any dataset id and have their run appear in that
+        # team's listing — not a privilege escalation, since the run is their
+        # own, but a way to put arbitrary content in front of people who never
+        # agreed to see it. Checked before the session directory exists, so a
+        # refused claim leaves nothing behind.
+        if dataset_artifact_id:
+            if not await self._caller_managed_datasets([dataset_artifact_id], context):
+                raise training.NotTheOwner(
+                    "dataset_artifact_id names a dataset you do not own or manage; "
+                    "a run can only be attached to a dataset you manage"
+                )
+
+        # Resuming reads ANOTHER RUN'S CHECKPOINT and continues from it, so the
+        # resulting model DERIVES from weights the caller did not train. That is
+        # why it is gated at all despite changing nothing on the other run.
+        #
+        # It is gated by ACCESS, not by ownership: the run's owner, a MANAGER OF
+        # ITS DATASET, or an administrator. Wider than stop/export/contribute on
+        # purpose — continuing a colleague's training is what a shared dataset is
+        # for, while disposing of their run is not. Note the consequence for the
+        # documented position: "you shared the id so you shared the history" is
+        # still true, but a dataset's managers can now also build on each other's
+        # weights, which the id alone never permitted.
         #
         # Checked BEFORE the session directory exists and before anything else,
         # so a refused resume leaves no PREPARING session behind and reveals
         # nothing about whether the named run exists.
         if resume_session_id:
-            training.require_caller_may_mutate(resume_session_id, context)
+            prior_dataset = training.read_status(resume_session_id).get(
+                training.DATASET_FIELD
+            )
+            training.require_caller_may_resume_run(
+                resume_session_id,
+                context,
+                writable_datasets=await self._caller_managed_datasets(
+                    [prior_dataset] if prior_dataset else [], context
+                ),
+            )
 
         # Before the session dir exists, so a bad name fails the call outright
         # rather than leaving a PREPARING session behind.
@@ -1733,6 +1853,17 @@ class EntryApp:
             # at creation because it cannot be recovered later: nothing else on
             # the record says whose work it was.
             **training.caller_identity(context),
+            # Which dataset this run belongs to, and so who may collaborate on
+            # it. Recorded at creation for the same reason as the owner: nothing
+            # else on the record says it, and it is VERIFIED above, so what is
+            # stored is a dataset the caller actually manages rather than a
+            # claim. Absent when the caller named none, which leaves the run
+            # private to its owner.
+            **(
+                {training.DATASET_FIELD: dataset_artifact_id}
+                if dataset_artifact_id
+                else {}
+            ),
             model_type=model_type,
             backend=backend,
             label=label,
@@ -1943,6 +2074,11 @@ class EntryApp:
         connection — so it sees the runs it started on that connection and no
         others.
 
+        A run also comes back to a MANAGER of the dataset it was trained on: a
+        run's collaborators are its dataset's managers, so a colleague can pick
+        up where another left off. That is listing and resuming only — stopping,
+        exporting and contributing stay with the owner.
+
         `context=True` is load-bearing and not decoration: without it the proxy
         forwards no context, `training.list_sessions` reads no identity, and the
         honest consequence of that is an EMPTY listing for everybody. That is
@@ -1951,7 +2087,111 @@ class EntryApp:
         """
         import training
 
-        return training.list_sessions(context)
+        # ONE walk of the store: the records and the dataset ids together.
+        # Asking for them separately read every record twice over on top of the
+        # read inside `get_status` -- 3 per run, so 783 for the 261 runs on the
+        # production store.
+        records, dataset_ids, skipped = training.scan_runs_for_listing()
+        writable = await self._caller_managed_datasets(dataset_ids, context)
+        # `skipped` is passed on, not dropped: `list_sessions` logs the stray
+        # directory names it was handed, and those names are caller-controlled,
+        # so the log is their only trace.
+        return training.list_sessions(
+            context, writable_datasets=writable, records=records, skipped=skipped
+        )
+
+    async def _caller_managed_datasets(self, dataset_ids, context) -> frozenset:
+        """Which of *dataset_ids* this caller owns or manages.
+
+        Resolved ONCE per listing and passed down, rather than per run: the
+        permission check is an artifact-manager round trip and the listing is a
+        synchronous loop over every run on disk. One RPC per run would be 261 of
+        them per call on the production store, and could not be expressed inside
+        a `def` anyway.
+
+        **Fails closed per artifact, not per call.** A dataset that cannot be
+        read — deleted, renamed, permissions withheld, the artifact-manager
+        down — is simply not in the returned set, so its runs stay invisible to
+        anyone but their owner and an administrator. One unreadable dataset must
+        not decide the answer for the others, and an unreadable one must never
+        read as permitted.
+
+        Short-circuits to empty when there is nothing to ask about, which is the
+        common case today: no run recorded a dataset before this feature, so a
+        worker full of older runs makes no RPCs at all.
+        """
+        import training
+
+        if not dataset_ids or not isinstance(context, dict):
+            return frozenset()
+        try:
+            am = await self._hypha.get_service("public/artifact-manager")
+        except Exception as exc:
+            print(
+                "[model-finetune] could not reach the artifact manager to resolve "
+                f"dataset managers; no co-manager access this call ({exc})",
+                flush=True,
+            )
+            return frozenset()
+        managed = set()
+        for artifact_id in dataset_ids:
+            try:
+                artifact = await am.read(artifact_id=artifact_id)
+            except Exception:
+                # Deliberately not logged per artifact: a caller can name a
+                # dataset, so this is attacker-reachable and would be a log
+                # amplifier. The closed outcome is the whole response.
+                continue
+            permissions = (artifact.get("config") or {}).get("permissions") or {}
+            if training.caller_manages_dataset(permissions, context):
+                managed.add(artifact_id)
+        return frozenset(managed)
+
+    @bioengine.method(context=True)
+    async def list_active_training_runs(self, context=None) -> Dict[str, Any]:
+        """Every UNFINISHED run on this worker, for an operator. Administrators only.
+
+        Answers the question the per-caller run listing deliberately cannot:
+        what is this worker currently working on. `list_training_sessions`
+        returns a run to its owner, to a manager of its dataset, or -- when it
+        has no owner -- to a `bioimage-io` administrator. A run started by a
+        caller who was not signed in therefore becomes invisible to everybody
+        once their connection closes, because Hypha mints that identity per
+        connection: the owner no longer exists to look, and the run is owned so
+        no administrator may list it. It keeps occupying the worker regardless.
+
+        **Each record is projected to an allow-list of operator fields** --
+        status, timings, backend and epoch counts -- rather than having its
+        owner fields stripped. An earlier version stripped `owner` and
+        `owner_anonymous` and claimed it said nothing about whose the run was;
+        that was false, because the record also carries `dataset_artifact_id`,
+        and a dataset its manager owns lives in that manager's own workspace,
+        so the id names them. The free-text label was a second such channel.
+        An allow-list has to be right only about what an operator needs; a
+        strip-list has to be right about every field anybody ever adds.
+
+        That is also why this is a separate call rather than a loosened
+        `list_training_sessions`: widening the administrator leg of that one
+        would hand every owned run to every administrator and undo a privacy
+        decision made on purpose, which a test pins.
+
+        **`stale` marks a record that is non-terminal but probably dead**, with
+        `stale_for_s` giving how long it has been quiet. A non-terminal status
+        is not a running process: the stale sweep in `get_status` only moves
+        PREPARING and TRAINING on, so a run that was QUEUED when its replica
+        restarted stays QUEUED for ever. Without the mark an operator would
+        read a busy worker that is in fact idle. Stale records are marked, not
+        hidden, because one of them may be a genuinely stuck run.
+
+        Returns `{}` for anyone who is not a `bioimage-io` administrator --
+        refusing rather than raising, because an operator surface should not
+        become a way to probe whether anything is running at all.
+        """
+        import training
+
+        if not training.caller_is_workspace_admin(context):
+            return {}
+        return training.non_terminal_runs()
 
     @bioengine.method(context=True)
     async def stop_training(
@@ -2041,6 +2281,14 @@ class EntryApp:
         served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
         await self._check_runtime_available(served)
         export_id = uuid.uuid4().hex
+        # WHO asked, recorded from the injected context at creation time. The
+        # export id is a handle to this run's weights, so the handle has to be
+        # bound to an identity -- `export_model` being owner-or-admin says
+        # nothing about who may later USE the id it returns. Stored under
+        # underscore keys so the single projection in `get_export_status`,
+        # which drops everything starting with "_", keeps the creator out of
+        # every response without a second rule to keep in step.
+        creator = training.caller_identity(context)
         request = {
             "name": name,
             "description": description,
@@ -2056,6 +2304,8 @@ class EntryApp:
             download_url=None,
             size_bytes=None,
             error=None,
+            _owner=creator.get("owner"),
+            _owner_anonymous=creator.get("owner_anonymous"),
         )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
@@ -2127,9 +2377,11 @@ class EntryApp:
         finally:
             export_hb.cancel()
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def get_export_status(
-        self, export_id: str = Field(..., description="export_id from export_model.")
+        self,
+        export_id: str = Field(..., description="export_id from export_model."),
+        context=None,
     ) -> Dict[str, Any]:
         """Export progress. ``status`` ∈ {PENDING, BUILDING, READY, FAILED}.
         ``download_url`` (6h TTL) + ``size_bytes`` are set on READY; ``error`` on
@@ -2139,12 +2391,19 @@ class EntryApp:
         feed back into ``start_training(init_checkpoint=...)``."""
         import training
 
+        # BEFORE the record is read, so the refusal cannot depend on what the
+        # record says. An unauthorised caller must not be able to tell "not
+        # yours" from "no such export": both come out of this call. (`get_export`
+        # does NOT write the swept record -- an earlier version of this comment
+        # said it did -- so the ordering is about the refusal, not a side
+        # effect.)
+        training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         return {k: v for k, v in rec.items() if not k.startswith("_")}
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def push_export(
         self,
         export_id: str = Field(..., description="A READY export_id from export_model."),
@@ -2154,6 +2413,7 @@ class EntryApp:
             "match the 'files' from get_export_status; mint the URLs via the draft "
             "artifact's put_file with the user's token.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Stream the built package files straight into a draft artifact so the
         browser never moves the ~350 MB twice. The frontend creates the staged
@@ -2162,6 +2422,10 @@ class EntryApp:
         reads the artifact."""
         import training
 
+        # The sharper half of the same gap: this streams the whole package --
+        # weights included -- to any presigned URL the caller hands over. Gated
+        # before the record is read, for the same reason as the status read.
+        training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
@@ -2170,13 +2434,32 @@ class EntryApp:
                 f"Export '{export_id}' is not READY (status={rec.get('status')})."
             )
         pkg_dir = Path(rec["_package_dir"])
-        pushed = []
-        for rel, url in files.items():
-            fpath = pkg_dir / rel
+        # EVERY name is bounded BEFORE the first byte moves, not as each file
+        # comes up. `files` keys come from the caller: before this bound
+        # existed, a key was joined to the package directory unchecked and a
+        # caller holding any READY export of their own could push
+        # "../../<another run>/best.pt" -- another run's checkpoint -- to a URL
+        # of their choosing. `package_member_path` requires the name to be one
+        # this export ANNOUNCED and to resolve inside the package.
+        #
+        # Validating the whole mapping first is the review's point and it is
+        # right: checking inside the loop meant a push whose last key was bad
+        # had already streamed the earlier files. Nothing leaked -- they were
+        # the caller's own announced files -- but a refused push that half
+        # happened is a worse thing to explain than one that did nothing.
+        resolved = []
+        for rel in files:
+            fpath = training.package_member_path(
+                pkg_dir, rel, announced=rec.get("files")
+            )
             if not fpath.is_file():
                 raise FileNotFoundError(
                     f"Package file '{rel}' not found for export '{export_id}'."
                 )
+            resolved.append((rel, files[rel], fpath))
+
+        pushed = []
+        for rel, url, fpath in resolved:
             resp = await self._put_file(url, fpath, timeout=600.0)
             resp.raise_for_status()
             pushed.append(rel)

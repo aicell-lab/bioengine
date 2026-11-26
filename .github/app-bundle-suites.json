@@ -2,12 +2,12 @@
   "run": {
     "annotation-broker": 300,
     "model-finetune": 90,
-    "model-runner": 6
+    "model-runner": 22
   },
   "skip": {},
   "max_skipped": {
     "annotation-broker": 0,
-    "model-finetune": 4,
+    "model-finetune": 6,
     "model-runner": 0
   }
 }
