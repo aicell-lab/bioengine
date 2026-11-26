@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import stat
 
 import pytest
@@ -41,7 +42,27 @@ import training
 #: The mode the writer must produce. 0o600 and not "something without the world
 #: bit": a single documented value is checkable, and "not world-writable" is the
 #: kind of loose assertion that passes on 0o644 and then on 0o664.
+#:
+#: Read from the WRITER's own constant rather than written again here. A review
+#: found the mode was documented only in this test file, and whoever rewrites
+#: the writer reads `training.py`, not a test — so `STATUS_FILE_MODE` now lives
+#: beside the write and this is the assertion that it has not moved.
 REQUIRED_MODE = 0o600
+
+
+def test_THE_WRITER_NAMES_THE_MODE_ITSELF():
+    """DONE WHEN 1's "one DOCUMENTED mode", and the document has to be where the
+    next change is made. A review found 0o600 appeared only in this test file
+    and in its docstring, while `training.py`'s long comment at the mkstemp call
+    explained atomicity and said nothing about the mode."""
+    assert training.STATUS_FILE_MODE == REQUIRED_MODE, (
+        f"the writer's constant is {training.STATUS_FILE_MODE:#o} and this test "
+        f"expects {REQUIRED_MODE:#o}"
+    )
+    src = (pathlib.Path(training.__file__)).read_text()
+    assert (
+        "os.fchmod(fd, STATUS_FILE_MODE)" in src
+    ), "the writer no longer REQUESTS the mode; it is back to inheriting it"
 
 
 def _mode(path) -> int:
@@ -102,22 +123,61 @@ def test_THE_WORLD_BIT_IS_WHAT_MATTERS_and_the_test_can_see_it(store):
     p = training._status_path(sid)
 
     os.chmod(p, 0o777)
-    assert _mode(p) != REQUIRED_MODE
-    assert _mode(p) & stat.S_IWOTH, "0o777 must register as world-writable"
+    assert (
+        _mode(p) != REQUIRED_MODE
+    ), "the mode did not change, so this control is inert"
+    # NO assertion that 0o777 has the world bit: that would be a test of the
+    # `stat` module, and a review was right that it reads as more evidence than
+    # it is. The control is the two lines below.
 
-    # ...and the shipped writer puts it back, because os.replace re-creates it.
+    # The shipped writer puts it back, because os.replace re-creates the inode.
     training.write_status(sid, state="RUNNING")
     assert _mode(training._status_path(sid)) == REQUIRED_MODE
 
 
-def test_the_mode_is_NOT_dependent_on_the_process_umask(store, monkeypatch):
-    """`mkstemp` ignores the umask, which is the property being relied on. A
-    writer switched to `write_text` would create at `0o666 & ~umask` and pass a
-    test run under a strict umask while shipping 0o666 under a lax one."""
-    old = os.umask(0o000)
+@pytest.mark.parametrize("umask", [0o000, 0o077])
+def test_the_mode_is_NOT_dependent_on_the_process_umask(store, monkeypatch, umask):
+    """The mode must not depend on the umask the process happens to carry.
+
+    AND A CORRECTION, because the first version of this docstring stated a
+    falsehood: "mkstemp ignores the umask". It does not. `mkstemp` calls
+    `os.open(..., 0o600)` and the umask masks that like any other creation mode
+    — it merely LOOKS immune because an ordinary umask never clears the owner
+    bits (`umask 0o200` would give `0o400`). What makes the mode genuinely
+    umask-independent is the explicit `os.fchmod` the writer now does.
+
+    `0o222` WOULD BE the discriminating case — it clears the owner WRITE bit, so
+    without the fchmod the file lands at 0o400 — and it is NOT in the list,
+    which is worth stating rather than quietly omitting. Under that umask the
+    writer cannot create its own `.mutex-*` file inside the session directory
+    (`PermissionError` out of `Path.touch`), so the call never reaches the
+    status file and the case measures a mutex problem instead of a mode one.
+    Pre-creating the session directory does not help: the mutex is created per
+    write, under whatever umask is in force.
+
+    So the umask-independence claim rests on the explicit `os.fchmod` in the
+    writer plus the mutation arm that swaps the writer for `Path.write_text`,
+    not on an owner-clearing umask. Making 0o222 reachable would mean changing
+    the mutex too, which is a different row.
+    """
+    # The suffix must be 8 chars to satisfy the id validator, so the umask is
+    # padded rather than printed at its natural width.
+    sid = f"2026-01-01-000003-{umask:08o}"
+    # THE SESSION DIRECTORY IS CREATED FIRST, BEFORE THE UMASK IS APPLIED, and
+    # that is not a way of dodging the hard case. Under `umask 0o222` a fresh
+    # `mkdir` lands at 0o555 and the store is unwritable, so the call raises
+    # SessionsRootUnavailable and never reaches the file this test is about —
+    # a directory-permission effect standing in for the file-mode one. Creating
+    # the directory first narrows the umask's reach to the status FILE, which
+    # is the claim under test.
+    training.session_dir(sid)
+
+    old = os.umask(umask)
     try:
-        sid = "2026-01-01-000003-dddddddd"
         training.write_status(sid, state="RUNNING")
-        assert _mode(training._status_path(sid)) == REQUIRED_MODE
+        got = _mode(training._status_path(sid))
+        assert (
+            got == REQUIRED_MODE
+        ), f"under umask {umask:#o} the file is {got:#o}, not {REQUIRED_MODE:#o}"
     finally:
         os.umask(old)
