@@ -240,7 +240,11 @@ def _cover(pkg_dir: Path, input_chw: np.ndarray, mask_hw: np.ndarray) -> None:
     import matplotlib.pyplot as plt
 
     disp = np.transpose(input_chw, (1, 2, 0))
-    disp = (disp - disp.min()) / (disp.ptp() or 1.0)
+    # np.ptp(disp), not disp.ptp(): NumPy 2.0 removed the ndarray method, and
+    # this app has runtimes on both majors. Correct today only because this
+    # worker runs in the cellpose runtime, which pins 1.26.4 — which is exactly
+    # the kind of "correct by where it happens to run" that stops being true.
+    disp = (disp - disp.min()) / (np.ptp(disp) or 1.0)
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 5))
     a1.imshow(disp)
     a1.set_title("input")
