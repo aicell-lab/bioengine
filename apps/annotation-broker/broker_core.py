@@ -1471,10 +1471,21 @@ UPLOAD_MARKER_VERSION = 1
 # does not sit in the artifact indefinitely.
 UPLOAD_MARKER_TTL_S = 3600.0
 
-# Housekeeping only: how many markers one mint will read while sweeping expired
-# ones. Bounded so that minting stays O(1)-ish no matter how many markers have
-# accumulated; the sweep is tidiness, and the AUTHORISATION check below already
-# treats an expired marker as no marker whether or not it was ever swept.
+# How many markers one sweep will REMOVE per call. Bounded so that a caller
+# cannot turn a mint into an unbounded series of deletions; the sweep is
+# housekeeping, and doing less of it per call is merely slower, never wrong --
+# the authorisation check treats an expired marker as no marker whether or not
+# it was ever swept, and the withholding holds a path until its object is gone.
+#
+# ⚠ THIS DOES NOT BOUND THE READ, and it used to. A review measured both ways
+# that cost: the finish consumed the markers for its path out of a capped list,
+# so a marker past the 50th entry -- including the finishing upload's own -- was
+# never seen and the fail-closed check passed on a list that did not contain it;
+# and the withholding was computed from the same capped list, so with more than
+# 50 markers in flight an unfinished upload past the cap was a dataset image
+# again. A cap on a read that a correctness decision depends on is not a bound,
+# it is a silent wrong answer. Both now read every marker; only the removals
+# below are capped.
 UPLOAD_MARKER_SWEEP_LIMIT = 50
 
 # How long a minted upload URL stays writable. Passed explicitly to `put_file`,

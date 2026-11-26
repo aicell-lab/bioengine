@@ -938,3 +938,112 @@ async def test_finishing_one_upload_leaves_ANOTHER_name_s_marker_alone(monkeypat
         ARTIFACT, "other99.png", done=True, mint_id=other["mint_id"]
     )
     assert done["committed"] is True
+
+
+# ── round 6: the cap on the marker READ, and what it hid ─────────────────────
+#
+# The listing read used to stop at UPLOAD_MARKER_SWEEP_LIMIT entries, and two
+# correctness decisions were computed from it. A folder upload that mints
+# everything before PUTting anything puts markers past that cap.
+
+
+@pytest.mark.asyncio
+async def test_a_FOLDER_UPLOAD_past_the_cap_keeps_its_finished_image(monkeypatch):
+    """Round 6's probe. 60 markers, finish the one whose marker sorts LAST.
+
+    Measured at the refused head: the finish consumed only the markers in the
+    first 50 listing entries, so this upload's OWN marker was never seen, the
+    fail-closed check passed on a list that did not contain it, and the sweep
+    deleted the finished image afterwards.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mints = {}
+    for i in range(60):
+        name = f"img{i:02d}.png"
+        mints[name] = await b.upload_local_image(ARTIFACT, name)
+
+    # The one whose MARKER FILENAME sorts last, which is where the cap bites.
+    last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
+    store.put(mints[last]["put_url"], _png(32))
+
+    out = await b.upload_local_image(
+        ARTIFACT, last, done=True, mint_id=mints[last]["mint_id"]
+    )
+    assert out["committed"] is True
+
+    own = core.upload_marker_path(mints[last]["mint_id"])
+    assert own not in store.objects, (
+        f"the finishing upload's own marker survived the finish ({own}), so the "
+        "sweep will delete the image it belongs to"
+    )
+
+    stem = last.rsplit(".", 1)[0]
+    manifest = await b._image_manifest(ARTIFACT)
+    assert stem in manifest, f"the committed image is not listed: {stem}"
+
+    # And it survives sweeping. Several passes, because the sweep caps how much
+    # it REMOVES per call and 59 markers remain.
+    for _ in range(4):
+        await b._sweep_expired_markers(ARTIFACT)
+    assert (
+        f"images/{last}" not in store.removed
+    ), f"the sweep deleted a finished image: {store.removed[:5]}"
+    manifest = await b._image_manifest(ARTIFACT)
+    assert stem in manifest, f"the finished image is gone from the list: {stem}"
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_upload_PAST_THE_CAP_is_still_withheld(monkeypatch):
+    """The other half: the withholding was computed from the same capped list.
+
+    With more than the cap in flight, an unfinished object past it was a dataset
+    image again -- the size bypass, reachable by minting 51 names.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mints = {}
+    for i in range(60):
+        name = f"img{i:02d}.png"
+        mints[name] = await b.upload_local_image(ARTIFACT, name)
+
+    last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
+    store.put(mints[last]["put_url"], _png(10000))  # 156x the ceiling, no finish
+
+    manifest = await b._image_manifest(ARTIFACT)
+
+    stem = last.rsplit(".", 1)[0]
+    assert stem not in manifest, (
+        "an unfinished oversized upload whose marker lies past the old read cap "
+        f"is listed as a dataset image: {stem}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_still_CAPS_WHAT_IT_REMOVES_per_call(monkeypatch):
+    """The cap is kept where it belongs: on the work a caller can inflate.
+
+    THE CONTROL for the two tests above -- they are satisfied by removing every
+    bound, and an unbounded sweep is a mint that can be made to do arbitrarily
+    many deletions.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    # Mint everything FIRST, then age it. Ageing inside the loop would have the
+    # NEXT mint's own sweep remove each marker as it goes -- which it did on the
+    # first run of this test, leaving 1 marker for the explicit sweep to find
+    # and making the cap look broken when it was the fixture that was wrong.
+    mints = [await b.upload_local_image(ARTIFACT, f"img{i:02d}.png") for i in range(60)]
+    for i, mint in enumerate(mints):
+        _age_marker(store, mint["mint_id"], path=f"images/img{i:02d}.png")
+
+    swept = await b._sweep_expired_markers(ARTIFACT)
+
+    assert swept == core.UPLOAD_MARKER_SWEEP_LIMIT, (
+        f"one sweep removed {swept} markers; the per-call cap is "
+        f"{core.UPLOAD_MARKER_SWEEP_LIMIT}"
+    )
+    assert swept < 60, "the sweep is unbounded"

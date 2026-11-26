@@ -2051,12 +2051,39 @@ class AnnotationBroker:
             return False
 
     async def _marker_pairs(self, artifact_id: str) -> list:
-        """``(marker_path, document)`` for the markers in ``.uploads/``.
+        """``(marker_path, document)`` for EVERY marker in ``.uploads/``.
 
-        One bounded listing plus one read per marker, shared by the sweep and by
-        the image-list reconciliation so the two cannot form different pictures
-        of which uploads are open. Bounded by the same limit as the sweep: a
-        caller cannot make either path unbounded by minting repeatedly.
+        **Uncapped, and it used to be capped at the sweep's limit of 50.** A
+        review measured what that cost, twice over, because two correctness
+        decisions read this list:
+
+        * the finish consumed the markers for its path out of it, so a marker
+          past the 50th listing entry -- *including the finishing upload's own*
+          -- was never seen, never removed, and the fail-closed check never
+          noticed. A folder upload that mints 60 names before PUTting anything
+          then lost the finished image to the sweep;
+        * the withholding is computed from it, so with more than 50 markers in
+          flight an unfinished upload past the cap was a dataset image again --
+          the size bypass, reachable by minting 51 names.
+
+        A cap on a READ that a correctness decision depends on is not a bound,
+        it is a silent wrong answer. **The cap now applies only to how much the
+        sweep DELETES per call**, which is the part a caller can inflate, and
+        the sweep is the one place where doing less work per call is merely
+        slower rather than wrong.
+
+        **The cost, stated rather than hidden**, since the review asked for it
+        in writing if the uncapped read were expensive: this is one listing plus
+        one document read per marker present, so a mint is O(markers present)
+        and the image-list rebuild is too. The image list is cached for
+        ``MANIFEST_CACHE_TTL_S``, and the sweep at the start of every mint keeps
+        the marker count near the number of uploads actually in flight, so the
+        steady state is small. The bad case is real and worth naming: a client
+        that mints N names before PUTting anything makes the Nth mint do N
+        reads. If that shows up in practice, the fix is to make the withholding
+        answerable from the LISTING alone -- a marker filename carrying the
+        object path as well as the mint id -- which would need its own review,
+        since the authoritative read must stay keyed by mint id.
 
         The documents are read rather than the paths being decoded from the
         filenames. A marker's filename is its MINT ID and nothing else, which is
@@ -2070,7 +2097,7 @@ class AnnotationBroker:
         except Exception:
             return []
         pairs = []
-        for entry in entries[: core.UPLOAD_MARKER_SWEEP_LIMIT]:
+        for entry in entries:
             name = entry.get("name") if isinstance(entry, dict) else None
             if not isinstance(name, str) or not name.endswith(".json"):
                 continue
@@ -2488,13 +2515,31 @@ class AnnotationBroker:
         # them. Removing them afterwards would leave the removals staged and
         # waiting on somebody else's commit, which is how `.uploads/` would end
         # up in a published dataset.
-        leftover = core.markers_for_path(
-            await self._marker_pairs(artifact_id), path=path
-        )
+        # ITS OWN MARKER IS REMOVED BY MINT ID FIRST, with no listing involved.
+        # That is the one removal this call cannot afford to miss, and a review
+        # measured it being missed: when the consumption was only the by-path
+        # scan below, a marker past the listing's old 50-entry cap -- including
+        # this upload's own -- was never seen, so the fail-closed check passed
+        # on a list that did not contain it. A path built from the validated
+        # mint id cannot be truncated by anything.
+        own = core.upload_marker_path(mint_id)
         unremoved = []
+        if own is None or not await self._remove_marker_file(artifact_id, own):
+            unremoved.append(own or f"<invalid mint id {mint_id!r}>")
+        # THEN every OTHER marker for this path, from the now-uncapped listing:
+        # a retried mint or a second browser tab leaves one behind, and leaving
+        # it open would withhold this image and then have the sweep delete it.
+        leftover = [
+            m
+            for m in core.markers_for_path(
+                await self._marker_pairs(artifact_id), path=path
+            )
+            if m != own
+        ]
         for marker_path in leftover:
             if not await self._remove_marker_file(artifact_id, marker_path):
                 unremoved.append(marker_path)
+        leftover = [own] + leftover
         if unremoved:
             raise RuntimeError(
                 f"'{name}' was uploaded and checked, but the record of the "
