@@ -1,0 +1,287 @@
+"""The mirror's decisions, pinned so a later change cannot loosen them quietly.
+
+WHAT THESE COVER, and the reason each matters rather than being shape-checking:
+
+* a generalist model needs its DECODER too, and a plain SAM model has none. A
+  mirror that got this wrong would pass its own checks and then fail the run;
+* an unparseable digest REFUSES. A digest that cannot be read is not a weaker
+  check, it is no check;
+* a wrong local file is reported as `replace`, NOT as `place`. The distinction
+  is the finding: something put bad bytes in the cache, and collapsing it into
+  "absent" loses that;
+* a member the mirror does not hold is `unavailable`, not silently handled, so
+  a partial mirror cannot look complete;
+* the four buckets are DISJOINT and their union is exactly what was asked for,
+  which is the assertion that catches a member dropped by a future edit.
+
+WHAT THEY DO NOT COVER: any network, artifact or real checkpoint. This module
+takes no part in downloading, and the tests use small files with real digests so
+they run anywhere in milliseconds.
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+
+import checkpoint_mirror as cm
+
+# A registry shaped like micro-sam's: generalist types carry a decoder, the
+# plain SAM types do not. Digests are computed from the bytes each test writes,
+# so nothing here is a hand-copied constant that could drift from the content.
+GENERALIST = "vit_t_lm"
+PLAIN = "vit_b"
+
+
+# SHA256 IS THE DEFAULT HERE, and that is about the harness rather than the
+# design. The registry's own algorithm is xxh128, but `xxhash` is a dependency
+# of the RUNTIME (pooch needs it to read an xxh128 registry) and is not
+# installed in every test environment -- it is absent from this one. Making the
+# structural tests depend on it turned twelve of them into ModuleNotFoundError,
+# which is an ERROR dressed as a failure and says nothing about the rules under
+# test. So the buckets, the layout and the refusals are exercised with sha256,
+# which the module supports for exactly the integrity role described in its
+# docstring, and the xxh128-specific cases below guard themselves.
+HAVE_XXHASH = True
+try:  # noqa: SIM105
+    import xxhash  # noqa: F401
+except ImportError:
+    HAVE_XXHASH = False
+
+
+def _d(data: bytes, alg: str = "sha256") -> str:
+    """A real digest of *data*, so no constant here can drift from the bytes."""
+    if alg == "sha256":
+        import hashlib
+
+        return f"sha256:{hashlib.sha256(data).hexdigest()}"
+    import xxhash as _x
+
+    return f"xxh128:{_x.xxh128(data).hexdigest()}"
+
+
+def _write(root: pathlib.Path, key: str, data: bytes) -> pathlib.Path:
+    p = cm.models_dir(root) / key
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+# ── which members a model type needs ───────────────────────────────────────
+
+
+def test_a_generalist_model_needs_its_DECODER_too():
+    reg = {GENERALIST: "x", f"{GENERALIST}_decoder": "y", PLAIN: "z"}
+    assert cm.required_members(GENERALIST, reg) == [GENERALIST, f"{GENERALIST}_decoder"]
+
+
+def test_a_plain_SAM_model_has_NO_decoder_and_that_is_not_an_omission():
+    """The plain SAM types genuinely have no decoder in the registry. Returning
+    one would make every mirror of them look permanently incomplete."""
+    reg = {GENERALIST: "x", f"{GENERALIST}_decoder": "y", PLAIN: "z"}
+    assert cm.required_members(PLAIN, reg) == [PLAIN]
+
+
+def test_an_UNKNOWN_model_type_RAISES_rather_than_returning_nothing():
+    """An empty list reads as 'nothing needed' and would mirror nothing at all
+    while reporting success."""
+    with pytest.raises(cm.MirrorError, match="not in the checkpoint registry"):
+        cm.required_members("vit_does_not_exist", {GENERALIST: "x"})
+
+
+@pytest.mark.parametrize("bad", ["", None, 0, [], {}])
+def test_a_missing_model_type_RAISES(bad):
+    with pytest.raises(cm.MirrorError):
+        cm.required_members(bad, {GENERALIST: "x"})
+
+
+# ── digests: fail closed on anything unreadable ─────────────────────────────
+
+
+def test_a_registry_digest_parses_into_algorithm_and_hex():
+    assert cm.parse_digest("xxh128:" + "a" * 32) == ("xxh128", "a" * 32)
+    assert cm.parse_digest("sha256:" + "b" * 64) == ("sha256", "b" * 64)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "deadbeef",                      # no algorithm
+        "xxh128:",                       # no hex
+        "xxh128:" + "a" * 31,            # one short
+        "xxh128:" + "a" * 33,            # one long
+        "sha256:" + "a" * 32,            # xxh128 length under sha256's name
+        "md5:" + "a" * 32,               # unsupported algorithm
+        "XXH128:" + "a" * 32,            # wrong case
+        "xxh128:" + "A" * 32,            # uppercase hex
+        "xxh128:zzzz" + "a" * 28,        # not hex
+        " xxh128:" + "a" * 32 + " x",    # trailing junk
+        None,
+        1234,
+    ],
+)
+def test_an_UNREADABLE_digest_REFUSES(bad):
+    """Fail closed. The caller must not be able to carry on as though a check
+    had happened."""
+    with pytest.raises(cm.MirrorError):
+        cm.parse_digest(bad)
+
+
+def test_a_file_is_checked_against_its_digest(tmp_path):
+    data = b"checkpoint-bytes" * 500
+    _write(tmp_path, GENERALIST, data)
+    assert cm.member_is_intact(cm.models_dir(tmp_path) / GENERALIST, _d(data))
+
+
+def test_a_CORRUPT_file_fails_its_digest(tmp_path):
+    good = b"checkpoint-bytes" * 500
+    _write(tmp_path, GENERALIST, b"substituted" * 500)
+    assert not cm.member_is_intact(cm.models_dir(tmp_path) / GENERALIST, _d(good))
+
+
+def test_an_ABSENT_file_reads_as_not_intact_rather_than_raising(tmp_path):
+    assert not cm.member_is_intact(cm.models_dir(tmp_path) / "nope", _d(b"x"))
+
+
+@pytest.mark.skipif(not HAVE_XXHASH, reason="xxhash absent; see the note by _d")
+def test_BOTH_algorithms_work_so_provenance_and_integrity_can_be_recorded(tmp_path):
+    """Provenance is the registry's xxh128; a sha256 of our own is integrity.
+    Both are supported so recording both costs no special case."""
+    data = b"weights" * 1000
+    _write(tmp_path, GENERALIST, data)
+    p = cm.models_dir(tmp_path) / GENERALIST
+    assert cm.member_is_intact(p, _d(data, "sha256"))
+    assert cm.member_is_intact(p, _d(data, "xxh128"))
+
+
+@pytest.mark.skipif(HAVE_XXHASH, reason="xxhash present, so the refusal cannot occur")
+def test_WITHOUT_xxhash_an_xxh128_digest_REFUSES_rather_than_falling_back(tmp_path):
+    """THE INVERSE CASE, and it is only testable where xxhash is missing.
+
+    Upstream publishes no sha256, so hashing with something else would turn a
+    provenance check into a self-consistency check. The module raises instead.
+    A silent fallback is the one substitution that must not happen, and this is
+    the environment that can prove it does not.
+    """
+    _write(tmp_path, GENERALIST, b"bytes" * 10)
+    with pytest.raises(cm.MirrorError, match="xxhash is not installed"):
+        cm.member_is_intact(cm.models_dir(tmp_path) / GENERALIST, "xxh128:" + "a" * 32)
+
+
+# ── the plan: four disjoint buckets ─────────────────────────────────────────
+
+
+def test_an_INTACT_member_is_left_alone(tmp_path):
+    """Re-placing it would mean moving up to 2.4 GB to learn what the digest
+    already said."""
+    data = b"a" * 4096
+    _write(tmp_path, GENERALIST, data)
+    plan = cm.seed_plan(tmp_path, {GENERALIST: _d(data)})
+    assert plan["ok"] == [GENERALIST]
+    assert plan["place"] == [] and plan["replace"] == [] and plan["unavailable"] == []
+
+
+def test_an_ABSENT_member_is_PLACED(tmp_path):
+    plan = cm.seed_plan(tmp_path, {GENERALIST: _d(b"a" * 10)})
+    assert plan["place"] == [GENERALIST] and plan["ok"] == []
+
+
+def test_a_WRONG_local_file_is_REPLACE_and_NOT_place(tmp_path):
+    """The distinction is the finding. `place` means a cold cache; `replace`
+    means something wrote bad bytes into it, which is worth seeing rather than
+    silently overwriting."""
+    _write(tmp_path, GENERALIST, b"wrong" * 100)
+    plan = cm.seed_plan(tmp_path, {GENERALIST: _d(b"right" * 100)})
+    assert plan["replace"] == [GENERALIST]
+    assert plan["place"] == []
+
+
+def test_a_member_the_MIRROR_LACKS_is_UNAVAILABLE_not_quietly_handled(tmp_path):
+    """A partial mirror must not look complete: the caller has to let the normal
+    upstream fetch try."""
+    plan = cm.seed_plan(
+        tmp_path, {GENERALIST: _d(b"x" * 10)}, available=["something-else"]
+    )
+    assert plan["unavailable"] == [GENERALIST]
+    assert plan["place"] == []
+
+
+def test_an_intact_member_is_OK_even_when_the_mirror_LACKS_it(tmp_path):
+    """Order matters: already-correct beats not-in-the-mirror, because nothing
+    needs fetching. Reversing the two would report a working cache as a gap."""
+    data = b"a" * 64
+    _write(tmp_path, GENERALIST, data)
+    plan = cm.seed_plan(tmp_path, {GENERALIST: _d(data)}, available=[])
+    assert plan["ok"] == [GENERALIST] and plan["unavailable"] == []
+
+
+def test_the_FOUR_BUCKETS_ARE_DISJOINT_and_cover_everything_asked_for(tmp_path):
+    """THE STRUCTURAL ASSERTION. A future edit that drops a member from the loop
+    would otherwise shrink the plan silently; here the union catches it."""
+    ok_d = b"o" * 32
+    bad_d = b"b" * 32
+    _write(tmp_path, "m_ok", ok_d)
+    _write(tmp_path, "m_bad", b"corrupt" * 10)
+    wanted = {
+        "m_ok": _d(ok_d),
+        "m_bad": _d(bad_d),
+        "m_absent": _d(b"z" * 8),
+        "m_missing_upstream": _d(b"q" * 8),
+    }
+    plan = cm.seed_plan(
+        tmp_path, wanted, available=["m_ok", "m_bad", "m_absent"]
+    )
+    buckets = [set(v) for v in plan.values()]
+    union = set().union(*buckets)
+    assert union == set(wanted), (plan, sorted(wanted))
+    total = sum(len(v) for v in plan.values())
+    assert total == len(wanted), f"a member is in two buckets: {plan}"
+    assert plan["ok"] == ["m_ok"]
+    assert plan["replace"] == ["m_bad"]
+    assert plan["place"] == ["m_absent"]
+    assert plan["unavailable"] == ["m_missing_upstream"]
+
+
+def test_the_PLAN_REFUSES_an_unreadable_digest_BEFORE_touching_the_filesystem(
+    tmp_path,
+):
+    with pytest.raises(cm.MirrorError):
+        cm.seed_plan(tmp_path, {GENERALIST: "not-a-digest"})
+
+
+# ── verification after seeding ──────────────────────────────────────────────
+
+
+def test_verify_NAMES_the_members_that_are_wrong(tmp_path):
+    """A bool cannot be reported. "The mirror failed" with no member named is
+    not an actionable sentence."""
+    good = b"g" * 100
+    _write(tmp_path, "a", good)
+    _write(tmp_path, "b", b"bad" * 10)
+    bad = cm.verify_seeded(tmp_path, {"a": _d(good), "b": _d(b"expected" * 10)})
+    assert bad == ["b"]
+
+
+def test_verify_is_EMPTY_when_everything_matches(tmp_path):
+    """The control: a verifier that always named something would satisfy the
+    test above."""
+    d1, d2 = b"1" * 50, b"2" * 50
+    _write(tmp_path, "a", d1)
+    _write(tmp_path, "b", d2)
+    assert cm.verify_seeded(tmp_path, {"a": _d(d1), "b": _d(d2)}) == []
+
+
+# ── the layout, read from micro-sam's source rather than assumed ────────────
+
+
+def test_checkpoints_live_in_the_models_subfolder_named_by_REGISTRY_KEY():
+    """micro-sam's `get_model_cache_directory` returns `<cache>/models`, and
+    `model_registry.fetch("vit_t_lm")` caches the file as `vit_t_lm` with no
+    extension. Both read from its source; a wrong layout would place files
+    somewhere pooch never looks and the mirror would appear to do nothing."""
+    assert cm.models_dir("/x") == pathlib.Path("/x/models")
+    assert cm.MODELS_SUBDIR == "models"
+    assert cm.DECODER_SUFFIX == "_decoder"
+    assert cm.CACHE_DIR_ENV == "MICROSAM_CACHEDIR"
