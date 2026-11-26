@@ -14,6 +14,14 @@ import pytest
 
 import broker_core as bc
 
+# Nothing is in flight in these cases, said explicitly rather than with a bare
+# `frozenset()`. `merge_image_manifest` REQUIRES `withheld_paths` and has no
+# default, because omitting it is silent and changes correctness: a review
+# measured the two manifest writers omitting it and recording somebody's
+# unfinished upload as a permanent dataset image. A test that does not exercise
+# the withholding still has to say so.
+NOTHING_WITHHELD = frozenset()
+
 
 # ---------------------------------------------------------------------------
 # Role resolution
@@ -1089,21 +1097,27 @@ class TestLocalImageEntry:
 
 class TestMergeImageManifest:
     def test_listing_only_builds_the_whole_manifest(self):
-        entries, changed = bc.merge_image_manifest({}, ["a.png", "b.tif"])
+        entries, changed = bc.merge_image_manifest(
+            {}, ["a.png", "b.tif"], withheld_paths=NOTHING_WITHHELD
+        )
         assert changed is True
         assert set(entries) == {"a", "b"}
         assert entries["b"]["path"] == "images/b.tif"
 
     def test_no_op_when_already_in_sync(self):
         stored = {"a": bc.local_image_entry("a.png")}
-        entries, changed = bc.merge_image_manifest(stored, ["a.png"])
+        entries, changed = bc.merge_image_manifest(
+            stored, ["a.png"], withheld_paths=NOTHING_WITHHELD
+        )
         assert changed is False
         assert entries == stored
 
     def test_read_never_drops_a_missing_local_file(self):
         # A transient listing failure must not delete images from the dataset.
         stored = {"a": bc.local_image_entry("a.png")}
-        entries, changed = bc.merge_image_manifest(stored, [])
+        entries, changed = bc.merge_image_manifest(
+            stored, [], withheld_paths=NOTHING_WITHHELD
+        )
         assert set(entries) == {"a"}
         assert changed is False
 
@@ -1112,21 +1126,25 @@ class TestMergeImageManifest:
             "a": bc.local_image_entry("a.png"),
             "b": bc.local_image_entry("b.png"),
         }
-        entries, changed = bc.merge_image_manifest(stored, ["a.png"], prune=True)
+        entries, changed = bc.merge_image_manifest(
+            stored, ["a.png"], prune=True, withheld_paths=NOTHING_WITHHELD
+        )
         assert set(entries) == {"a"}
         assert changed is True
 
     def test_prune_never_drops_a_remote_entry(self):
         # A remote image has no file under images/ by definition.
         stored = {"r": {"state": "remote", "source": {"kind": "ngff"}}}
-        entries, changed = bc.merge_image_manifest(stored, [], prune=True)
+        entries, changed = bc.merge_image_manifest(
+            stored, [], prune=True, withheld_paths=NOTHING_WITHHELD
+        )
         assert set(entries) == {"r"}
         assert changed is False
 
     def test_dims_backfilled_into_an_existing_entry(self):
         stored = {"a": bc.local_image_entry("a.png")}
         entries, changed = bc.merge_image_manifest(
-            stored, ["a.png"], dims={"a": [8, 9]}
+            stored, ["a.png"], dims={"a": [8, 9]}, withheld_paths=NOTHING_WITHHELD
         )
         assert changed is True
         assert (entries["a"]["width"], entries["a"]["height"]) == (8, 9)
@@ -1134,24 +1152,34 @@ class TestMergeImageManifest:
     def test_existing_dims_are_not_overwritten(self):
         stored = {"a": bc.local_image_entry("a.png", [1, 2])}
         entries, changed = bc.merge_image_manifest(
-            stored, ["a.png"], dims={"a": [8, 9]}
+            stored, ["a.png"], dims={"a": [8, 9]}, withheld_paths=NOTHING_WITHHELD
         )
         assert changed is False
         assert (entries["a"]["width"], entries["a"]["height"]) == (1, 2)
 
     def test_a_remote_entry_survives_a_read_merge(self):
         stored = {"r": {"state": "remote", "source": {"kind": "ngff"}}}
-        entries, _ = bc.merge_image_manifest(stored, ["a.png"])
+        entries, _ = bc.merge_image_manifest(
+            stored, ["a.png"], withheld_paths=NOTHING_WITHHELD
+        )
         assert set(entries) == {"r", "a"}
 
     def test_same_stem_two_extensions_collapses_deterministically(self):
-        entries, _ = bc.merge_image_manifest({}, ["a.tif", "a.png"])
+        entries, _ = bc.merge_image_manifest(
+            {}, ["a.tif", "a.png"], withheld_paths=NOTHING_WITHHELD
+        )
         assert set(entries) == {"a"}
         assert entries["a"]["path"] == "images/a.tif"
 
     def test_does_not_mutate_the_input(self):
         stored = {"a": bc.local_image_entry("a.png")}
-        bc.merge_image_manifest(stored, ["b.png"], dims={"a": [1, 2]}, prune=True)
+        bc.merge_image_manifest(
+            stored,
+            ["b.png"],
+            dims={"a": [1, 2]},
+            prune=True,
+            withheld_paths=NOTHING_WITHHELD,
+        )
         assert stored == {"a": {"state": "local", "path": "images/a.png"}}
 
 
@@ -1806,26 +1834,34 @@ class TestMergeImageManifestPromotesRemote:
         )
 
     def test_promotes_instead_of_replacing(self):
-        entries, changed = bc.merge_image_manifest({"r": self._remote()}, ["r.tif"])
+        entries, changed = bc.merge_image_manifest(
+            {"r": self._remote()}, ["r.tif"], withheld_paths=NOTHING_WITHHELD
+        )
         assert changed is True
         assert entries["r"]["state"] == "local"
         assert entries["r"]["path"] == "images/r.tif"
 
     def test_keeps_provenance_through_the_promotion(self):
         remote = self._remote()
-        entries, _ = bc.merge_image_manifest({"r": remote}, ["r.tif"])
+        entries, _ = bc.merge_image_manifest(
+            {"r": remote}, ["r.tif"], withheld_paths=NOTHING_WITHHELD
+        )
         assert entries["r"]["source"] == remote["source"]
         assert entries["r"]["dtype"] == "uint16"
         assert entries["r"]["channels"] == ["DAPI", "GFP"]
         assert (entries["r"]["width"], entries["r"]["height"]) == (800, 600)
 
     def test_drops_the_stores_level_count(self):
-        entries, _ = bc.merge_image_manifest({"r": self._remote()}, ["r.tif"])
+        entries, _ = bc.merge_image_manifest(
+            {"r": self._remote()}, ["r.tif"], withheld_paths=NOTHING_WITHHELD
+        )
         assert "levels" not in entries["r"]
 
     def test_a_remote_with_no_file_is_left_alone(self):
         remote = self._remote()
-        entries, changed = bc.merge_image_manifest({"r": remote}, [])
+        entries, changed = bc.merge_image_manifest(
+            {"r": remote}, [], withheld_paths=NOTHING_WITHHELD
+        )
         assert changed is False
         assert entries["r"] == remote
 
@@ -1833,13 +1869,19 @@ class TestMergeImageManifestPromotesRemote:
         # prune only removes local entries whose file is gone. The promoted
         # entry's file is right there in the listing, so it stays.
         entries, _ = bc.merge_image_manifest(
-            {"r": self._remote()}, ["r.tif"], prune=True
+            {"r": self._remote()},
+            ["r.tif"],
+            prune=True,
+            withheld_paths=NOTHING_WITHHELD,
         )
         assert entries["r"]["path"] == "images/r.tif"
 
     def test_an_unrelated_local_file_still_gets_a_bare_entry(self):
         entries, _ = bc.merge_image_manifest(
-            {"r": self._remote()}, ["r.tif", "plain.png"], dims={"plain": [10, 20]}
+            {"r": self._remote()},
+            ["r.tif", "plain.png"],
+            dims={"plain": [10, 20]},
+            withheld_paths=NOTHING_WITHHELD,
         )
         assert "source" not in entries["plain"]
         assert (entries["plain"]["width"], entries["plain"]["height"]) == (10, 20)
