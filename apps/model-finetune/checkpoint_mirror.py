@@ -145,9 +145,18 @@ def parse_expectation(value: Any) -> Dict[str, str]:
 
     * ``"xxh128:<hex>"`` -- a single algorithm, the registry's own literal;
     * ``{"xxh128": "<hex>", "sha256": "<hex>"}`` -- both, each value bare hex or
-      prefixed. A :class:`Mapping`, not specifically a ``dict``, because a record
-      that arrives over hypha RPC is a ``dotdict`` and ``isinstance(x, dict)`` is
-      False for it -- a check that would silently take the string branch.
+      prefixed. The runtime check is against :class:`collections.abc.Mapping`
+      rather than ``dict`` so that any mapping an RPC layer hands back is
+      accepted, not only a real ``dict``.
+
+      An earlier version of this comment asserted that hypha's ``dotdict`` fails
+      ``isinstance(x, dict)``. **Measured here and it does not**: the installed
+      ``hypha_rpc.utils.dotdict`` has MRO ``dotdict -> dict -> object``, so that
+      check is True for it. The ``Mapping`` test is therefore the wider of the
+      two by choice rather than by necessity, which is still the right way round
+      for a value that crosses a transport -- but it is not fixing a known
+      failure, and the claim that it was has been removed rather than left to be
+      repeated.
 
     Fail-closed throughout, including on an EMPTY mapping: no recorded digest is
     not a weaker check, it is no check, and it must not be able to read as one.
@@ -225,8 +234,89 @@ def digest_file(path: Any, alg: str, *, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def member_is_intact(path: Any, digest: Any) -> bool:
+#: What :func:`verify_member` reports when a file is absent, so the caller sees
+#: the same record shape either way and cannot mistake "absent" for "checked".
+_ABSENT = "absent"
+
+
+def verify_member(
+    path: Any, digest: Any, *, allow_unverified_provenance: bool = False
+) -> Dict[str, Any]:
+    """The full result of checking one member, as a record rather than a bool.
+
+    ``{"intact": bool, "checked": [alg…], "skipped": [alg…], "absent": bool}``.
+
+    This exists because a bool cannot answer the question a caller actually has.
+    A review measured that with `xxhash` absent, ``{"xxh128": WRONG, "sha256":
+    right}`` returned True and nothing in the result said the provenance check
+    had been skipped -- so "both digests verified" and "the xxh128 was silently
+    dropped" were the same answer. ``skipped`` is how they differ now.
+
+    *allow_unverified_provenance* has to be passed EXPLICITLY to accept a result
+    whose provenance leg could not be computed. The default refuses, which keeps
+    this consistent with :func:`digest_file`, which declines to hash with an
+    algorithm upstream never published rather than substituting one. The ruling
+    that the fallback verifies the sha256 is about the runtime download path;
+    it does not say a missing hasher may waive the provenance claim, so the
+    waiver is a decision a call site makes in writing.
+    """
+    expected = parse_expectation(digest)
+    p = Path(path)
+    record: Dict[str, Any] = {
+        "intact": False,
+        "checked": [],
+        "skipped": [],
+        "absent": False,
+    }
+    if not p.is_file():
+        record["absent"] = True
+        record["skipped"] = sorted(expected)
+        return record
+
+    mismatched = False
+    for alg, want in sorted(expected.items()):
+        try:
+            got = digest_file(p, alg)
+        except MirrorError:
+            # Only an uncomputable algorithm lands here (no `xxhash`). Whether
+            # that is survivable depends on what ELSE was recorded, which is
+            # decided after the loop -- never inside it, where one missing
+            # hasher would short-circuit a check that could still be made.
+            record["skipped"].append(alg)
+            continue
+        record["checked"].append(alg)
+        if got != want:
+            mismatched = True
+
+    if not record["checked"]:
+        raise MirrorError(
+            f"none of the recorded digests ({', '.join(sorted(expected))}) could "
+            f"be computed here, so {p.name} was NOT verified. Refusing rather "
+            "than reporting a result: install `xxhash`, or record a sha256 "
+            "alongside the registry's xxh128 so there is something to fall back "
+            "to."
+        )
+    if record["skipped"] and not allow_unverified_provenance:
+        raise MirrorError(
+            f"{p.name} matched {record['checked']} but {record['skipped']} could "
+            "not be computed here, so its PROVENANCE is unverified. Refusing: "
+            "a matching sha256 proves the mirror has not changed since we hashed "
+            "it, not that the bytes are upstream's. Install `xxhash`, or pass "
+            "allow_unverified_provenance=True at a call site where integrity "
+            "alone is the documented standard."
+        )
+    record["intact"] = not mismatched
+    return record
+
+
+def member_is_intact(
+    path: Any, digest: Any, *, allow_unverified_provenance: bool = False
+) -> bool:
     """Whether the file at *path* matches what is recorded for it.
+
+    The boolean face of :func:`verify_member`, for the callers that only branch
+    on it. Anything that has to REPORT should use the record instead: this
+    cannot express "it matched, but one of the two checks did not run".
 
     *digest* is anything :func:`parse_expectation` accepts: one algorithm, or
     both. **Every recorded algorithm that can be computed here must match** --
@@ -238,41 +328,19 @@ def member_is_intact(path: Any, digest: Any) -> bool:
     report: :func:`seed_plan` distinguishes them, so "the mirror is wrong" never
     looks like "the cache is cold".
 
-    **The fallback, and its limit.** If `xxhash` is not installed the xxh128
-    cannot be computed. When a sha256 is also recorded, that one is verified and
-    the answer stands on it -- the mirror is still known to be unchanged, and
-    this is the fallback the ruling asks for. When xxh128 is the ONLY recorded
-    digest, this RAISES rather than answering: there is nothing left to check,
-    and True would be a verification that never ran. Returning False instead
-    would be no better in the other direction -- it would read as corruption and
-    send a caller re-downloading good bytes from an origin that is down.
+    **What RAISES rather than answering.** A member none of whose digests can be
+    computed: there is nothing left to check, and True would be a verification
+    that never ran, while False would read as corruption and send a caller
+    re-downloading good bytes from an origin that is down. And, unless
+    *allow_unverified_provenance* says otherwise, a member whose xxh128 could
+    not be computed even though its sha256 matched -- see :func:`verify_member`
+    for why that is a refusal and not a pass.
     """
-    expected = parse_expectation(digest)
-    p = Path(path)
-    if not p.is_file():
-        return False
-    checked = 0
-    for alg, want in sorted(expected.items()):
-        try:
-            got = digest_file(p, alg)
-        except MirrorError:
-            # Only an uncomputable algorithm lands here (no `xxhash`). Whether
-            # that is survivable depends on what ELSE was recorded, which is
-            # decided after the loop -- never inside it, where one missing
-            # hasher would short-circuit a check that could still be made.
-            continue
-        checked += 1
-        if got != want:
-            return False
-    if checked == 0:
-        raise MirrorError(
-            f"none of the recorded digests ({', '.join(sorted(expected))}) could "
-            f"be computed here, so {p.name} was NOT verified. Refusing rather "
-            "than reporting a result: install `xxhash`, or record a sha256 "
-            "alongside the registry's xxh128 so there is something to fall back "
-            "to."
-        )
-    return True
+    return bool(
+        verify_member(
+            path, digest, allow_unverified_provenance=allow_unverified_provenance
+        )["intact"]
+    )
 
 
 def seed_plan(
@@ -290,7 +358,7 @@ def seed_plan(
     ``None`` means "assume everything is available", which is what a caller that
     has not listed the mirror yet should say.
 
-    Returns ``{"ok", "place", "replace", "unavailable"}``:
+    Returns ``{"ok", "place", "replace", "unavailable", "corrupt_unavailable"}``:
 
     * ``ok``          already present and matching -- do nothing, and in
                       particular do not re-download 2.4 GB to prove it again;
@@ -300,12 +368,28 @@ def seed_plan(
                       mismatch is a FINDING: it means something put a wrong file
                       in the cache, and a run that quietly overwrites it loses
                       the only evidence that happened;
-    * ``unavailable`` needed, not intact locally, and the mirror does not have
-                      it. The honest end state of a partial mirror: the caller
-                      must let the normal upstream fetch try, not pretend the
-                      member is handled.
+    * ``unavailable`` needed, ABSENT locally, and the mirror does not have it.
+                      The honest end state of a partial mirror: the caller must
+                      let the normal upstream fetch try, not pretend the member
+                      is handled;
+    * ``corrupt_unavailable``
+                      present locally, the digest does NOT match, and the mirror
+                      cannot supply a replacement. Its own bucket because the
+                      two facts need different actions: the caller still has to
+                      fall back upstream, as for ``unavailable``, AND something
+                      has put a wrong file in the cache, which is a finding
+                      whatever the mirror holds.
 
-    The four are disjoint and their union is exactly *wanted*, so a caller can
+                      This existed as a defect before it existed as a bucket. A
+                      review measured that a corrupt file the mirror lacked came
+                      back as plain ``unavailable`` -- indistinguishable from
+                      "never downloaded" -- because the availability test ran
+                      before the presence test. The docstring above already said
+                      a mismatch must not be collapsed, and the code collapsed
+                      it; the test covered only the absent case, so it stayed
+                      green.
+
+    The five are disjoint and their union is exactly *wanted*, so a caller can
     assert that and catch a member silently dropped by a future change.
     """
     have = None if available is None else set(available)
@@ -314,6 +398,7 @@ def seed_plan(
         "place": [],
         "replace": [],
         "unavailable": [],
+        "corrupt_unavailable": [],
     }
     target = models_dir(cache_root)
     for key, digest in wanted.items():
@@ -321,14 +406,18 @@ def seed_plan(
         path = target / key
         present = path.is_file()
         intact = member_is_intact(path, digest) if present else False
+        mirrored = have is None or key in have
+        # PRESENCE IS TESTED BEFORE AVAILABILITY, and the order is the fix: the
+        # other way round, a corrupt file the mirror lacks never reaches a
+        # branch that can see it is present.
         if intact:
             plan["ok"].append(key)
-        elif have is not None and key not in have:
-            plan["unavailable"].append(key)
         elif present:
-            plan["replace"].append(key)
-        else:
+            plan["replace" if mirrored else "corrupt_unavailable"].append(key)
+        elif mirrored:
             plan["place"].append(key)
+        else:
+            plan["unavailable"].append(key)
     return plan
 
 
@@ -339,9 +428,39 @@ def verify_seeded(cache_root: Any, wanted: Mapping[str, str]) -> List[str]:
     caller that only needs the boolean can test emptiness; one that has to
     report cannot recover the names from a bool, and "the mirror failed" with no
     member named is not an actionable sentence.
+
+    Raises if any member's provenance could not be checked, rather than counting
+    it as good -- see :func:`verify_member`. Use :func:`verify_seeded_report` to
+    get that as data instead of as an exception.
     """
-    bad = []
-    for key, digest in wanted.items():
-        if not member_is_intact(models_dir(cache_root) / key, digest):
-            bad.append(key)
-    return bad
+    return [
+        k
+        for k, v in verify_seeded_report(cache_root, wanted).items()
+        if not v["intact"]
+    ]
+
+
+def verify_seeded_report(
+    cache_root: Any,
+    wanted: Mapping[str, str],
+    *,
+    allow_unverified_provenance: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """:func:`verify_member` for every wanted member, keyed by registry key.
+
+    The reporting face of the verification. A caller that has to say what it
+    checked -- a seeding log, a mirror's own manifest, the evidence on an issue
+    -- needs to distinguish "both digests matched" from "the integrity digest
+    matched and the provenance one could not be computed here". The list
+    :func:`verify_seeded` returns cannot carry that, and a report that cannot
+    carry it is how an unverified provenance claim gets published as a verified
+    one.
+    """
+    return {
+        key: verify_member(
+            models_dir(cache_root) / key,
+            digest,
+            allow_unverified_provenance=allow_unverified_provenance,
+        )
+        for key, digest in wanted.items()
+    }

@@ -175,22 +175,82 @@ def test_WITHOUT_xxhash_an_xxh128_ALONE_REFUSES_rather_than_falling_back(tmp_pat
 
 
 @pytest.mark.skipif(
-    HAVE_XXHASH, reason="the fallback only engages when xxh128 cannot be computed"
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
 )
-def test_WITHOUT_xxhash_a_RECORDED_SHA256_IS_THE_FALLBACK_and_it_decides(tmp_path):
-    """The ruling's fallback: when the xxh128 cannot be computed but a sha256 of
-    our own was recorded, that one is verified and the answer stands on it.
+def test_WITHOUT_xxhash_an_UNCHECKABLE_PROVENANCE_is_REFUSED_not_waived(tmp_path):
+    """A review measured this returning True in silence, which is the defect.
 
-    Both directions, because a fallback that only ever said True would satisfy
-    the first assertion and verify nothing.
+    With xxhash absent, `{xxh128: WRONG, sha256: right}` answered True and
+    nothing in the result said the provenance leg had been skipped -- so "both
+    digests verified" and "the xxh128 was silently dropped" were the same
+    answer. The ruling that the FALLBACK verifies the sha256 is about the
+    runtime download path; it does not say a missing hasher may waive the
+    provenance claim, so the default is now a refusal.
     """
     data = b"weights" * 512
     _write(tmp_path, GENERALIST, data)
     p = cm.models_dir(tmp_path) / GENERALIST
     good_sha = _d(data, "sha256").split(":", 1)[1]
 
-    assert cm.member_is_intact(p, {"xxh128": "a" * 32, "sha256": good_sha})
-    assert not cm.member_is_intact(p, {"xxh128": "a" * 32, "sha256": "b" * 64})
+    with pytest.raises(cm.MirrorError, match="PROVENANCE is unverified"):
+        cm.member_is_intact(p, {"xxh128": "a" * 32, "sha256": good_sha})
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_WITHOUT_xxhash_the_WAIVER_IS_EXPLICIT_and_NAMES_what_it_skipped(tmp_path):
+    """The ruling's fallback, taken deliberately at a call site that asks for it.
+
+    Both directions, because a waiver that only ever said True would verify
+    nothing -- and the record must NAME the algorithm it could not compute, or
+    the caller is back to being unable to tell the two cases apart.
+    """
+    data = b"weights" * 512
+    _write(tmp_path, GENERALIST, data)
+    p = cm.models_dir(tmp_path) / GENERALIST
+    good_sha = _d(data, "sha256").split(":", 1)[1]
+
+    rec = cm.verify_member(
+        p,
+        {"xxh128": "a" * 32, "sha256": good_sha},
+        allow_unverified_provenance=True,
+    )
+    assert rec["intact"] is True
+    assert rec["checked"] == ["sha256"], rec
+    assert rec["skipped"] == ["xxh128"], rec
+
+    bad = cm.verify_member(
+        p,
+        {"xxh128": "a" * 32, "sha256": "b" * 64},
+        allow_unverified_provenance=True,
+    )
+    assert bad["intact"] is False, bad
+    assert bad["skipped"] == ["xxh128"], bad
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_the_REPORT_distinguishes_fully_checked_from_provenance_skipped(tmp_path):
+    """What a seeding log has to be able to say. A list of bad members cannot
+    carry "this one matched, but only on integrity", and a report that cannot
+    carry it is how an unverified provenance claim gets published as a verified
+    one."""
+    data = b"weights" * 512
+    _write(tmp_path, GENERALIST, data)
+    wanted = {
+        GENERALIST: {
+            "xxh128": "a" * 32,
+            "sha256": _d(data, "sha256").split(":", 1)[1],
+        }
+    }
+
+    report = cm.verify_seeded_report(tmp_path, wanted, allow_unverified_provenance=True)
+
+    assert report[GENERALIST]["intact"] is True
+    assert report[GENERALIST]["skipped"] == ["xxh128"]
+    assert report[GENERALIST]["checked"] == ["sha256"]
 
 
 @pytest.mark.skipif(
@@ -276,14 +336,22 @@ def test_a_WRONG_local_file_is_REPLACE_and_NOT_place(tmp_path):
     assert plan["place"] == []
 
 
-def test_a_member_the_MIRROR_LACKS_is_UNAVAILABLE_not_quietly_handled(tmp_path):
+def test_an_ABSENT_member_the_MIRROR_LACKS_is_UNAVAILABLE_not_quietly_handled(
+    tmp_path,
+):
     """A partial mirror must not look complete: the caller has to let the normal
-    upstream fetch try."""
+    upstream fetch try.
+
+    ABSENT is in the name because that is what `unavailable` now means. A
+    present-but-wrong file the mirror lacks has its own bucket, and conflating
+    the two was the defect a review measured.
+    """
     plan = cm.seed_plan(
         tmp_path, {GENERALIST: _d(b"x" * 10)}, available=["something-else"]
     )
     assert plan["unavailable"] == [GENERALIST]
     assert plan["place"] == []
+    assert plan["corrupt_unavailable"] == []
 
 
 def test_an_intact_member_is_OK_even_when_the_mirror_LACKS_it(tmp_path):
@@ -295,16 +363,23 @@ def test_an_intact_member_is_OK_even_when_the_mirror_LACKS_it(tmp_path):
     assert plan["ok"] == [GENERALIST] and plan["unavailable"] == []
 
 
-def test_the_FOUR_BUCKETS_ARE_DISJOINT_and_cover_everything_asked_for(tmp_path):
+def test_the_FIVE_BUCKETS_ARE_DISJOINT_and_cover_everything_asked_for(tmp_path):
     """THE STRUCTURAL ASSERTION. A future edit that drops a member from the loop
-    would otherwise shrink the plan silently; here the union catches it."""
+    would otherwise shrink the plan silently; here the union catches it.
+
+    Five, not four. A review measured that a corrupt file the mirror LACKS came
+    back as plain `unavailable`, indistinguishable from one that was never
+    downloaded, so it gets its own bucket -- and this case is in the fixture.
+    """
     ok_d = b"o" * 32
     bad_d = b"b" * 32
     _write(tmp_path, "m_ok", ok_d)
     _write(tmp_path, "m_bad", b"corrupt" * 10)
+    _write(tmp_path, "m_bad_unmirrored", b"corrupt" * 10)
     wanted = {
         "m_ok": _d(ok_d),
         "m_bad": _d(bad_d),
+        "m_bad_unmirrored": _d(b"w" * 8),
         "m_absent": _d(b"z" * 8),
         "m_missing_upstream": _d(b"q" * 8),
     }
@@ -318,6 +393,31 @@ def test_the_FOUR_BUCKETS_ARE_DISJOINT_and_cover_everything_asked_for(tmp_path):
     assert plan["replace"] == ["m_bad"]
     assert plan["place"] == ["m_absent"]
     assert plan["unavailable"] == ["m_missing_upstream"]
+    assert plan["corrupt_unavailable"] == ["m_bad_unmirrored"]
+
+
+def test_a_CORRUPT_file_the_mirror_LACKS_is_DISTINGUISHABLE_from_an_absent_one(
+    tmp_path,
+):
+    """The review's probe, as a test, and it is RED without the fix.
+
+    Measured at the refused head: `models/vit_b_lm` holding the wrong bytes with
+    `available=[]` returned `{'unavailable': ['vit_b_lm'], 'replace': []}` -- the
+    same answer as a member that was never fetched. The two need different
+    actions: both fall back upstream, but one of them also means something put a
+    wrong file in the cache, and that is a finding whatever the mirror holds.
+    """
+    _write(tmp_path, GENERALIST, b"corrupt" * 10)
+    wanted = {GENERALIST: _d(b"the right bytes")}
+
+    corrupt_plan = cm.seed_plan(tmp_path, wanted, available=[])
+    absent_plan = cm.seed_plan(tmp_path / "cold", wanted, available=[])
+
+    assert corrupt_plan["corrupt_unavailable"] == [GENERALIST], corrupt_plan
+    assert corrupt_plan["unavailable"] == [], corrupt_plan
+    assert absent_plan["unavailable"] == [GENERALIST], absent_plan
+    assert absent_plan["corrupt_unavailable"] == [], absent_plan
+    assert corrupt_plan != absent_plan, "a corrupt cache still reads as a cold one"
 
 
 def test_the_PLAN_REFUSES_an_unreadable_digest_BEFORE_touching_the_filesystem(
