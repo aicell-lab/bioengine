@@ -291,8 +291,19 @@ class AnnotationBroker:
 
     async def _list_files_all(
         self, artifact_id: str, dir_path: str, stage: bool = True
-    ) -> List[Dict[str, Any]]:
-        """Every entry under *dir_path*, following the server's pagination.
+    ) -> tuple:
+        """``(entries, complete)`` for *dir_path*, following the server's pagination.
+
+        **A TUPLE, not a list, and that is the point.** A review measured the
+        previous version returning a PARTIAL list silently when a page after the
+        first failed -- 7 of 30 markers, with the past-page unfinished upload
+        listed as an image. For the withholding that is the documented
+        fail-open; for the finish's by-path extras scan it is the data-loss
+        direction, because a missed duplicate marker survives the commit and the
+        sweep later deletes that image. Returning a bare list let every caller
+        treat "all of them" and "as many as I could get" as the same value. A
+        caller that ignores the second element now gets a tuple where it
+        expected a list, which fails loudly.
 
         `list_files` is paginated and its default page is 1000 entries, so a
         single call is a PAGE and not a directory. A review measured what that
@@ -350,11 +361,26 @@ class AnnotationBroker:
                     f"list_files does not accept limit/offset; {dir_path} was "
                     "read as ONE page and may be incomplete"
                 )
-                return await self._list_files_safe(artifact_id, dir_path, stage)
+                # Complete as far as this server is concerned: it has no
+                # pagination to follow. Flagged complete=True deliberately, with
+                # the warning above as the record that one call was all there
+                # was to ask for.
+                return await self._list_files_safe(artifact_id, dir_path, stage), True
             except Exception as exc:
                 if _is_send_failure(exc):
                     raise
-                return out
+                # INCOMPLETE, and said so. Page 0 failing means the directory
+                # could not be read at all; a later page failing means a partial
+                # answer. Both are reported as incomplete, and both are logged
+                # with the offset, because "I read everything" and "I read what
+                # I could" must never be the same return value.
+                logger.warning(
+                    f"listing {dir_path} failed at offset {offset} (page "
+                    f"{page + 1}) after {len(out)} entries: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}. The answer is "
+                    "INCOMPLETE."
+                )
+                return out, False
             batch = files or []
             # STOP ONLY ON AN EMPTY PAGE, never on a page shorter than the limit
             # that was asked for. The server is free to cap the limit below the
@@ -365,7 +391,7 @@ class AnnotationBroker:
             # loop after one page and the read was incomplete again, which is
             # the very defect this method exists to fix.
             if not batch:
-                return out
+                return out, True
             before = len(seen)
             for entry in batch:
                 name = entry.get("name") if isinstance(entry, dict) else str(entry)
@@ -382,7 +408,7 @@ class AnnotationBroker:
                     f"listing {dir_path} returned a repeated page at offset "
                     f"{offset}; stopping, and the result may be incomplete"
                 )
-                return out
+                return out, False
             offset += len(batch)
             page += 1
             logger.info(
@@ -2159,8 +2185,15 @@ class AnnotationBroker:
             )
             return False
 
-    async def _marker_pairs(self, artifact_id: str) -> list:
-        """``(marker_path, document)`` for EVERY marker in ``.uploads/``.
+    async def _marker_pairs(self, artifact_id: str) -> tuple:
+        """``(pairs, complete)`` where pairs is ``(marker_path, document)``.
+
+        `complete` is False when the listing could not be read in full. It is
+        carried rather than dropped because its two callers need OPPOSITE
+        things from it: the withholding may answer on a partial read and stay
+        fail-open, while the finish must refuse, since a marker it did not see
+        is a marker it cannot consume -- and an unconsumed duplicate marker has
+        the sweep delete a committed image.
 
         **Uncapped, and it used to be capped at the sweep's limit of 50.** A
         review measured what that cost, twice over, because two correctness
@@ -2202,9 +2235,11 @@ class AnnotationBroker:
         filename is which object a marker authorises touching.
         """
         try:
-            entries = await self._list_files_all(artifact_id, core.UPLOAD_MARKER_DIR)
+            entries, complete = await self._list_files_all(
+                artifact_id, core.UPLOAD_MARKER_DIR
+            )
         except Exception:
-            return []
+            return [], False
         pairs = []
         for entry in entries:
             name = entry.get("name") if isinstance(entry, dict) else None
@@ -2216,7 +2251,7 @@ class AnnotationBroker:
             except Exception:
                 doc = None
             pairs.append((marker_path, doc))
-        return pairs
+        return pairs, complete
 
     async def _withheld_upload_paths(self, artifact_id: str) -> frozenset:
         """Object paths that must not be treated as dataset images yet.
@@ -2241,7 +2276,17 @@ class AnnotationBroker:
         the fail-open leaves is "an abandoned upload is listed until the next
         mint sweeps it", not "the ceiling is unenforced".
         """
-        pairs = await self._marker_pairs(artifact_id)
+        pairs, complete = await self._marker_pairs(artifact_id)
+        if not complete:
+            # Still fail-open, as documented above -- but SAID, because a
+            # partial read means the withheld set may be short and an
+            # abandoned upload may be listed until the next mint sweeps it.
+            logger.warning(
+                f"the marker listing for {artifact_id} was INCOMPLETE "
+                f"({len(pairs)} marker(s) read); the withheld set may be short, "
+                "so an unfinished upload could be listed until the next mint "
+                "sweeps it"
+            )
         if not pairs:
             return frozenset()
         return core.withheld_upload_paths(pairs)
@@ -2266,7 +2311,16 @@ class AnnotationBroker:
         is logged rather than raised into a caller that was in the middle of
         minting a perfectly good upload.
         """
-        pairs = await self._marker_pairs(artifact_id)
+        pairs, complete = await self._marker_pairs(artifact_id)
+        if not complete:
+            # Housekeeping only, so a partial read costs a later sweep rather
+            # than correctness: the authorisation check treats an expired marker
+            # as no marker whether or not it was ever swept, and the withholding
+            # holds a path until its object is gone.
+            logger.info(
+                f"sweeping {artifact_id} from an INCOMPLETE marker listing "
+                f"({len(pairs)} read); the rest waits for the next mint"
+            )
         if not pairs:
             return 0
         # `now` is THIS app's clock, the one that wrote `expires_at`. Never a
@@ -2638,13 +2692,23 @@ class AnnotationBroker:
         # THEN every OTHER marker for this path, from the now-uncapped listing:
         # a retried mint or a second browser tab leaves one behind, and leaving
         # it open would withhold this image and then have the sweep delete it.
-        leftover = [
-            m
-            for m in core.markers_for_path(
-                await self._marker_pairs(artifact_id), path=path
+        pairs, complete = await self._marker_pairs(artifact_id)
+        if not complete:
+            # FAIL CLOSED, exactly as the own-marker removal above does. A
+            # marker this call did not SEE is a marker it cannot consume, and an
+            # unconsumed duplicate marker for this path withholds the image and
+            # then has the sweep delete it. A review measured the silent version:
+            # a store raising on offset>0 gave 7 of 30 markers, so the extras
+            # scan ran against a list that could not contain the one that
+            # mattered and the fail-closed check passed on it.
+            raise RuntimeError(
+                f"'{name}' was uploaded and checked, but the record of the "
+                "upload could not be read in full, so it was NOT published. "
+                "Publishing without being able to clear every record for this "
+                "file would have let housekeeping delete the image later. "
+                "Nothing was committed; retry with done=false and PUT again."
             )
-            if m != own
-        ]
+        leftover = [m for m in core.markers_for_path(pairs, path=path) if m != own]
         for marker_path in leftover:
             if not await self._remove_marker_file(artifact_id, marker_path):
                 unremoved.append(marker_path)

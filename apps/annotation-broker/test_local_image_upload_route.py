@@ -88,6 +88,24 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
         return state["listing"]
 
     class _Am:
+        async def list_files(self, _a, dir_path=None, stage=True, limit=None, offset=0):
+            """The paginated surface the marker read uses.
+
+            Present because the finish now FAILS CLOSED on a listing it could
+            not read in full, and an `_Am` without this method made every finish
+            refuse through an AttributeError -- which is the fail-closed working,
+            but against a double rather than against the case it is for.
+            """
+            rows = state["listing"] if dir_path == core.UPLOAD_MARKER_DIR else []
+            if dir_path == core.UPLOAD_MARKER_DIR:
+                rows = [
+                    {"name": n.split("/")[-1], "type": "file"}
+                    for n in sorted(state["markers"])
+                ]
+            start = int(offset or 0)
+            size = int(limit) if limit else len(rows)
+            return rows[start : start + size]
+
         async def put_file(self, _a, file_path=None, expires_in=None):
             # Accepted AND recorded: the route passes a short expiry on purpose,
             # and a double that did not take the argument would turn that call

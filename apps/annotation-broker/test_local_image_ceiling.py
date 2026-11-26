@@ -1105,7 +1105,8 @@ async def test_the_marker_read_FOLLOWS_the_servers_pagination(monkeypatch):
     last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
     store.put(mints[last]["put_url"], _png(10000))  # 156x the ceiling, no finish
 
-    pairs = await b._marker_pairs(ARTIFACT)
+    pairs, complete = await b._marker_pairs(ARTIFACT)
+    assert complete is True, "the marker listing was not read in full"
     manifest = await b._image_manifest(ARTIFACT)
 
     assert (
@@ -1138,8 +1139,9 @@ async def test_a_page_SHORTER_than_asked_for_does_not_end_the_read(monkeypatch):
     for i in range(60):
         await b.upload_local_image(ARTIFACT, f"img{i:02d}.png")
 
-    entries = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+    entries, complete = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
 
+    assert complete is True, "a short page was reported as incomplete"
     assert len(entries) == 60, len(entries)
     asks = [c for c in store.listing_calls if c[0] == core.UPLOAD_MARKER_DIR]
     # c = (dir_path, offset, ASKED, SERVED). The ask must exceed the server's
@@ -1169,8 +1171,116 @@ async def test_a_server_that_IGNORES_OFFSET_terminates_the_read(monkeypatch):
 
     monkeypatch.setattr(store, "list_files", ignores_offset)
 
-    entries = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+    entries, complete = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
 
     assert (
         len(entries) == store.page_size
     ), f"expected to stop after the repeated page: {len(entries)}"
+    # And it REPORTS the shortfall. A repeated page means the server is ignoring
+    # `offset`, so the answer may be short -- claiming it complete is the silent
+    # partial the finish now refuses on.
+    assert complete is False, "a repeated page was reported as a complete read"
+
+
+@pytest.mark.asyncio
+async def test_a_finish_REFUSES_when_the_marker_listing_is_PARTIAL(monkeypatch):
+    """The lead's arm for the round-8 residual, and the shape measured in review.
+
+    The paging read used to return a PARTIAL list silently when a page after the
+    first failed -- 7 of 30 markers in the reviewer's probe. For the finish that
+    is the data-loss direction: a duplicate marker it never saw survives the
+    commit, withholds the image, and the sweep deletes it later. So an
+    incomplete listing is now a refusal, exactly as the own-marker removal
+    already is.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    for i in range(60):
+        await b.upload_local_image(ARTIFACT, f"other{i:02d}.png")
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(32))
+
+    real = store.list_files
+
+    async def breaks_after_the_first_page(
+        _a, dir_path=None, stage=True, limit=None, offset=0
+    ):
+        if int(offset or 0) > 0:
+            raise RuntimeError("the store refused a later page")
+        return await real(
+            _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
+        )
+
+    monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
+
+    with pytest.raises(RuntimeError, match="NOT published"):
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+        )
+
+    assert store.committed == 0, "it committed on a listing it could not read in full"
+
+
+@pytest.mark.asyncio
+async def test_the_marker_read_REPORTS_a_partial_page_rather_than_hiding_it(
+    monkeypatch,
+):
+    """The flag itself, both ways. A read that always said `False` would satisfy
+    the refusal test above and make every finish refuse."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    for i in range(60):
+        await b.upload_local_image(ARTIFACT, f"img{i:02d}.png")
+
+    pairs, complete = await b._marker_pairs(ARTIFACT)
+    assert complete is True and len(pairs) == 60, (complete, len(pairs))
+
+    real = store.list_files
+
+    async def breaks_after_the_first_page(
+        _a, dir_path=None, stage=True, limit=None, offset=0
+    ):
+        if int(offset or 0) > 0:
+            raise RuntimeError("the store refused a later page")
+        return await real(
+            _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
+        )
+
+    monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
+
+    pairs, complete = await b._marker_pairs(ARTIFACT)
+    assert complete is False, "a partial read was reported as complete"
+    assert len(pairs) == store.page_size, len(pairs)
+
+
+@pytest.mark.asyncio
+async def test_the_WITHHOLDING_still_answers_on_a_partial_read(monkeypatch):
+    """The fail-open half, kept deliberately and asserted so it is not quietly
+    turned into a refusal: an unreadable `.uploads/` must not present the
+    dataset as having no images at all."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    store.publish("images/already.png", _png(16))
+    for i in range(60):
+        await b.upload_local_image(ARTIFACT, f"img{i:02d}.png")
+
+    real = store.list_files
+
+    async def breaks_after_the_first_page(
+        _a, dir_path=None, stage=True, limit=None, offset=0
+    ):
+        if int(offset or 0) > 0:
+            raise RuntimeError("the store refused a later page")
+        return await real(
+            _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
+        )
+
+    monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
+
+    withheld = await b._withheld_upload_paths(ARTIFACT)
+    manifest = await b._image_manifest(ARTIFACT)
+
+    assert len(withheld) == store.page_size, len(withheld)
+    assert (
+        "already" in manifest
+    ), f"a partial marker read hid an image that was already committed: {manifest}"
