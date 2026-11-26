@@ -154,7 +154,10 @@ def test_NO_OWNER_IDENTIFIER_REACHES_THE_CARD_in_any_form(tmp_path):
     the first and suppressed only the second, which satisfied "no emails" while
     still handing out a stable identifier for a named individual.
     """
-    for label, owner in (("account id", OWNER), ("id that is an email", OWNER_WITH_EMAIL_ID)):
+    for label, owner in (
+        ("account id", OWNER),
+        ("id that is an email", OWNER_WITH_EMAIL_ID),
+    ):
         meta = _write(tmp_path, "bioimage-io/pub", public=True, owner=owner)
         entry = core.public_dataset_entry(
             meta, name="n", description="d", image_count=0
