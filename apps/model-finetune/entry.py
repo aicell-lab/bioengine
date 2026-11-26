@@ -1808,6 +1808,16 @@ class EntryApp:
     #: is a higher cap, with the same silent truncation one threshold up.
     RUNS_LIST_PAGE = 1000
 
+    #: How many record uploads (and read-backs) the backfill has in flight at
+    #: once. A class attribute so a test can set it to 1 and get the old
+    #: serial order back, or to a large number to check the bound is what
+    #: limits concurrency rather than luck.
+    #:
+    #: Bounded rather than unbounded on purpose: `asyncio.gather` over 313
+    #: uploads would open 313 connections at once against a shared artifact
+    #: store, which trades a timeout for a different kind of outage.
+    RUNS_MIGRATE_CONCURRENCY = 8
+
     # Class-level fallbacks for the cache, so a published method never raises
     # AttributeError on an instance whose __init__ did not run. That is not a
     # hypothetical: a half-constructed instance is how the suite exercises a
@@ -2952,17 +2962,57 @@ class EntryApp:
                 f"partial history"
             )
 
+        # ONE STAGE, MANY UPLOADS, ONE COMMIT.
+        #
+        # This loop used to call `_persist_run_record` per record, and that
+        # helper wraps `edit(stage=True)` ... `commit()` around a SINGLE file.
+        # That is right for its other caller -- one run finishing on its own --
+        # and ruinous here: a 313-record backfill became 313 artifact commits,
+        # about 1565 round trips taken serially, which is what exceeded the
+        # proxy's 600 s ceiling and left this operation with no success path at
+        # production scale. The write itself was never the problem; the number
+        # of round trips was.
+        #
+        # `_persist_run_record` is deliberately NOT changed. The bulk shape
+        # belongs here, where the records are known to be independent of one
+        # another and a single stage/commit pair covers all of them.
         written, failed = [], []
-        for item in planned:
-            # The PLANNED record, not a freshly built one: the hash in the plan
-            # is of these bytes, so writing anything else would make the plan a
+        am = await self._runs_artifact_manager()
+        await am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True)
+        upload_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+        async def _upload_one(entry: Dict[str, Any]) -> tuple:
+            # The PLANNED record, not a freshly built one, and serialised the
+            # same way the plan hashed it: the plan's sha256 is of exactly
+            # these bytes, so sending anything else would make the plan a
             # statement about a document that was never uploaded.
-            ok = await self._persist_run_record(
-                item["id"], record=item["record"], log_failure=True
-            )
-            (written if ok else failed).append(item["id"])
+            body = _json.dumps(entry["record"]).encode("utf-8")
+            async with upload_sem:
+                try:
+                    url = await am.put_file(
+                        training.RUNS_ARTIFACT_ID, file_path=entry["path"]
+                    )
+                    resp = await self._http.put(url, content=body)
+                    resp.raise_for_status()
+                except Exception as exc:
+                    logger.warning(
+                        f"model-finetune: backfill could not upload the record "
+                        f"for '{entry['id']}': {type(exc).__name__}: {exc}"
+                    )
+                    return entry["id"], False
+                return entry["id"], True
+
+        # gather preserves argument order, so `written`/`failed` are built
+        # deterministically rather than in completion order.
+        for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
+            (written if ok else failed).append(sid)
+
+        # Committed ONCE, and after every upload has been awaited. A commit
+        # taken while uploads were still in flight would publish a version the
+        # read-back below then compares against an incomplete set.
+        await am.commit(artifact_id=training.RUNS_ARTIFACT_ID)
         plan["applied"] = len(written)
-        plan["failed"] = failed
+        plan["failed"] = sorted(failed)
 
         # THE ARTIFACT IS READ BACK. `written` only means "our commit returned"
         # -- it is this replica's account of its own actions, and a backfill
@@ -2986,19 +3036,32 @@ class EntryApp:
                     "the read-back listing could not be proven complete, so the "
                     "artifact's contents cannot be compared against the plan"
                 )
-            for fname in listing:
+            # Filtered BEFORE fetching, not inside the loop: a record that
+            # belongs to another deployment or to an older run is not part of
+            # this plan and is not evidence either way about it, so there is no
+            # reason to spend a round trip on it.
+            targets = [f for f in listing if f[: -len(".json")] in plan["hashes"]]
+            verify_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+            async def _fetch_one(fname: str) -> tuple:
                 sid = fname[: -len(".json")]
-                if sid not in plan["hashes"]:
-                    # Another deployment's or an older run's record. Not part of
-                    # this plan, so not evidence either way about it.
-                    continue
-                url = await am.get_file(
-                    artifact_id=training.RUNS_ARTIFACT_ID,
-                    file_path=f"{training.run_record_dir(store)}/{fname}",
-                )
-                resp = await self._http.get(url)
-                resp.raise_for_status()
-                verified[sid] = hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
+                async with verify_sem:
+                    url = await am.get_file(
+                        artifact_id=training.RUNS_ARTIFACT_ID,
+                        file_path=f"{training.run_record_dir(store)}/{fname}",
+                    )
+                    resp = await self._http.get(url)
+                    resp.raise_for_status()
+                    return sid, hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
+
+            # A raising fetch propagates out of gather and is caught by the
+            # handler below, which records it as `verify_error` -- the same
+            # behaviour the serial loop had. It must NOT be swallowed per
+            # record: a read-back that quietly skipped a record would leave its
+            # id absent from `verified`, and the mismatch list would then blame
+            # the record instead of the read.
+            for sid, digest in await asyncio.gather(*(_fetch_one(f) for f in targets)):
+                verified[sid] = digest
         except Exception as exc:
             verify_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
 

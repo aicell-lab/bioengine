@@ -81,18 +81,27 @@ class FakeAM:
         #: error rather than a hang.
         self.max_asks = 50
         self.list_asks = []  # (dir_path, limit, offset) as ASKED, not as served
+        #: How many times the artifact was STAGED and COMMITTED. Counted
+        #: because the cost this fake cannot otherwise show is round trips:
+        #: the backfill used to stage and commit once PER RECORD.
+        self.edits = 0
+        self.commits = 0
+        #: Uploads in flight, and the high-water mark, so a test can assert
+        #: the concurrency BOUND rather than hoping.
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     def store(self, path, text):
         self.files[path] = text
 
     async def edit(self, artifact_id=None, stage=None, **kw):
-        pass
+        self.edits += 1
 
     async def put_file(self, artifact_id=None, file_path=None, **kw):
         return f"https://upload.example/{file_path}"
 
     async def commit(self, artifact_id=None, **kw):
-        pass
+        self.commits += 1
 
     async def list_files(
         self, artifact_id=None, dir_path=None, limit=1000, offset=0, **kw
@@ -164,8 +173,17 @@ class FakeHTTP:
         return url.split("://", 1)[1].split("/", 1)[1]
 
     async def put(self, url, content=None, **kw):
-        self.am.store(self._path(url), content.decode("utf-8"))
-        return self._Resp(200)
+        self.am.in_flight += 1
+        self.am.max_in_flight = max(self.am.max_in_flight, self.am.in_flight)
+        try:
+            # Yield so overlapping uploads are actually interleaved by the loop;
+            # without this every PUT completes before the next starts and the
+            # high-water mark would read 1 however concurrent the caller is.
+            await asyncio.sleep(0)
+            self.am.store(self._path(url), content.decode("utf-8"))
+            return self._Resp(200)
+        finally:
+            self.am.in_flight -= 1
 
     async def get(self, url, **kw):
         path = self._path(url)
@@ -190,32 +208,45 @@ def _wire(inst, am=None):
 
 
 def _app(persisted=None, fail=(), tamper=(), am=None):
-    """An instance whose `_persist_run_record` is STUBBED.
+    """An instance whose fake UPLOAD records what the artifact received.
 
-    The stub still deposits the record it was handed into the fake artifact, so
-    the read-back has something real to read; `tamper` makes it deposit
-    something else instead, which is how a record that lands with the WRONG
-    CONTENT is exercised. The real write path is covered separately, by
-    `test_the_PLANNED_HASH_is_a_hash_of_the_BYTES_ACTUALLY_UPLOADED`.
+    These levers used to hang off a stubbed `_persist_run_record`. The apply
+    path no longer calls that helper at all -- it stages once, uploads every
+    record, and commits once, because calling the helper per record meant one
+    artifact COMMIT per record and about 1565 serial round trips for a
+    313-record store. A stub there now intercepts nothing: `persisted` stayed
+    empty and `fail`/`tamper` reached no code, while `applied` and `complete`
+    still read correct, which is exactly the shape of a test that has stopped
+    testing.
+
+    So they moved onto the HTTP PUT the backfill actually performs. That
+    exercises the real `put_file` -> PUT -> `commit` sequence, and `persisted`
+    now means "the artifact received this record" rather than "this private
+    method was called" -- a stronger statement, and one that survives the next
+    refactor of the write path.
     """
     cls = _entry_cls()
     inst = object.__new__(cls)
     am = _wire(inst, am)
+    real_put = inst._http.put
 
-    async def _persist(session_id, status=None, *, log_failure=False, record=None):
-        if session_id in fail:
-            return False
+    def _id_from(url):
+        return url.rsplit("/", 1)[-1][: -len(".json")]
+
+    async def _put(url, content=None, **kw):
+        sid = _id_from(url)
+        if sid in fail:
+            # The real failure arrives as a raising PUT, which the upload path
+            # catches per record; returning a 500 would exercise
+            # `raise_for_status` instead. Both land in `failed`.
+            raise RuntimeError(f"upload refused for {sid}")
         if persisted is not None:
-            persisted.append(session_id)
-        body = (
-            json.dumps({"tampered": session_id})
-            if session_id in tamper
-            else json.dumps(record)
-        )
-        am.store(f"{training.run_record_dir('an-app')}/{session_id}.json", body)
-        return True
+            persisted.append(sid)
+        if sid in tamper:
+            content = json.dumps({"tampered": sid}).encode("utf-8")
+        return await real_put(url, content=content, **kw)
 
-    inst._persist_run_record = _persist
+    inst._http.put = _put
     return cls, inst
 
 
@@ -521,3 +552,64 @@ def test_the_writer_USES_the_record_it_was_GIVEN(store):
     assert (
         json.loads(am.files[path]) == sentinel
     ), "the writer rebuilt the record instead of writing the one it was handed"
+
+
+# ── the round-trip cost, which is what the ceiling was about ───────────────
+
+
+def test_a_BACKFILL_STAGES_ONCE_AND_COMMITS_ONCE_however_many_records(store):
+    """THE property the fix buys. The timeout was a round-trip count, not a write.
+
+    The apply used to call `_persist_run_record` per record, and that helper wraps
+    `edit(stage=True)` ... `commit()` around ONE file -- so a 313-record backfill
+    performed 313 artifact commits and about 1565 round trips, taken serially. The
+    stage/commit count has to be independent of how many records there are.
+    """
+    for i in range(1, 13):
+        store(f"2026-01-01-0000{i:02d}-aaaaaaa{i % 10}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="12")
+
+    assert plan["applied"] == 12, plan
+    assert plan["complete"] is True, plan
+    assert am.edits == 1, f"staged {am.edits} times for 12 records"
+    assert am.commits == 1, f"committed {am.commits} times for 12 records"
+
+
+def test_the_upload_concurrency_is_BOUNDED_by_the_class_attribute(store):
+    """Bounded, not unbounded -- 313 simultaneous connections is a different outage.
+
+    Asserted on the high-water mark of uploads in flight, and on it being ABOVE one,
+    so this cannot pass because the uploads happened to serialise.
+    """
+    for i in range(1, 13):
+        store(f"2026-01-01-0000{i:02d}-bbbbbbb{i % 10}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    inst.RUNS_MIGRATE_CONCURRENCY = 3
+
+    _run(cls, inst, apply=True, confirm="12")
+
+    assert am.max_in_flight > 1, "the uploads never overlapped, so this asserts nothing"
+    assert am.max_in_flight <= 3, f"concurrency reached {am.max_in_flight}, bound was 3"
+
+
+def test_a_concurrency_of_ONE_still_completes(store):
+    """THE CONTROL on the bound: it is a ceiling, not a requirement to overlap.
+
+    A fix that only worked when requests overlapped would pass the test above and
+    break on a store that forced serialisation.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-ccccccc{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    inst.RUNS_MIGRATE_CONCURRENCY = 1
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert am.max_in_flight == 1, am.max_in_flight
+    assert am.commits == 1, am.commits
