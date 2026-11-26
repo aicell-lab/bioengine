@@ -1,9 +1,9 @@
 """A replica's HOME must not depend on the setup hook having run, or having succeeded.
 
-THE DEFECT THIS PINS. HOME and TMPDIR used to be set in exactly one place:
-``replica_init.setup_replica_environment()``, and only *after* that function had
-materialised the user's source over the network. Two independent things then had to go
-right before a replica had a writable HOME:
+WHAT THIS PINS. Were HOME and TMPDIR set in only one place --
+``replica_init.setup_replica_environment()``, and only *after* that function has
+materialised the user's source over the network -- then two independent things have to go
+right before a replica has a writable HOME:
 
   1. **The hook had to run at all.** Ray Serve does not honour
      ``runtime_env.worker_process_setup_hook`` for its replicas, so the hook is reached
@@ -17,12 +17,13 @@ right before a replica had a writable HOME:
      before calling the hook and swallows any exception to a printed traceback, never
      retrying. So a sync that raised left HOME untouched, permanently.
 
-Either way HOME stayed at the image's ``/home/ray``, which is read-only in the published
-worker image, and the app's first write to its own store died with
+Either way HOME stays at the image's ``/home/ray``, which is read-only in the published
+worker image, and the app's first write to its own store fails with
 ``OSError: [Errno 30] Read-only file system`` — a symptom two steps removed from its
-cause. Measured on a production worker: of four replicas of one app created within 0.5 s,
-one logged ``replica environment ready``, one logged ``replica source bootstrap failed``,
-and one logged neither; the latter two both hit the read-only error.
+cause. The failure is per-replica and nondeterministic: of four replicas of one app
+created within half a second, one can log ``replica environment ready``, one
+``replica source bootstrap failed``, and one neither — and the latter two both hit the
+read-only error.
 
 WHAT THE FIX IS, AND WHY BOTH LEGS ARE HERE. The paths are now composed into the
 ``runtime_env`` env_vars by ``AppBuilder._build_env_vars`` — applied by Ray before any
@@ -249,8 +250,8 @@ def test_the_fixture_really_starts_from_the_read_only_default(hook_env) -> None:
 # `fcntl.flock(LOCK_EX)` on the app directory. That directory is an NFS mount with no lock
 # manager, so the call raises `OSError: [Errno 37] No locks available` — six lines before
 # HOME was set, escaping `setup_replica_environment`, swallowed by the bootstrap finder,
-# leaving the replica serving with HOME=/home/ray. One production app showed 4 ENOLCK
-# against 2 of the resulting read-only write failures.
+# leaving the replica serving with HOME=/home/ray, which is read-only in the published
+# image.
 #
 # The lock is REPLACED, not dropped: `mkdir` is atomic on NFS. Degrading to an unlocked
 # sync was rejected because ENOLCK is frequent on this mount, so the unlocked path would
@@ -304,7 +305,7 @@ def test_the_module_takes_no_byte_range_lock_AT_ALL(monkeypatch, tmp_path):
 
 
 def test_ENOLCK_no_longer_stops_a_replica_reaching_ready(monkeypatch, tmp_path):
-    """THE PRODUCTION ARM. flock raises ENOLCK exactly as the de.NBI mount makes it.
+    """THE REAL-WORLD ARM. flock raises ENOLCK as an NFS mount with no lock manager does.
 
     On the previous code this is the failure: `_ensure_source` propagates ENOLCK out of
     `setup_replica_environment` before HOME is assigned. Here the call must complete with
@@ -428,7 +429,7 @@ def test_a_LIVE_claim_makes_it_fail_LOUDLY_not_sync_unclaimed(monkeypatch, tmp_p
 
 
 def test_staleness_survives_a_SKEWED_POD_CLOCK(monkeypatch, tmp_path):
-    """The de.NBI NFS server clock is measured 78.6 s AHEAD of the pods.
+    """A network file server's clock can run well ahead of its clients.
 
     So `time.time() - st_mtime` is the wrong subtraction, and at a large enough skew it
     reads a brand-new claim as abandoned and breaks it — reintroducing concurrent writers

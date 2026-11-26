@@ -270,14 +270,14 @@ class AppBuilder:
         which computes the same paths under ``BIOENGINE_APP_DIR`` so they
         survive app version bumps and stay per-app-per-node (shared across
         replicas of the same app on the same node by design; see
-        :doc:`v0.11.4 release notes`). They used to be left to the hook
-        alone, which is not safe: Ray Serve does not honour
+        :doc:`v0.11.4 release notes`). The hook alone is not sufficient:
+        Ray Serve does not honour
         ``runtime_env.worker_process_setup_hook`` for its replicas, so the
         hook is reached only through the ``sys.meta_path`` finder installed
         in ``bioengine/__init__.py``. That finder fires on the first
         *unresolved* import, at most once per process, and swallows its own
         failures — so a replica whose imports all resolve, or whose source
-        sync raises, never got ``HOME`` and wrote to the image's read-only
+        sync raises, never receives ``HOME`` and writes to the image's read-only
         ``/home/ray``. ``runtime_env`` env_vars are applied by Ray before any
         user code imports, so this leg cannot be skipped.
         """

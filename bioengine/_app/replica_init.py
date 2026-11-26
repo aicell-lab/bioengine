@@ -224,12 +224,13 @@ _CLAIM_WAIT_S = 600
 def _store_now(app_dir: Path) -> float:
     """Return "now" as the STORE's clock sees it.
 
-    Staleness must compare two timestamps from ONE clock. ``time.time()`` is the pod's
-    clock and ``st_mtime`` is the NFS server's, and on the de.NBI share the server is
-    measured **78.6 s ahead** of the pods — so ``time.time() - st_mtime`` goes negative
-    and a naive age test reads a brand-new claim as ancient, or an abandoned one as
-    fresh. Writing a probe into the same directory and stat-ing it yields a timestamp
-    stamped by the same clock that stamped the claim.
+    Staleness must compare two timestamps from ONE clock. ``time.time()`` is the local
+    clock and ``st_mtime`` comes from the file server, and the two are not guaranteed to
+    agree: a network file server's clock can run ahead of its clients by tens of seconds.
+    ``time.time() - st_mtime`` can therefore be negative, and a naive age test reads a
+    brand-new claim as ancient or an abandoned one as fresh. Writing a probe into the
+    same directory and stat-ing it yields a timestamp from the same clock that stamped
+    the claim.
     """
     probe = app_dir / f".claim-probe-{os.getpid()}"
     try:
@@ -249,12 +250,13 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
     at any point before we got it, which is the *only* situation in which the caller may
     trust the version marker instead of reconciling — see :func:`_ensure_source`.
 
-    ``fcntl.flock`` used to do this and **cannot** on the production store: the de.NBI
-    app directory is an NFS mount with no lock manager, so ``flock(LOCK_EX)`` raises
-    ``OSError: [Errno 37] No locks available``. That escaped ``setup_replica_environment``
-    before it had set ``HOME``, was swallowed by the bootstrap finder, and left the
-    replica serving with ``HOME=/home/ray`` — read-only in the published image. Measured
-    on one production app: 4 ENOLCK against 2 of the resulting read-only write failures.
+    A byte-range lock cannot do this job. The app directory may be an NFS mount with no
+    lock manager, where ``fcntl.flock(LOCK_EX)`` raises
+    ``OSError: [Errno 37] No locks available``. Raised from here that error escapes
+    ``setup_replica_environment`` before it has set ``HOME``, is swallowed by the
+    bootstrap finder, and leaves the replica serving with ``HOME`` still pointing at the
+    image's ``/home/ray``, which is read-only — so the app's first write under
+    ``Path.home()`` fails with ``Errno 30`` and the cause is two steps from the symptom.
 
     ``mkdir`` is atomic on NFS (it is a single namespace operation, not a byte-range
     lock), so exactly one of N racing replicas creates the directory and the rest see
@@ -319,8 +321,8 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
        per-file incremental Hypha sync (:func:`_sync_source_from_hypha`).
 
     Concurrent same-store starts are serialised by :func:`_acquire_claim`, an atomic
-    ``mkdir``. It replaced an ``fcntl`` lock, which cannot work on an NFS store without
-    a lock manager — see that function for the measured failure.
+    ``mkdir``. A byte-range lock is deliberately not used: it raises ``ENOLCK`` on an NFS
+    store with no lock manager — see that function.
     """
     source = app_dir / "source"
     version_marker = app_dir / ".version"
@@ -424,12 +426,12 @@ def setup_replica_environment() -> None:
 
     # Point HOME/TMPDIR at the per-app workspace BEFORE materialising the
     # source. These four assignments are local and cheap; the source sync
-    # reaches the network and can fail. While the sync ran first, a failed
-    # sync returned through the caller's error path with HOME still pointing
-    # at the image's `/home/ray`, which is read-only in the published worker
-    # image — so the app's first write died with `OSError: [Errno 30]
-    # Read-only file system` and the real cause (a source sync that raised)
-    # was two steps removed from the symptom. Nothing is gained by deferring
+    # reaches the network and can fail. The ordering matters: with the sync
+    # first, a sync that raises leaves HOME pointing at the image's
+    # `/home/ray`, which is read-only, so the app's first write fails with
+    # `OSError: [Errno 30] Read-only file system` and the real cause (a
+    # source sync that raised) is two steps from the symptom. Nothing is
+    # gained by deferring
     # them behind the download, and a replica that cannot fetch its source is
     # still better off with a writable HOME.
     home = app_dir / "home"
