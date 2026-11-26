@@ -1657,6 +1657,21 @@ class EntryApp:
                 "they select different starting checkpoints."
             )
 
+        # Resuming reads ANOTHER RUN'S CHECKPOINT, so it is gated like the other
+        # calls keyed by a session id: the run's own caller, or a `bioimage-io`
+        # admin. It does not CHANGE the other run, which is why it is not a
+        # mutating call -- but it takes that run's trained weights and continues
+        # from them, so the resulting model derives from a checkpoint the caller
+        # was never granted. "You shared the id so you shared the history" is a
+        # far easier thing to accept than "you shared the id so you shared the
+        # weights", and only the first is the documented position.
+        #
+        # Checked BEFORE the session directory exists and before anything else,
+        # so a refused resume leaves no PREPARING session behind and reveals
+        # nothing about whether the named run exists.
+        if resume_session_id:
+            training.require_caller_may_mutate(resume_session_id, context)
+
         # Before the session dir exists, so a bad name fails the call outright
         # rather than leaving a PREPARING session behind.
         selected_metrics = training.validate_metrics(metrics)
@@ -1917,32 +1932,61 @@ class EntryApp:
 
         return training.get_status(session_id)
 
-    @bioengine.method
-    async def list_training_sessions(self) -> Dict[str, Any]:
-        """All fine-tuning sessions on this worker, keyed by session_id."""
-        import training
+    @bioengine.method(context=True)
+    async def list_training_sessions(self, context=None) -> Dict[str, Any]:
+        """The fine-tuning runs YOU may see, keyed by session_id.
 
-        return training.list_sessions()
+        Not every run on the worker: a run is returned to the caller whose
+        identity it was recorded under, and a run carrying no owner only to a
+        caller holding rw or admin on the `bioimage-io` workspace. An
+        anonymous caller is a real identity here — Hypha mints a fresh one per
+        connection — so it sees the runs it started on that connection and no
+        others.
 
-    @bioengine.method
-    async def stop_training(
-        self, session_id: str = Field(..., description="Session id to stop.")
-    ) -> Dict[str, Any]:
-        """Request cancellation (an in-flight training epoch may finish first).
-
-        Refuses a session that does not exist, and creates nothing when it does
-        so. `write_status` below calls `mkdir(parents=True)`, which is how a real
-        session's directory comes into being on its first write — so without this
-        check, stopping a run that never existed MANUFACTURES it, complete with a
-        status record that then appears in the run listing.
+        `context=True` is load-bearing and not decoration: without it the proxy
+        forwards no context, `training.list_sessions` reads no identity, and the
+        honest consequence of that is an EMPTY listing for everybody. That is
+        the safe direction, and it is also indistinguishable from "this worker
+        has no runs", so the decorator is covered by a test rather than trusted.
         """
         import training
 
+        return training.list_sessions(context)
+
+    @bioengine.method(context=True)
+    async def stop_training(
+        self,
+        session_id: str = Field(..., description="Session id to stop."),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Request cancellation (an in-flight training epoch may finish first).
+
+        Only the run's own caller, or a `bioimage-io` administrator, may stop it.
+        A run with no recorded owner is administrator-only: it cannot be
+        attributed to anybody, and guessing is worse than admitting that.
+
+        Refuses a session that does not exist, and creates nothing when it does
+        so. `write_status` below calls `mkdir(parents=True)`, which is how a real
+        session's directory comes into being on its first write -- so without
+        that check, stopping a run that never existed MANUFACTURES it, complete
+        with a status record that then appears in the run listing.
+
+        THE ORDER OF THE TWO IS LOAD-BEARING. The ownership gate runs FIRST, so a
+        caller who does not own the run is refused without learning whether it
+        exists; only a caller already entitled to act on it reaches the
+        existence check and can tell the two apart.
+
+        `context=True` is load-bearing too. Without it the proxy forwards no
+        context, the check sees no identity, and it then refuses EVERYBODY -- the
+        safe direction, but a silent outage, so a test asserts the decorator.
+        """
+        import training
+
+        training.require_caller_may_mutate(session_id, context)
         if not training.session_dir(session_id).exists():
             raise training.SessionNotFound(
                 f"no training session {session_id!r} on this worker"
             )
-
         training.request_stop(session_id)
         task = self._training_tasks.get(session_id)
         if task is not None and not task.done():
@@ -1955,7 +1999,7 @@ class EntryApp:
         )
         return training.get_status(session_id)
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def export_model(
         self,
         session_id: str = Field(
@@ -1973,6 +2017,7 @@ class EntryApp:
             description="Baked server-side into RDF config.microsam_provenance, e.g. "
             "{dataset_artifact_id, label, split_name, session_lineage}.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Start building a BioImage.IO model package from a COMPLETED fine-tuning
         session — a **combined SAM+decoder** package (interactive prompt head + AIS
@@ -1989,10 +2034,21 @@ class EntryApp:
         """
         import training
 
+        # BEFORE any work, and before the checkpoint lookup, which would tell an
+        # unauthorised caller whether the session exists and whether it trained.
+        training.require_caller_may_mutate(session_id, context)
         self._session_checkpoint(session_id)  # raises if no trained checkpoint
         served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
         await self._check_runtime_available(served)
         export_id = uuid.uuid4().hex
+        # WHO asked, recorded from the injected context at creation time. The
+        # export id is a handle to this run's weights, so the handle has to be
+        # bound to an identity -- `export_model` being owner-or-admin says
+        # nothing about who may later USE the id it returns. Stored under
+        # underscore keys so the single projection in `get_export_status`,
+        # which drops everything starting with "_", keeps the creator out of
+        # every response without a second rule to keep in step.
+        creator = training.caller_identity(context)
         request = {
             "name": name,
             "description": description,
@@ -2008,6 +2064,8 @@ class EntryApp:
             download_url=None,
             size_bytes=None,
             error=None,
+            _owner=creator.get("owner"),
+            _owner_anonymous=creator.get("owner_anonymous"),
         )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
@@ -2079,9 +2137,11 @@ class EntryApp:
         finally:
             export_hb.cancel()
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def get_export_status(
-        self, export_id: str = Field(..., description="export_id from export_model.")
+        self,
+        export_id: str = Field(..., description="export_id from export_model."),
+        context=None,
     ) -> Dict[str, Any]:
         """Export progress. ``status`` ∈ {PENDING, BUILDING, READY, FAILED}.
         ``download_url`` (6h TTL) + ``size_bytes`` are set on READY; ``error`` on
@@ -2091,12 +2151,19 @@ class EntryApp:
         feed back into ``start_training(init_checkpoint=...)``."""
         import training
 
+        # BEFORE the record is read, so the refusal cannot depend on what the
+        # record says. An unauthorised caller must not be able to tell "not
+        # yours" from "no such export": both come out of this call. (`get_export`
+        # does NOT write the swept record -- an earlier version of this comment
+        # said it did -- so the ordering is about the refusal, not a side
+        # effect.)
+        training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         return {k: v for k, v in rec.items() if not k.startswith("_")}
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def push_export(
         self,
         export_id: str = Field(..., description="A READY export_id from export_model."),
@@ -2106,6 +2173,7 @@ class EntryApp:
             "match the 'files' from get_export_status; mint the URLs via the draft "
             "artifact's put_file with the user's token.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Stream the built package files straight into a draft artifact so the
         browser never moves the ~350 MB twice. The frontend creates the staged
@@ -2114,6 +2182,10 @@ class EntryApp:
         reads the artifact."""
         import training
 
+        # The sharper half of the same gap: this streams the whole package --
+        # weights included -- to any presigned URL the caller hands over. Gated
+        # before the record is read, for the same reason as the status read.
+        training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
@@ -2122,13 +2194,32 @@ class EntryApp:
                 f"Export '{export_id}' is not READY (status={rec.get('status')})."
             )
         pkg_dir = Path(rec["_package_dir"])
-        pushed = []
-        for rel, url in files.items():
-            fpath = pkg_dir / rel
+        # EVERY name is bounded BEFORE the first byte moves, not as each file
+        # comes up. `files` keys come from the caller: before this bound
+        # existed, a key was joined to the package directory unchecked and a
+        # caller holding any READY export of their own could push
+        # "../../<another run>/best.pt" -- another run's checkpoint -- to a URL
+        # of their choosing. `package_member_path` requires the name to be one
+        # this export ANNOUNCED and to resolve inside the package.
+        #
+        # Validating the whole mapping first is the review's point and it is
+        # right: checking inside the loop meant a push whose last key was bad
+        # had already streamed the earlier files. Nothing leaked -- they were
+        # the caller's own announced files -- but a refused push that half
+        # happened is a worse thing to explain than one that did nothing.
+        resolved = []
+        for rel in files:
+            fpath = training.package_member_path(
+                pkg_dir, rel, announced=rec.get("files")
+            )
             if not fpath.is_file():
                 raise FileNotFoundError(
                     f"Package file '{rel}' not found for export '{export_id}'."
                 )
+            resolved.append((rel, files[rel], fpath))
+
+        pushed = []
+        for rel, url, fpath in resolved:
             resp = await self._put_file(url, fpath, timeout=600.0)
             resp.raise_for_status()
             pushed.append(rel)
@@ -2456,7 +2547,7 @@ class EntryApp:
             except Exception:
                 pass
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def contribute(
         self,
         session_id: str = Field(
@@ -2479,6 +2570,7 @@ class EntryApp:
             None,
             description="Optional solo validation score for this contribution, recorded for audit.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Upload a finished cpsam session's weights into a community model-soup
         pool. Records weights + an auditable metadata.json (architecture
@@ -2495,6 +2587,14 @@ class EntryApp:
         import pool
         import training
 
+        # BEFORE get_status, whose "session ... is <status>, not COMPLETED" error
+        # would otherwise tell an unauthorised caller that a run exists and what
+        # state it is in -- the same oracle deliberately avoided in export_model.
+        #
+        # Publishing someone else's checkpoint into the shared community pool is
+        # the same harm as exporting it, and worse in reach: the pool index is
+        # append-only and shared, so a contribution cannot simply be withdrawn.
+        training.require_caller_may_mutate(session_id, context)
         st = training.get_status(session_id)
         if st.get("status") != "COMPLETED":
             raise ValueError(
