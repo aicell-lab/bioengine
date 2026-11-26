@@ -64,6 +64,14 @@ def fake_training(monkeypatch: pytest.MonkeyPatch) -> None:
         "model_type": "cpsam",
         "init_checkpoint": "stock",
     }
+    # `contribute` is now gated: only the run's owner or a bioimage-io admin may
+    # publish its checkpoint into the shared pool. A stub module has to provide
+    # that function or the method raises AttributeError before reaching anything
+    # these tests are about. It is a no-op HERE on purpose -- these files are
+    # about dedupe and provenance, and the authorisation behaviour has its own
+    # tests (owner allowed, third party and anonymous refused, the refusal
+    # revealing nothing, and three mutants) in test_run_listing_per_caller.py.
+    mod.require_caller_may_mutate = lambda *_a, **_k: None
     monkeypatch.setitem(sys.modules, "training", mod)
 
 
