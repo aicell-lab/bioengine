@@ -384,11 +384,15 @@ def test_the_FIVE_BUCKETS_ARE_DISJOINT_and_cover_everything_asked_for(tmp_path):
         "m_missing_upstream": _d(b"q" * 8),
     }
     plan = cm.seed_plan(tmp_path, wanted, available=["m_ok", "m_bad", "m_absent"])
-    buckets = [set(v) for v in plan.values()]
+    # Enumerated from SEED_PLAN_BUCKETS rather than from plan.values(): the plan
+    # also carries `provenance_unverified`, which deliberately overlaps `ok`, and
+    # summing every key would make this assertion fail for a correct plan.
+    buckets = [set(plan[name]) for name in cm.SEED_PLAN_BUCKETS]
     union = set().union(*buckets)
     assert union == set(wanted), (plan, sorted(wanted))
-    total = sum(len(v) for v in plan.values())
+    total = sum(len(plan[name]) for name in cm.SEED_PLAN_BUCKETS)
     assert total == len(wanted), f"a member is in two buckets: {plan}"
+    assert set(plan) == set(cm.SEED_PLAN_BUCKETS) | {"provenance_unverified"}, plan
     assert plan["ok"] == ["m_ok"]
     assert plan["replace"] == ["m_bad"]
     assert plan["place"] == ["m_absent"]
@@ -573,3 +577,45 @@ def test_seed_plan_can_PASS_THE_WAIVER_THROUGH_and_refuses_by_default(tmp_path):
         tmp_path, wanted, available=[GENERALIST], allow_unverified_provenance=True
     )
     assert plan["ok"] == [GENERALIST], plan
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_the_PLAN_RECORDS_a_member_that_passed_on_INTEGRITY_ALONE(tmp_path):
+    """Round 3's gap: a waived provenance check was invisible in the plan.
+
+    The record fixed it for one member and the plan did not, one level up -- so
+    a caller logging the plan showed a verified mirror where one leg had been
+    skipped. `provenance_unverified` deliberately OVERLAPS `ok`: the member is
+    in both, because nothing it was checked against disagreed and because what
+    was checked was integrity alone.
+    """
+    good = b"exactly these bytes"
+    _write(tmp_path, GENERALIST, good)
+    wanted = {
+        GENERALIST: {
+            "xxh128": "a" * 32,
+            "sha256": _d(good, "sha256").split(":", 1)[1],
+        }
+    }
+
+    plan = cm.seed_plan(
+        tmp_path, wanted, available=[GENERALIST], allow_unverified_provenance=True
+    )
+
+    assert plan["ok"] == [GENERALIST], plan
+    assert plan["provenance_unverified"] == [GENERALIST], plan
+
+
+def test_the_PLAN_records_NO_skip_when_everything_was_fully_checked(tmp_path):
+    """THE CONTROL. A plan that listed every member as provenance-unverified
+    would satisfy the test above and make the field meaningless."""
+    data = b"a" * 4096
+    _write(tmp_path, GENERALIST, data)
+    wanted = {GENERALIST: _d(data)}
+
+    plan = cm.seed_plan(tmp_path, wanted, available=[GENERALIST])
+
+    assert plan["ok"] == [GENERALIST], plan
+    assert plan["provenance_unverified"] == [], plan

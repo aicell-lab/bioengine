@@ -59,6 +59,18 @@ DECODER_SUFFIX = "_decoder"
 
 CACHE_DIR_ENV = "MICROSAM_CACHEDIR"
 
+#: The keys of :func:`seed_plan` that are DISJOINT buckets and whose union is
+#: exactly what was asked for. Named so a caller can assert that property
+#: without having to know which of the plan's keys are buckets -- the plan also
+#: carries `provenance_unverified`, which deliberately OVERLAPS `ok`.
+SEED_PLAN_BUCKETS = (
+    "ok",
+    "place",
+    "replace",
+    "unavailable",
+    "corrupt_unavailable",
+)
+
 # `xxh128:<32 hex>` is what micro-sam's registry holds. Anchored, and the length
 # is fixed, so a truncated or differently-prefixed value is rejected rather than
 # silently treated as a digest.
@@ -368,7 +380,7 @@ def seed_plan(
     available: Optional[Iterable[str]] = None,
     allow_unverified_provenance: bool = False,
 ) -> Dict[str, List[str]]:
-    """What to do for each wanted member, as four disjoint lists.
+    """What to do for each wanted member, as five disjoint lists plus a note.
 
     *wanted* maps registry key -> expectation, where an expectation is anything
     :func:`parse_expectation` takes: the registry's ``"xxh128:<hex>"`` literal, or
@@ -409,7 +421,19 @@ def seed_plan(
                       green.
 
     The five are disjoint and their union is exactly *wanted*, so a caller can
-    assert that and catch a member silently dropped by a future change.
+    assert that and catch a member silently dropped by a future change. They are
+    named in :data:`SEED_PLAN_BUCKETS`, so that assertion does not have to know
+    which of the plan's keys are buckets.
+
+    **``provenance_unverified`` is NOT one of them.** It lists the members whose
+    provenance leg could not be computed -- `xxhash` absent, with the waiver
+    passed -- and it deliberately OVERLAPS `ok`: such a member is in `ok`,
+    because nothing it was checked against disagreed, and in here, because what
+    was checked was integrity alone. A review found this one level up from where
+    it started: a bool could not say "matched, but only on integrity", and then
+    neither could the plan, so a caller logging the plan showed a verified
+    mirror where one leg had been skipped. It is empty whenever the waiver is
+    not passed, since without it such a member raises instead.
 
     *allow_unverified_provenance* is passed straight through to
     :func:`verify_member`. It has to exist here because planning happens in the
@@ -421,27 +445,26 @@ def seed_plan(
     image, which is a reason to expect it, not a check that it is there.
     """
     have = None if available is None else set(available)
-    plan: Dict[str, List[str]] = {
-        "ok": [],
-        "place": [],
-        "replace": [],
-        "unavailable": [],
-        "corrupt_unavailable": [],
-    }
+    plan: Dict[str, List[str]] = {name: [] for name in SEED_PLAN_BUCKETS}
+    plan["provenance_unverified"] = []
     target = models_dir(cache_root)
     for key, digest in wanted.items():
         parse_expectation(digest)  # fail closed before any filesystem work
         path = target / key
         present = path.is_file()
-        intact = (
-            member_is_intact(
+        if present:
+            # The RECORD, not the bool: the plan has to be able to report that a
+            # member passed on integrity alone, and a bool cannot carry it.
+            seen = verify_member(
                 path,
                 digest,
                 allow_unverified_provenance=allow_unverified_provenance,
             )
-            if present
-            else False
-        )
+            intact = bool(seen["intact"])
+            if seen["skipped"]:
+                plan["provenance_unverified"].append(key)
+        else:
+            intact = False
         mirrored = have is None or key in have
         # PRESENCE IS TESTED BEFORE AVAILABILITY, and the order is the fix: the
         # other way round, a corrupt file the mirror lacks never reaches a
