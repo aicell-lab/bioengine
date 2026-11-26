@@ -1702,9 +1702,9 @@ def shape_status(
     """The reported shape of one run, from its stored document.
 
     ONE definition, because there are now two sources: this worker's own disk
-    and a record shared by another instance of the app. The first version of
-    the shared listing returned the stored document raw, and a review measured
-    what that cost -- the same run read locally and through a record came back:
+    and a record shared by another instance of the app. A shared listing that
+    returns the stored document raw instead costs the difference below -- the
+    same run read locally and through a record then comes back:
 
         LOCAL  STOPPED  [checkpoint_available, config, elapsed_s, message,
                          session_id, start_time, status, updated_at]

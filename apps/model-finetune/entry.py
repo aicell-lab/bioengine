@@ -1520,10 +1520,11 @@ class EntryApp:
     # ------------------------------------------------------------------
     # The shared run record
     #
-    # Run history used to be this worker's own filesystem, which is why two
-    # instances of the app answered differently: measured on one worker as one
-    # administrator, the production instance listed 261 runs, a second instance
-    # listed 19, and the two had NOTHING in common. The records below are the
+    # Run history is a property of the PROJECT, not of one worker's filesystem.
+    # While each instance answers from its own disk, two instances of the app
+    # answer differently: measured on one worker as one administrator, the
+    # production instance listed 261 runs, a second instance listed 19, and the
+    # two had NOTHING in common. The records below are the
     # shared copy that makes the history a property of the project rather than
     # of whichever instance answered.
     #

@@ -99,7 +99,7 @@ def record(sid, owner, **fields):
 
 
 def test_a_run_from_ANOTHER_instance_is_listed_to_its_owner(local):
-    """The clause this row exists for: two instances, one history."""
+    """Two instances, one history: a run started elsewhere is listed here."""
     local("mine-here", ME)
     shared = {"mine-elsewhere": record("mine-elsewhere", ME)}
     out = training.list_sessions(MINE, records=shared)
@@ -178,9 +178,8 @@ def test_the_LOCAL_status_wins_over_a_stale_record(local):
 
 # ── a shared run is reported exactly as a local one ─────────────────────────
 #
-# THE RED-MAKER the first review round named, and it was right. The first
-# version returned the stored document raw while the local path went through
-# `get_status`, so the same run read both ways came back:
+# THE RED-MAKER. Returning the stored document raw while the local path goes
+# through `get_status` makes the same run, read both ways, come back as:
 #
 #   LOCAL  STOPPED  [checkpoint_available, config, elapsed_s, message,
 #                    session_id, start_time, status, updated_at]
@@ -198,11 +197,11 @@ def _record_from_local(sid):
 
 
 def test_a_run_LISTED_BOTH_WAYS_comes_back_IDENTICAL(local):
-    # The params carry fields OUTSIDE the display allow-list, which is what
-    # the first version of this test lacked: with only allow-listed params it
-    # passed while the shared path was reporting the whole params document,
-    # worker-local paths included. A review measured that and named this test
-    # as the one that should have caught it.
+    # The params carry fields OUTSIDE the display allow-list, and that is what
+    # makes this test discriminating rather than decorative: with only
+    # allow-listed params it passes while the shared path reports the whole
+    # params document, worker-local paths included. Keep a non-allow-listed
+    # field here or the case stops being able to fail.
     (training.sessions_root() / "mine").mkdir(parents=True, exist_ok=True)
     (training.sessions_root() / "mine" / "training_params.json").write_text(
         json.dumps(
