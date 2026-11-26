@@ -58,6 +58,18 @@ _SEND_FAILURE_MARKERS = (
 #: paging loop is what makes the answer complete, not this number.
 _LIST_PAGE = 10000
 
+#: How many consecutive pages may add NOTHING before the read is called
+#: incomplete. A filtered overlap stalls for at most as many pages as there are
+#: staged-removed entries in the window; a server ignoring `offset` stalls for
+#: ever. Generous, because the cost of being wrong in one direction is a refused
+#: upload and in the other is one extra page read.
+_NO_PROGRESS_PAGES = 8
+
+#: `list_files`'s own default page. Used only to judge whether a SINGLE
+#: unpaginated call can be called complete: a result shorter than this cannot
+#: have been truncated by the default, while one at or above it may have been.
+_SERVER_DEFAULT_PAGE = 1000
+
 
 def _is_send_failure(exc: Exception) -> bool:
     return any(marker in str(exc) for marker in _SEND_FAILURE_MARKERS)
@@ -341,6 +353,7 @@ class AnnotationBroker:
         """
         out: List[Dict[str, Any]] = []
         seen: set = set()
+        stalled = 0
         offset = 0
         page = 0
         while True:
@@ -361,11 +374,14 @@ class AnnotationBroker:
                     f"list_files does not accept limit/offset; {dir_path} was "
                     "read as ONE page and may be incomplete"
                 )
-                # Complete as far as this server is concerned: it has no
-                # pagination to follow. Flagged complete=True deliberately, with
-                # the warning above as the record that one call was all there
-                # was to ask for.
-                return await self._list_files_safe(artifact_id, dir_path, stage), True
+                # Complete ONLY if the single page is shorter than the server's
+                # documented default -- a full-looking page may be a page. The
+                # previous version returned True unconditionally while the log
+                # above said "may be incomplete", which is the contradiction a
+                # review caught: the log and the return value disagreed, and the
+                # return value is the one callers act on.
+                one = await self._list_files_safe(artifact_id, dir_path, stage)
+                return one, len(one) < _SERVER_DEFAULT_PAGE
             except Exception as exc:
                 if _is_send_failure(exc):
                     raise
@@ -398,17 +414,54 @@ class AnnotationBroker:
                 if isinstance(name, str) and name not in seen:
                     seen.add(name)
                     out.append(entry)
+            # TWO DIFFERENT THINGS LOOK ALIKE HERE, and neither the naive
+            # version nor my first fix told them apart.
+            #
+            #   * the server IGNORES `offset` and hands back the same page --
+            #     which cannot be read past, so the answer is INCOMPLETE;
+            #   * an ordinary OVERLAP. Hypha applies offset to the RAW S3
+            #     listing and filters staged-removed entries AFTERWARDS, so
+            #     advancing by the SERVED count makes the next window start
+            #     early and re-serve names already seen.
+            #
+            # Comparing the page's CONTENT to the previous page's does not
+            # separate them: measured, with a page size of 2 and one flagged
+            # marker, a genuine overlap served a page IDENTICAL to the previous
+            # one, so a content test called the offset ignored and the finish
+            # refused a valid upload. The distinguishing fact is not what a page
+            # contains but whether progress ever RESUMES: under a filtered
+            # overlap, pages that add nothing new are bounded by the number of
+            # filtered entries, while an ignored offset never progresses again.
+            #
+            # So: tolerate up to _NO_PROGRESS_PAGES consecutive pages that add
+            # nothing, then declare the read incomplete. That is a bound rather
+            # than a proof, and it is deliberately generous; the alternative
+            # designs are recorded on the row.
+            names = [
+                entry.get("name") if isinstance(entry, dict) else str(entry)
+                for entry in batch
+            ]
+            before = len(seen)
+            for entry in batch:
+                name = entry.get("name") if isinstance(entry, dict) else str(entry)
+                if isinstance(name, str) and name not in seen:
+                    seen.add(name)
+                    out.append(entry)
             if len(seen) == before:
-                # A non-empty page that added nothing new: the server is
-                # ignoring `offset` and handing back the same page. Stopping is
-                # the only termination available, and it is logged as a WARNING
-                # because the answer may be incomplete -- the one thing this
-                # method must not do is claim completeness it cannot have.
-                logger.warning(
-                    f"listing {dir_path} returned a repeated page at offset "
-                    f"{offset}; stopping, and the result may be incomplete"
+                stalled += 1
+                if stalled >= _NO_PROGRESS_PAGES:
+                    logger.warning(
+                        f"listing {dir_path} made no progress for {stalled} "
+                        f"consecutive pages at offset {offset}; treating the "
+                        "result as INCOMPLETE"
+                    )
+                    return out, False
+                logger.info(
+                    f"listing {dir_path} overlapped at offset {offset} "
+                    f"({len(batch)} entries, none new); reading on"
                 )
-                return out, False
+            else:
+                stalled = 0
             offset += len(batch)
             page += 1
             logger.info(
@@ -2685,13 +2738,13 @@ class AnnotationBroker:
         # this upload's own -- was never seen, so the fail-closed check passed
         # on a list that did not contain it. A path built from the validated
         # mint id cannot be truncated by anything.
-        own = core.upload_marker_path(mint_id)
-        unremoved = []
-        if own is None or not await self._remove_marker_file(artifact_id, own):
-            unremoved.append(own or f"<invalid mint id {mint_id!r}>")
-        # THEN every OTHER marker for this path, from the now-uncapped listing:
-        # a retried mint or a second browser tab leaves one behind, and leaving
-        # it open would withhold this image and then have the sweep delete it.
+        # THE LISTING IS READ BEFORE ANYTHING IS REMOVED, so a refusal here
+        # leaves the upload exactly as it was. A review measured the other
+        # order: the own marker was removed first, then an incomplete listing
+        # refused -- and because the marker was gone, the object was no longer
+        # withheld, so the image list showed an UNCOMMITTED file, while the
+        # error told the caller to retry with done=false, which answered
+        # `already: True`. A dead end, and a message that was false.
         pairs, complete = await self._marker_pairs(artifact_id)
         if not complete:
             # FAIL CLOSED, exactly as the own-marker removal above does. A
@@ -2708,6 +2761,17 @@ class AnnotationBroker:
                 "file would have let housekeeping delete the image later. "
                 "Nothing was committed; retry with done=false and PUT again."
             )
+        # ITS OWN MARKER IS REMOVED BY MINT ID, with no listing involved: a path
+        # built from the validated mint id cannot be truncated by anything, and
+        # a review measured the version that relied on the scan alone missing
+        # its own marker past the listing's old cap.
+        own = core.upload_marker_path(mint_id)
+        unremoved = []
+        if own is None or not await self._remove_marker_file(artifact_id, own):
+            unremoved.append(own or f"<invalid mint id {mint_id!r}>")
+        # THEN every OTHER marker for this path: a retried mint or a second
+        # browser tab leaves one behind, and leaving it open would withhold this
+        # image and then have the sweep delete it.
         leftover = [m for m in core.markers_for_path(pairs, path=path) if m != own]
         for marker_path in leftover:
             if not await self._remove_marker_file(artifact_id, marker_path):

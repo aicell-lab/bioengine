@@ -1284,3 +1284,167 @@ async def test_the_WITHHOLDING_still_answers_on_a_partial_read(monkeypatch):
     assert (
         "already" in manifest
     ), f"a partial marker read hid an image that was already committed: {manifest}"
+
+
+# ── round 9: Hypha applies offset to the RAW listing, then filters ───────────
+#
+# `offset`/`max_length` cut the raw S3 listing; the stage filter that hides
+# `_remove`-flagged entries runs AFTERWARDS. So advancing by the SERVED count
+# makes the next page start that many raw entries early and re-serve names
+# already seen. That OVERLAP is ordinary -- a marker is flagged whenever any
+# other route commits while an upload is open, and annotation saves commit --
+# and reading it as "incomplete" refused valid uploads.
+
+
+class _RawOffsetStore(_Store):
+    """A store with Hypha's own ordering: slice the RAW list, then filter.
+
+    `flagged` holds marker names that are staged for removal: still present in
+    the raw listing, hidden from the served page. Modelled from the Hypha source
+    the review cited rather than from my own guess at the behaviour.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.flagged: set = set()
+
+    def listing(self, dir_path: str, stage: bool = True, limit=None, offset=0):
+        source = {**self.published, **self.objects}
+        raw = []
+        for path, body in sorted(source.items()):
+            head, _, nm = path.rpartition("/")
+            if head != dir_path:
+                continue
+            raw.append({"name": nm, "type": "file", "size": len(body)})
+        start = int(offset or 0)
+        asked = int(limit) if limit else self.page_size
+        size = min(asked, self.page_size)
+        self.listing_calls.append((dir_path, start, asked, size))
+        page = raw[start : start + size]  # the RAW slice comes first...
+        return [e for e in page if e["name"] not in self.flagged]  # ...then the filter
+
+
+@pytest.mark.asyncio
+async def test_a_finish_COMMITS_through_an_overlapping_page(monkeypatch):
+    """Round 9's probe: a staged-removed marker must not refuse a good upload.
+
+    Measured at the refused head: with `a.png`'s mint id sorting before another
+    open marker's, every trial refused with "could not be read in full" and
+    committed nothing -- and because the own marker had already been removed,
+    the uncommitted object was then LISTED as an image while the error told the
+    caller to retry, which answered `already: True`.
+    """
+    store = _RawOffsetStore()
+    store.page_size = 2  # tiny, so two markers already span pages
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    a_mint = await b.upload_local_image(ARTIFACT, "a.png")
+    await b.upload_local_image(ARTIFACT, "b.png")
+    store.put(a_mint["put_url"], _png(32))
+    # a.png's marker is COMMITTED and then flagged for removal, which is what
+    # any other route's commit during an open upload produces.
+    store.flagged.add(core.upload_marker_path(a_mint["mint_id"]).split("/")[-1])
+
+    out = await b.upload_local_image(
+        ARTIFACT, "a.png", done=True, mint_id=a_mint["mint_id"]
+    )
+
+    assert out["committed"] is True, f"an overlapping page refused a good upload: {out}"
+    assert store.committed == 1, store.committed
+
+
+@pytest.mark.asyncio
+async def test_an_overlapping_page_is_NOT_reported_incomplete(monkeypatch):
+    """The read itself, so the distinction is pinned where it is made rather
+    than only through the route."""
+    store = _RawOffsetStore()
+    store.page_size = 2
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    mints = [await b.upload_local_image(ARTIFACT, f"m{i}.png") for i in range(6)]
+    store.flagged.add(core.upload_marker_path(mints[0]["mint_id"]).split("/")[-1])
+
+    entries, complete = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+
+    assert complete is True, "an ordinary overlap was reported as incomplete"
+    # Five of the six are served: the flagged one is hidden by the filter, and
+    # every unflagged marker is reached despite the overlap.
+    assert len(entries) == 5, [e["name"] for e in entries]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_now_leaves_the_upload_UNCHANGED(monkeypatch):
+    """The dead end, closed. The listing is read before anything is removed, so
+    a refusal leaves the marker in place -- which keeps the object withheld and
+    makes the error's "retry" instruction true."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    for i in range(60):
+        await b.upload_local_image(ARTIFACT, f"img{i:02d}.png")
+    mint = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(mint["put_url"], _png(32))
+
+    real = store.list_files
+
+    async def breaks_after_the_first_page(
+        _a, dir_path=None, stage=True, limit=None, offset=0
+    ):
+        if int(offset or 0) > 0:
+            raise RuntimeError("the store refused a later page")
+        return await real(
+            _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
+        )
+
+    monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
+
+    with pytest.raises(RuntimeError, match="NOT published"):
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+        )
+
+    own = core.upload_marker_path(mint["mint_id"])
+    assert own in store.objects, "the refusal removed the marker anyway"
+    assert own not in store.removed
+    manifest = await b._image_manifest(ARTIFACT)
+    assert (
+        "scan01" not in manifest
+    ), f"the uncommitted object is listed as an image: {manifest}"
+
+
+@pytest.mark.asyncio
+async def test_an_UNPAGINATED_server_does_not_over_claim_completeness(monkeypatch):
+    """The fallback branch, for a store that rejects limit/offset outright.
+
+    It falls back to one unpaginated call, and that call's result may itself be
+    a page. A review caught the previous version returning `complete=True`
+    there while the log beside it said "may be incomplete" -- the log and the
+    return value disagreed, and the return value is the one callers act on.
+
+    `_SERVER_DEFAULT_PAGE` is lowered for the test rather than creating a
+    thousand markers: the rule under test is "a result at or above the server's
+    default page may have been truncated", and that rule is what the constant
+    expresses. Both directions are asserted, so a branch that always reported
+    incompleteness would fail here.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    async def rejects_pagination(_a, dir_path=None, stage=True, limit=None, offset=0):
+        if limit is not None or offset:
+            raise TypeError("list_files() got an unexpected keyword argument")
+        return store.listing(dir_path, stage=stage)
+
+    monkeypatch.setattr(store, "list_files", rejects_pagination)
+    monkeypatch.setattr(bk, "_SERVER_DEFAULT_PAGE", 4, raising=False)
+
+    for i in range(3):
+        await b.upload_local_image(ARTIFACT, f"few{i}.png")
+    entries, complete = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+    assert len(entries) == 3 and complete is True, (len(entries), complete)
+
+    for i in range(3, 9):
+        await b.upload_local_image(ARTIFACT, f"few{i}.png")
+    entries, complete = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+    assert len(entries) == 9, len(entries)
+    assert (
+        complete is False
+    ), "a single page at or above the server's default page was called complete"
