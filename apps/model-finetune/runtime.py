@@ -740,6 +740,22 @@ class RuntimeApp:
         """
         import training
 
+        # THE REPLICA THAT WILL WRITE, asked here. The entry refuses up front
+        # using a verdict from whichever replica its handle routed to, which
+        # need not be this one if a backend ever has more than one replica --
+        # a review named that, and my own design note had admitted the window
+        # between a cached verdict and the write. This closes it: the check
+        # runs in the process that is about to write, BEFORE the GPU lock, so
+        # a refused run neither holds the GPU nor dies mid-epoch. One probe per
+        # training run is nothing next to training.
+        report = await self.store_status(max_age_s=0)
+        if report.get("writable") is False:
+            raise RuntimeError(
+                "This GPU runtime cannot write the training-run store, so the "
+                "run was not started: "
+                + str(report.get("detail") or "the store refuses writes")
+            )
+
         async with self._gpu_lock:
             await asyncio.to_thread(self._release_model)
             training.write_status(

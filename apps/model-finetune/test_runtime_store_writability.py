@@ -481,3 +481,100 @@ async def test_START_TRAINING_actually_awaits_the_store_gate(monkeypatch):
     assert "/home/ray/.bioengine" in msg, msg
     assert "No run was started" in msg, msg
     assert started == [], "a session was created before the store was checked"
+
+
+# ── the replica that writes answers for itself ─────────────────────────────
+
+
+@pytest.mark.parametrize("name,cls", _runtime_classes())
+@pytest.mark.asyncio
+async def test_TRAIN_refuses_in_the_process_that_would_write(
+    name, cls, read_only_store
+):
+    """Round 1's minor (b): the entry's verdict comes from whichever replica
+    its handle routed to, which need not be the one that trains. So `train`
+    asks for itself, with a FRESH probe, before taking the GPU lock -- a
+    refused run must neither hold the GPU nor die mid-epoch."""
+    inst = _bare(cls)
+    inst._gpu_lock = asyncio.Lock()
+    took_lock = []
+
+    class _Watch:
+        async def __aenter__(self_inner):
+            took_lock.append(1)
+
+        async def __aexit__(self_inner, *a):
+            return False
+
+    inst._gpu_lock = _Watch()
+
+    with pytest.raises(RuntimeError) as exc:
+        await cls.train.__get__(inst)("2026-11-26-120000-aaaaaaaa", "cpsam", {})
+    msg = str(exc.value)
+    assert "cannot write" in msg, msg
+    assert str(read_only_store) in msg, msg
+    assert took_lock == [], "it took the GPU lock before refusing"
+
+
+@pytest.mark.parametrize("name,cls", _runtime_classes())
+@pytest.mark.asyncio
+async def test_TRAIN_does_not_refuse_on_a_writable_store(
+    name, cls, writable_store, monkeypatch
+):
+    """The control: it must get past the check. Stopped immediately afterwards
+    with a sentinel so the test does not run a real training subprocess."""
+    inst = _bare(cls)
+
+    class _Boom:
+        async def __aenter__(self_inner):
+            raise AssertionError("REACHED THE GPU LOCK")
+
+        async def __aexit__(self_inner, *a):
+            return False
+
+    inst._gpu_lock = _Boom()
+    with pytest.raises(AssertionError) as exc:
+        await cls.train.__get__(inst)("2026-11-26-120000-aaaaaaaa", "cpsam", {})
+    assert "REACHED THE GPU LOCK" in str(exc.value), str(exc.value)
+
+
+@pytest.mark.parametrize("name,cls", _runtime_classes())
+@pytest.mark.asyncio
+async def test_TRAIN_RE_PROBES_rather_than_trusting_a_cached_verdict(
+    name, cls, read_only_store
+):
+    """Why `train` asks with `max_age_s=0`.
+
+    The entry has already asked, so the cache can hold a verdict up to a
+    minute old -- and the store can have changed since, which is precisely
+    what happened in production when a replica came up with a HOME that was
+    never redirected. This plants a FRESH-looking cached "writable" over a
+    store that is actually read-only: with a re-probe the run is refused, and
+    with a cached read it would start and die at its first write.
+
+    Without this test the `max_age_s=0` could be dropped silently -- an arm
+    that replaced it with a long TTL was GREEN until this existed, because
+    the other fixtures leave the cache empty and an empty cache always probes.
+    """
+    import time as _time
+
+    inst = _bare(cls)
+    inst._store_ok = True
+    inst._store_detail = "a stale verdict that says the store is fine"
+    inst._store_checked_at = _time.time()  # fresh enough for any TTL
+
+    class _Boom:
+        async def __aenter__(self_inner):
+            raise AssertionError("REACHED THE GPU LOCK")
+
+        async def __aexit__(self_inner, *a):
+            return False
+
+    inst._gpu_lock = _Boom()
+
+    with pytest.raises(RuntimeError) as exc:
+        await cls.train.__get__(inst)("2026-11-26-120000-aaaaaaaa", "cpsam", {})
+    msg = str(exc.value)
+    assert "cannot write" in msg, msg
+    assert "stale verdict" not in msg, "it reported the cached verdict, not a probe"
+    assert str(read_only_store) in msg, msg
