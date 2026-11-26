@@ -402,3 +402,49 @@ def test_the_mutate_cannot_edit_the_callers_own_record_object(tmp_path):
     assert (
         seen and seen[0] is not fresh
     ), "mutate was handed a live reference, not a copy"
+
+
+def test_create_label_RETURNS_what_update_metadata_STORED():
+    """The spanning-writer pin does NOT see this, and a review found the mutant.
+
+    `create_label` can call `update_metadata`, DISCARD its result, mutate the stale
+    in-memory copy and return that. The suite stays green, and the caller is handed
+    exactly the asymmetric record this row was filed about: the new label present,
+    the concurrent writer's image dimensions missing. It does not breach the clause's
+    literal text -- the write still either lands or raises -- but it reproduces the
+    reported symptom, which is what matters.
+
+    So the returned value has to BE the name `update_metadata`'s result was bound to.
+    Checked structurally, because the harness needed to drive this behaviourally does
+    not exist in this file.
+    """
+    node = _method("create_label")
+
+    bound = [
+        t.id
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "attr", "") == "update_metadata"
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    ]
+    assert bound, (
+        "create_label does not bind update_metadata's result to a name, so whatever "
+        "it returns cannot be the stored record"
+    )
+
+    # ast.walk descends into the nested mutate function, whose own `return record`
+    # is not this method's return value -- filtering by the bound name excludes it.
+    own_returns = [
+        n.value
+        for n in ast.walk(node)
+        if isinstance(n, ast.Return)
+        and isinstance(n.value, ast.Name)
+        and n.value.id in bound
+    ]
+    assert own_returns, (
+        f"create_label does not return the record update_metadata stored (bound to "
+        f"{bound}); returning the in-hand copy hands the caller a record describing a "
+        f"write that may not have landed as given"
+    )
