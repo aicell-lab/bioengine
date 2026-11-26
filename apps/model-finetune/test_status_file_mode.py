@@ -32,8 +32,8 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import stat
+import tempfile
 
 import pytest
 
@@ -43,10 +43,12 @@ import training
 #: bit": a single documented value is checkable, and "not world-writable" is the
 #: kind of loose assertion that passes on 0o644 and then on 0o664.
 #:
-#: Read from the WRITER's own constant rather than written again here. A review
-#: found the mode was documented only in this test file, and whoever rewrites
-#: the writer reads `training.py`, not a test — so `STATUS_FILE_MODE` now lives
-#: beside the write and this is the assertion that it has not moved.
+#: WRITTEN AGAIN HERE ON PURPOSE, so that a drift of `training.STATUS_FILE_MODE`
+#: is caught rather than followed. This literal deliberately does NOT read the
+#: writer's constant: a test whose expectation comes from the code under test
+#: cannot see that code change, and `test_THE_WRITER_NAMES_THE_MODE_ITSELF`
+#: below exists precisely to compare the two. Keeping the second copy is what
+#: makes a silent edit of the writer's constant a test failure.
 REQUIRED_MODE = 0o600
 
 
@@ -54,15 +56,23 @@ def test_THE_WRITER_NAMES_THE_MODE_ITSELF():
     """DONE WHEN 1's "one DOCUMENTED mode", and the document has to be where the
     next change is made. A review found 0o600 appeared only in this test file
     and in its docstring, while `training.py`'s long comment at the mkstemp call
-    explained atomicity and said nothing about the mode."""
+    explained atomicity and said nothing about the mode.
+
+    THIS TEST NO LONGER GREPS THE WRITER'S SOURCE, and the reason is a measured
+    hole rather than a tidy-up. It used to assert the literal text
+    `os.fchmod(fd, STATUS_FILE_MODE)` appeared in `training.py`; a review
+    replaced that line with `# os.fchmod(fd, STATUS_FILE_MODE)` in a throwaway
+    copy and every test in this file still passed, because the text was still
+    there and the writer was back to inheriting its mode. A substring grep
+    cannot tell code from a comment, so the guarantee now rests on the
+    behavioural test below, which is immune to comments, re-wording and line
+    moves. What remains here is the constant's VALUE, which no behavioural test
+    can pin: it is the thing this file's expectation is compared against.
+    """
     assert training.STATUS_FILE_MODE == REQUIRED_MODE, (
         f"the writer's constant is {training.STATUS_FILE_MODE:#o} and this test "
         f"expects {REQUIRED_MODE:#o}"
     )
-    src = (pathlib.Path(training.__file__)).read_text()
-    assert (
-        "os.fchmod(fd, STATUS_FILE_MODE)" in src
-    ), "the writer no longer REQUESTS the mode; it is back to inheriting it"
 
 
 def _mode(path) -> int:
@@ -93,6 +103,55 @@ def test_a_NEW_status_file_is_created_0o600(store):
     assert (
         _mode(p) == REQUIRED_MODE
     ), f"{p.name} was created {oct(_mode(p))}, not {oct(REQUIRED_MODE)}"
+
+
+def test_THE_WRITER_SETS_THE_MODE_ITSELF_on_a_PERMISSIVE_temp_file(store, monkeypatch):
+    """DONE WHEN 1's "the writer REQUESTS the mode", asserted behaviourally.
+
+    This replaces a substring grep for `os.fchmod(fd, STATUS_FILE_MODE)` in the
+    writer's source. A review defeated that grep by COMMENTING THE LINE OUT: the
+    text was still in the file, every test passed, and the writer had silently
+    gone back to inheriting whatever mode it was handed.
+
+    So hand it a permissive one. `mkstemp` is wrapped so the writer's own temp
+    file arrives at 0o666 — the mode `Path.write_text` would produce under a
+    0o000 umask, and the one case where "inherited" and "requested" give
+    different answers. `os.replace` carries the temp file's mode onto the
+    target, so the installed `status.json` is 0o600 only if the writer set it
+    between the two. A commented-out, deleted, re-worded or moved fchmod all
+    fail this identically, because nothing here reads the source.
+
+    The wrapper fires only on the writer's own `.status-` prefix, so nothing
+    else that calls `mkstemp` while it is installed is affected, and `seen` is
+    asserted non-empty: if the writer ever stops using that prefix the test
+    would otherwise pass while exercising nothing at all.
+    """
+    real_mkstemp = tempfile.mkstemp
+    seen = []
+
+    def permissive_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        if kwargs.get("prefix") == ".status-":
+            os.fchmod(fd, 0o666)
+            seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return fd, name
+
+    monkeypatch.setattr(training.tempfile, "mkstemp", permissive_mkstemp)
+
+    sid = "2026-01-01-000004-dddddddd"
+    training.write_status(sid, state="RUNNING", owner={"id": "u1"})
+
+    assert seen == [0o666], (
+        "the wrapper never saw a '.status-' temp file, so this test measured "
+        f"NOTHING about the writer's mode (observed: {[oct(m) for m in seen]})"
+    )
+    p = training._status_path(sid)
+    got = _mode(p)
+    assert got == REQUIRED_MODE, (
+        f"the temp file was handed over at 0o666 and the installed file is "
+        f"{got:#o}: the writer INHERITED the mode instead of requesting "
+        f"{REQUIRED_MODE:#o}"
+    )
 
 
 def test_a_REWRITTEN_status_file_KEEPS_0o600(store):
