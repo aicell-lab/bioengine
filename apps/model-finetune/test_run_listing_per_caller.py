@@ -439,10 +439,18 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context, *, writable_datasets=frozenset(), records=None, skipped=None):
+    def spy(
+        context,
+        *,
+        writable_datasets=frozenset(),
+        records=None,
+        shared_ids=frozenset(),
+        skipped=None,
+    ):
         seen["context"] = context
         seen["writable_datasets"] = writable_datasets
         seen["records"] = records
+        seen["shared_ids"] = shared_ids
         return {"sentinel": {}}
 
     class _AM:
@@ -460,6 +468,11 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
     inst = cls.__new__(cls)
     inst._hypha = _Hypha()
     out = await fn(inst, context=ADMIN)
+    # This instance has no connection, so the shared run record cannot be read.
+    # The listing must still answer -- from local disk alone -- rather than
+    # raise: a short history beats no history. That it is `{}` and not None is
+    # the filter's contract, which has no None branch.
+    assert seen["records"] == {}, seen["records"]
     assert out == {"sentinel": {}}
     assert seen["context"] is ADMIN, seen
     # The spy takes `context` POSITIONALLY-or-by-keyword and would accept a
