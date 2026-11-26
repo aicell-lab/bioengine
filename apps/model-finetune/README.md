@@ -67,6 +67,32 @@ served without an app release.
 Switching `model_type` frees the previous model's VRAM and loads the new one
 (one resident at a time, per runtime).
 
+## Who can do what with a run identifier
+
+**A run identifier grants access to that run. Sharing the identifier is how you share the run, and it cannot be withdrawn.** An identifier is a timestamp plus 32 random bits, so nobody will guess one — but anyone you give it to keeps what it grants for as long as the run exists. There is no revoke, and there is no list of who holds it.
+
+What holding an identifier lets anyone do:
+
+| Call | Who | |
+|---|---|---|
+| `get_training_status(session_id)` | anyone holding the identifier | what was trained, the configuration, and how far it got |
+| `get_export_status(export_id)` | the export's creator, or `rw`/admin on `bioimage-io` | ⚠ **hands over the weights** — a READY record carries `download_url`, a 6-hour presigned link to the packaged weights, and `resume_checkpoint_file` |
+| `push_export(export_id)` | the export's creator, or `rw`/admin on `bioimage-io` | ⚠ streams the package to any presigned URL the caller supplies |
+| `infer(session_id=…)` | anyone holding the identifier | **run inference with the run's model** |
+| `compute_embedding(session_id=…)` | anyone holding the identifier | likewise |
+| `stop_training(session_id)` | the run's owner, or `rw`/admin on `bioimage-io` | acts on somebody else's run |
+| `export_model(session_id=…)` | the run's owner, or `rw`/admin on `bioimage-io` | hands out the weights |
+| `contribute(session_id=…)` | the run's owner, or `rw`/admin on `bioimage-io` | publishes them into the shared pool |
+| `start_training(resume_session_id=…)` | the run's owner, anyone who owns or manages the dataset it was trained on, or `rw`/admin on `bioimage-io` | continues training from the checkpoint, producing a model derived from it |
+
+The line is not "touches the weights" — it is whether the call **hands out or creates** weights. Inference returns an *output* computed with the model; the caller never receives the checkpoint and no new model derives from it. Several people trying one run's model in a shared notebook is the intended flow, so inference is deliberately open to any holder of the run identifier. Exporting, contributing and resuming each put the weights themselves in somebody's hands, so none of them is open to a stranger holding the id. Exporting and contributing need the run's owner or a holder of `rw`/admin on `bioimage-io`. **Resuming is deliberately wider**: it also admits anyone who owns or manages the dataset the run was trained on, because a run's collaborators are its dataset's managers and a colleague should be able to carry the work on — while disposing of somebody else's run is not something sharing a dataset consents to.
+
+⚠ **An export handle is not a progress token — treat it as the weights themselves.** A READY export record carries `download_url`, a presigned link to the packaged weights with a six-hour life, plus `resume_checkpoint_file`, and `push_export` streams the whole package to any presigned URL the caller supplies.
+
+**An `export_id` is bound to the identity that created it**, so it is not a shareable link: `get_export_status` and `push_export` are allowed only for the caller `export_model` recorded, or for a holder of `rw`/admin on `bioimage-io`. A refusal does not say whether the export exists, so a wrong id and somebody else's id are answered identically. An export minted before that rule existed records no creator and is admin-only; those expire within hours. If you want somebody to see a run or try its model, share the run identifier — not an export handle.
+
+For the per-caller run listing, and what an id does and does not grant, see `list_training_sessions` under Methods below; that paragraph is the authoritative one and this section does not restate it.
+
 ## Methods
 
 - **`infer(input_arrays=None, embeddings=None, model_type="vit_l_lm", min_size=None, session_id=None)`**

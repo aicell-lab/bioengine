@@ -288,7 +288,7 @@ def test_the_owner_may_still_mutate_their_own_run(runs):
     assert training.caller_may_mutate(sid, ctx(OWNER, anonymous=False)) is True
 
 
-# ── the dataset scan that feeds the async resolver ───────────────────────────
+# ── the listing must not re-read what it has already read ────────────────────
 
 
 def test_the_listing_reads_each_run_record_ONCE(runs, monkeypatch):
