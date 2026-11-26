@@ -124,7 +124,10 @@ def test_a_card_carries_WHAT_A_GALLERY_NEEDS(tmp_path):
     assert entry["name"] == "HPA Demo"
     assert entry["description"] == "A demo set"
     assert entry["image_count"] == 86
-    assert entry["owner_display"] == "github|49943582"
+    # No owner, and asserted as ABSENT rather than as None: a key present with
+    # a null value is a slot, and a slot is how an identifier gets put back.
+    assert "owner_display" not in entry, entry
+    assert "owner" not in entry, entry
 
 
 def test_a_card_is_an_ALLOW_LIST_so_a_new_field_cannot_leak(tmp_path):
@@ -142,14 +145,37 @@ def test_a_card_is_an_ALLOW_LIST_so_a_new_field_cannot_leak(tmp_path):
     assert EMAIL.findall(json.dumps(entry)) == []
 
 
-def test_an_owner_whose_ID_IS_an_email_shows_NO_owner_rather_than_the_address(
-    tmp_path,
-):
-    """Some logins record an address as the id. There is then nothing
-    publishable, and inventing a name would be worse than showing none."""
-    meta = _write(tmp_path, "bioimage-io/pub", public=True, owner=OWNER_WITH_EMAIL_ID)
+def test_NO_OWNER_IDENTIFIER_REACHES_THE_CARD_in_any_form(tmp_path):
+    """The card names nobody, and that is the requirement rather than a side
+    effect of scrubbing addresses.
 
-    assert core.owner_display(meta) is None
-    entry = core.public_dataset_entry(meta, name="n", description="d", image_count=0)
-    assert entry["owner_display"] is None
-    assert EMAIL.findall(json.dumps(entry)) == []
+    Driven from BOTH owner shapes the metadata can hold -- an account id and an
+    id that is itself an email address -- because an earlier version published
+    the first and suppressed only the second, which satisfied "no emails" while
+    still handing out a stable identifier for a named individual.
+    """
+    for label, owner in (("account id", OWNER), ("id that is an email", OWNER_WITH_EMAIL_ID)):
+        meta = _write(tmp_path, "bioimage-io/pub", public=True, owner=owner)
+        entry = core.public_dataset_entry(
+            meta, name="n", description="d", image_count=0
+        )
+        blob = json.dumps(entry)
+        assert EMAIL.findall(blob) == [], (label, blob)
+        # Nothing from the owner block, by VALUE: a field-name check would miss
+        # an id that arrived under some other key.
+        for value in (owner or {}).values():
+            if isinstance(value, str) and value:
+                assert value not in blob, (label, value, blob)
+        assert "owner_display" not in entry, (label, entry)
+
+
+def test_there_is_NO_owner_display_HELPER_left_to_call(tmp_path):
+    """A helper returning None would be a slot for somebody to fill back in
+    with whatever identifier is to hand, which is exactly how the field
+    arrived. Removing the field and leaving the function would make the next
+    reinstatement a one-line change nobody reviews."""
+    assert not hasattr(core, "owner_display"), (
+        "core.owner_display still exists; the gallery card must have no owner "
+        "slot at all, not an owner slot that happens to be empty"
+    )
+    assert "owner_display" not in core.PUBLIC_DATASET_FIELDS
