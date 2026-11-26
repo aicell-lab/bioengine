@@ -217,8 +217,15 @@ def _sync_source_from_hypha(
 #: sync of a large artifact over a loaded NFS mount is not a dead replica, and breaking a
 #: live claim is worse than waiting.
 _CLAIM_STALE_S = 900
-#: How long to wait for someone else's claim before giving up LOUDLY.
-_CLAIM_WAIT_S = 600
+#: How long to wait for someone else's claim before giving up LOUDLY. It MUST exceed
+#: ``_CLAIM_STALE_S``: a waiter that gives up first can never reach the age at which it
+#: would be allowed to break an abandoned claim, so the replacement for a replica that
+#: died mid-sync would raise instead of taking over — which is the very case this claim
+#: exists to survive. Derived from the staleness bound rather than written as a second
+#: literal, so the two cannot drift apart.
+_CLAIM_WAIT_S = _CLAIM_STALE_S + 300
+#: Poll interval while waiting for someone else's claim.
+_CLAIM_POLL_S = 2
 
 
 def _store_now(app_dir: Path) -> float:
@@ -241,6 +248,29 @@ def _store_now(app_dir: Path) -> float:
             probe.unlink()
         except OSError:
             pass
+
+
+def _wait_or_give_up(
+    claim: Path,
+    deadline: float,
+    age: Optional[float],
+    exc: Optional[OSError],
+) -> None:
+    """Sleep one poll interval, or raise because the deadline has passed.
+
+    Factored out so that *every* retry path in :func:`_acquire_claim` is bounded by the
+    same deadline and pays the same sleep. A retry path that bypassed this is how a
+    bounded wait became an unbounded spin.
+    """
+    if time.monotonic() > deadline:
+        held = f"held by another replica for {age:.0f}s" if age is not None else (
+            f"and the claim could not be read ({exc})"
+        )
+        raise RuntimeError(
+            f"BioEngine: timed out after {_CLAIM_WAIT_S}s waiting for the source claim "
+            f"at {claim}, {held}. Refusing to materialise source without a claim."
+        )
+    time.sleep(_CLAIM_POLL_S)
 
 
 def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
@@ -284,10 +314,17 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
                 f"The replica refuses to materialise source without a claim."
             ) from exc
 
+        # Every path from here back to the mkdir goes through _wait_or_give_up below.
+        # An `except: continue` that skipped it span the loop with no sleep and no
+        # deadline check: a persistently failing stat (a full or read-only store, a
+        # vanished mount) turned a bounded wait into a busy loop that never ended.
         try:
             age = _store_now(app_dir) - claim.stat().st_mtime
-        except OSError:
-            # It vanished between the mkdir and the stat — the holder finished. Retry.
+        except OSError as exc:
+            # Either it vanished between the mkdir and the stat (the holder finished,
+            # and the next mkdir wins) or the store cannot be read at all. The two are
+            # indistinguishable here, and only the deadline tells them apart.
+            _wait_or_give_up(claim, deadline, None, exc)
             continue
 
         if age > _CLAIM_STALE_S:
@@ -301,13 +338,7 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
                 pass  # someone else broke it first; the next mkdir decides
             continue
 
-        if time.monotonic() > deadline:
-            raise RuntimeError(
-                f"BioEngine: timed out after {_CLAIM_WAIT_S}s waiting for the source "
-                f"claim at {claim}, held by another replica for {age:.0f}s. Refusing to "
-                f"materialise source without a claim."
-            )
-        time.sleep(2)
+        _wait_or_give_up(claim, deadline, age, None)
 
 
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
@@ -431,9 +462,8 @@ def setup_replica_environment() -> None:
     # `/home/ray`, which is read-only, so the app's first write fails with
     # `OSError: [Errno 30] Read-only file system` and the real cause (a
     # source sync that raised) is two steps from the symptom. Nothing is
-    # gained by deferring
-    # them behind the download, and a replica that cannot fetch its source is
-    # still better off with a writable HOME.
+    # gained by deferring them behind the download, and a replica that cannot
+    # fetch its source is still better off with a writable HOME.
     home = app_dir / "home"
     tmp = app_dir / "tmp"
     home.mkdir(parents=True, exist_ok=True)

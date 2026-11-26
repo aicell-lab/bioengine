@@ -251,7 +251,8 @@ def test_the_fixture_really_starts_from_the_read_only_default(hook_env) -> None:
 # manager, so the call raises `OSError: [Errno 37] No locks available` — six lines before
 # HOME was set, escaping `setup_replica_environment`, swallowed by the bootstrap finder,
 # leaving the replica serving with HOME=/home/ray, which is read-only in the published
-# image.
+# image. The assignment sits after the sync in the function, so an ENOLCK from the lock
+# never reaches it.
 #
 # The lock is REPLACED, not dropped: `mkdir` is atomic on NFS. Degrading to an unlocked
 # sync was rejected because ENOLCK is frequent on this mount, so the unlocked path would
@@ -442,8 +443,80 @@ def test_staleness_survives_a_SKEWED_POD_CLOCK(monkeypatch, tmp_path):
     app_dir.mkdir(parents=True, exist_ok=True)
     (app_dir / ".claim").mkdir()  # fresh, so it must NOT be broken
     skew = replica_init._CLAIM_STALE_S * 10
-    monkeypatch.setattr(replica_init.time, "time", lambda: time.time() + skew)
+    real_time = time.time  # captured BEFORE the patch, or the lambda calls itself
+    monkeypatch.setattr(replica_init.time, "time", lambda: real_time() + skew)
+    assert replica_init.time.time() - real_time() > skew / 2, "the skew patch is inert"
     monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0)
     with pytest.raises(RuntimeError, match="claim"):
         replica_init.setup_replica_environment()
     assert calls == [], "a skewed pod clock broke a live claim and synced anyway"
+
+
+# ───────────────── leg 4: the claim's own bounds, both measured ─────────────────
+
+
+def test_the_wait_bound_EXCEEDS_the_staleness_bound(monkeypatch, tmp_path):
+    """The invariant, asserted on the shipped constants.
+
+    A waiter that gives up before a claim can be judged abandoned can never break one. The
+    replacement for a replica that died mid-sync arrives at age ~0 and is exactly the
+    caller that must survive this, so `wait <= stale` makes the claim unrecoverable in the
+    one case it exists for. Asserted on the constants because that is what cannot drift:
+    the module derives the wait from the staleness bound rather than writing a second
+    literal, and this fails if anyone unpicks that.
+    """
+    assert replica_init._CLAIM_WAIT_S > replica_init._CLAIM_STALE_S, (
+        f"wait={replica_init._CLAIM_WAIT_S}s does not exceed "
+        f"stale={replica_init._CLAIM_STALE_S}s, so an abandoned claim is never broken"
+    )
+
+
+def test_an_abandoned_YOUNG_claim_is_eventually_acquired(monkeypatch, tmp_path):
+    """The behaviour the invariant buys, driven with the shipped *shape* scaled down.
+
+    The claim is fresh on arrival and nobody ever releases it. With the wait exceeding the
+    staleness bound the waiter outlives the threshold, breaks it and proceeds; with the
+    bounds the other way round it raises.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / ".claim").mkdir()
+    monkeypatch.setattr(replica_init, "_CLAIM_STALE_S", 0.2)
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0.5)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.02)
+    replica_init.setup_replica_environment()
+    assert calls == ["1.2.3"], "it never got the claim, so it never synced"
+    assert os.environ["HOME"] == str(app_dir / "home")
+
+
+def test_an_UNREADABLE_claim_does_not_spin_past_the_deadline(monkeypatch, tmp_path):
+    """A retry path that skipped the deadline turned a bounded wait into a busy loop.
+
+    `_store_now` writes a probe into the store, so it fails whenever the store does — a
+    full quota, a read-only remount, a vanished mount. Each failure used to `continue`
+    straight back to the mkdir with no sleep and no deadline check, so the loop spun as
+    fast as the CPU allowed and never ended.
+
+    Bounded here by COUNTING the attempts, not by wall clock: a test that only asserted
+    "it raises" would pass on the spinning version too, since it does eventually raise
+    when the deadline is checked — it just burns a core until then.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / ".claim").mkdir()
+    attempts = []
+
+    def unreadable(_app_dir):
+        attempts.append(1)
+        if len(attempts) > 500:
+            raise AssertionError(f"SPUN {len(attempts)} times past the deadline")
+        raise OSError(122, "Disk quota exceeded")
+
+    monkeypatch.setattr(replica_init, "_store_now", unreadable)
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0.2)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.05)
+    with pytest.raises(RuntimeError, match="claim"):
+        replica_init.setup_replica_environment()
+    # wait/poll is ~4 polls; allow generous slack but nothing like a spin.
+    assert len(attempts) <= 40, f"{len(attempts)} attempts for a 0.2s/0.05s budget"
+    assert calls == [], "it synced without a claim"
