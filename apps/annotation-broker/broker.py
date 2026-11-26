@@ -3478,11 +3478,27 @@ class AnnotationBroker:
         image_read_url = await self._am.get_file(
             artifact_id=artifact_id, file_path=image_file_path, stage=True
         )
-        embedding_put_url = await self._am.put_file(artifact_id, file_path=emb_path)
+
+        # THE SAME BUG AS `get_save_urls`, and found by the review of that fix.
+        # `put_file` asserts the artifact is staged, so a bare call here raised
+        # on any artifact that had been committed -- and adding an image commits
+        # one. The first embedding request for a freshly uploaded image
+        # therefore failed with "Artifact must be in staging mode.", on the same
+        # path a user walks straight after adding their image.
+        #
+        # Fixing it here rather than filing it: the two are one defect, and the
+        # browser check that would have caught it comes after a release.
+        minted: Dict[str, str] = {}
+
+        async def _mint_embedding_url():
+            minted["url"] = await self._am.put_file(artifact_id, file_path=emb_path)
+
+        await self._ensure_staged(artifact_id, _mint_embedding_url)
+
         return {
             "exists": False,
             "image_read_url": image_read_url,
-            "embedding_put_url": embedding_put_url,
+            "embedding_put_url": minted["url"],
         }
 
     @bioengine.method(context=True)
@@ -3565,9 +3581,14 @@ class AnnotationBroker:
         # drawn was lost with it.
         #
         # Minting and the users upsert go in ONE block rather than two so a
-        # single restage covers both. A retry re-mints, which costs nothing: a
-        # presigned URL nobody writes to has no effect, and the upsert is
-        # idempotent.
+        # single restage covers both. A retry is safe because it reuses the
+        # SAME paths -- not because an unused mint is free. It is not:
+        # `_commit_tolerating_pending_uploads` exists precisely because
+        # `put_file` registers the file in the staged manifest immediately, and
+        # a staged entry that never arrives in S3 blocks later commits until it
+        # is pruned. An earlier version of this comment said such a URL "has no
+        # effect", which contradicted that docstring; the conclusion held but
+        # the reason was wrong.
         async def _mint_and_record_user():
             minted["png"] = await self._am.put_file(
                 artifact_id, file_path=paths["png"]

@@ -53,6 +53,12 @@ class StagingAm:
         self.calls.append("commit")
         self.staged = False
 
+    async def get_file(self, artifact_id=None, file_path=None, stage=True, **_kw):
+        # Reads are NOT gated on staging -- only `put_file` is. Modelling them
+        # as refused too would hide which call the staging rule actually bites.
+        self.calls.append("get_file:%s" % file_path)
+        return "https://signed.invalid/read/%s" % file_path
+
 
 def _broker(monkeypatch, *, staged: bool):
     b = bk.AnnotationBroker()
@@ -81,8 +87,22 @@ def _broker(monkeypatch, *, staged: bool):
     monkeypatch.setattr(b, "_read_json_file", _read_json_file)
     monkeypatch.setattr(b, "_write_json_file", _write_json_file)
     monkeypatch.setattr(b, "_am", am)
-    # No real backoff: the retry path is exercised, not waited out.
-    monkeypatch.setattr(core, "ensure_staged", core.ensure_staged)
+
+    # No real backoff. The previous line here set `core.ensure_staged` to
+    # ITSELF -- a no-op under a comment claiming it skipped the wait -- so each
+    # test really slept the full retry delay. `ensure_staged` takes an
+    # injectable `sleep` for exactly this, so the broker's wrapper is replaced
+    # with one that passes a sleep doing nothing.
+    async def _no_sleep(_seconds):
+        return None
+
+    async def _ensure_staged(artifact_id, fn):
+        async def restage():
+            await am.edit(artifact_id=artifact_id, stage=True)
+
+        return await core.ensure_staged(fn, restage, sleep=_no_sleep)
+
+    monkeypatch.setattr(b, "_ensure_staged", _ensure_staged)
     return b, am, docs
 
 
@@ -190,3 +210,69 @@ async def test_a_NON_STAGE_error_is_NOT_retried(monkeypatch):
     assert "edit:stage=True" not in am.calls, (
         f"a non-staging failure triggered a restage: {am.calls}"
     )
+
+
+# ── the sibling: embeddings mint an upload URL the same way ─────────────────
+
+
+def _embedding_broker(monkeypatch, *, staged: bool):
+    """Like `_broker`, plus the reads `get_embedding_urls` makes before minting."""
+    b, am, docs = _broker(monkeypatch, staged=staged)
+
+    async def _file_exists(_a, _path):
+        return False          # no embedding yet, so it takes the minting branch
+
+    async def _image_file_path(_a, stem):
+        return "images/%s.png" % stem
+
+    monkeypatch.setattr(b, "_file_exists", _file_exists)
+    monkeypatch.setattr(b, "_image_file_path", _image_file_path)
+    return b, am, docs
+
+
+async def _embeddings(b):
+    return await bk.AnnotationBroker.get_embedding_urls(
+        b, artifact_id=ARTIFACT, image_stem="probe", model_type="vit_b_lm", context={}
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_EMBEDDING_url_on_a_COMMITTED_artifact_SUCCEEDS(monkeypatch):
+    """The sibling of the save bug, on the path a user walks right after upload.
+
+    Adding an image commits the artifact; the very next thing the annotate page
+    needs is an embedding. Minting that URL with a bare `put_file` fails for
+    exactly the same reason, and this is the arm that would have caught it
+    before a release rather than after.
+    """
+    b, am, _docs = _embedding_broker(monkeypatch, staged=False)
+
+    res = await _embeddings(b)
+
+    assert res["exists"] is False
+    assert res["embedding_put_url"].startswith("https://signed.invalid/")
+    assert am.staged is True, "the artifact was left committed"
+
+
+@pytest.mark.asyncio
+async def test_the_EMBEDDING_mint_RESTAGES_before_it_succeeds(monkeypatch):
+    """Ordering again: a mint is attempted, fails, THEN the restage runs."""
+    b, am, _docs = _embedding_broker(monkeypatch, staged=False)
+
+    await _embeddings(b)
+
+    first_put = next(i for i, c in enumerate(am.calls) if c.startswith("put_file"))
+    restage = next(i for i, c in enumerate(am.calls) if c == "edit:stage=True")
+    assert first_put < restage, am.calls
+    assert any(c.startswith("put_file") for c in am.calls[restage + 1:]), am.calls
+
+
+@pytest.mark.asyncio
+async def test_an_ALREADY_STAGED_artifact_needs_no_restage_for_embeddings(monkeypatch):
+    """The paired control, so the fix cannot be 'restage on every call'."""
+    b, am, _docs = _embedding_broker(monkeypatch, staged=True)
+
+    res = await _embeddings(b)
+
+    assert res["embedding_put_url"]
+    assert "edit:stage=True" not in am.calls, am.calls
