@@ -43,6 +43,7 @@ it, which is what makes it the right lever, but an app is free to ignore it.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import time
 from pathlib import Path
@@ -630,3 +631,124 @@ def test_the_timeout_message_CARRIES_the_errno_even_when_an_age_is_known(
     msg = str(ei.value)
     assert "Directory not empty" in msg, f"the errno never reached the message: {msg}"
     assert "held by another replica" in msg, f"the age was dropped instead: {msg}"
+
+
+# ───────── leg 5: two gaps the superseded sibling PR identified, adapted ─────────
+#
+# A sibling pull request proposed a different fix for the same defect and was closed
+# unmerged once this one superseded it, with its ordering change folded in here. Two of
+# its test ideas were NOT folded in, and neither is covered by anything above:
+#
+#   * the claim directory being UNCREATABLE at all (not held by a peer — mkdir itself
+#     failing, as it would on a read-only or quota-exhausted store);
+#   * genuine MUTUAL EXCLUSION between two concurrent replicas.
+#
+# Its own versions could not be applied: they assert a design that was rejected (a
+# `.materialising` path, an `errno=` message format, a `_CLAIM_POLL_SECONDS` constant),
+# so they would fail against the code that actually landed. These are the same two
+# properties written against the landed implementation.
+
+
+def test_a_claim_that_CANNOT_BE_CREATED_fails_loudly_naming_the_path(monkeypatch, tmp_path):
+    """mkdir failing outright is not the same as a peer holding the claim.
+
+    `FileExistsError` means wait; every other `OSError` from that mkdir means the store
+    will not accept a claim at all — a read-only remount, an exhausted quota, a vanished
+    mount. That must raise, name the path, and carry the errno, because silence is what
+    made the original defect expensive: a replica that proceeds unclaimed looks healthy
+    and corrupts a shared tree instead.
+    """
+    import errno as _errno
+
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    real_mkdir = Path.mkdir
+
+    def refusing_mkdir(self, *a, **kw):
+        if self.name == ".claim":
+            raise OSError(_errno.EROFS, "Read-only file system")
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "mkdir", refusing_mkdir)
+    # Bound the wait. On correct code the raise is immediate, so this changes nothing --
+    # but a regression that SWALLOWS the error does not proceed unclaimed, it spins until
+    # the deadline, and with the shipped 1200 s bound that turns this arm into a
+    # twenty-minute hang instead of a failure. Measured while building the mutant control
+    # for this very test: the run had to be killed. A test that hangs on the defect it
+    # guards is a test nobody will keep.
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 1)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.05)
+    with pytest.raises(RuntimeError) as ei:
+        replica_init.setup_replica_environment()
+    msg = str(ei.value)
+    assert ".claim" in msg, f"the error does not name the claim path: {msg}"
+    assert "Read-only file system" in msg, f"the error does not carry the errno: {msg}"
+    assert calls == [], "it synced despite being unable to claim"
+
+
+def test_two_concurrent_replicas_NEVER_SYNC_AT_ONCE(monkeypatch, tmp_path):
+    """The property the claim exists for, and the only arm here that is really concurrent.
+
+    THE INVARIANT IS NON-OVERLAP, NOT DEDUPLICATION — and asserting the wrong one would
+    fail against correct code. The loser acquires the claim once the winner releases it,
+    and (since the marker fast path only applies to a replica that waited) a second sync
+    is legitimate. What must never happen is two syncs IN FLIGHT AT ONCE over one
+    `source/`, because that is what tears the tree, and it tears it quietly.
+
+    So this records each sync's [start, end] and asserts no two intervals overlap.
+    """
+    import threading
+
+    app_dir, _calls, _held = _sync_env(monkeypatch, tmp_path)
+    spans, lock = [], threading.Lock()
+
+    def slow_sync(files_url, version, token, source, snapshot_path, logger):
+        t0 = time.monotonic()
+        time.sleep(0.4)
+        Path(source).mkdir(parents=True, exist_ok=True)
+        with lock:
+            spans.append((t0, time.monotonic()))
+
+    monkeypatch.setattr(replica_init, "_sync_source_from_hypha", slow_sync)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.02)
+    errors = []
+
+    def run():
+        try:
+            replica_init._ensure_source(app_dir, "1.2.3", logging.getLogger("t"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not errors, f"a replica raised: {errors}"
+    assert len(spans) >= 1, "neither replica synced, so nothing was measured"
+    overlaps = [
+        (a, b)
+        for i, a in enumerate(spans)
+        for b in spans[i + 1:]
+        if a[0] < b[1] and b[0] < a[1]
+    ]
+    assert not overlaps, f"two syncs were in flight at once over one source/: {overlaps}"
+
+
+def test_the_bootstrap_failure_message_POINTS_AT_THE_REAL_CAUSE():
+    """The finder swallows a bootstrap failure to a printed traceback, so that print is the
+    only thing a reader gets. It must say that HOME/TMPDIR are already set by then.
+
+    Without that sentence the traceback is read as "source missing from sys.path", and the
+    read-only write that follows looks like a separate, unrelated fault — which is exactly
+    how the original defect stayed unexplained. Asserted structurally because the finder
+    only runs inside a replica, so the message cannot be triggered from a unit test; the
+    guard is that the wording survives, not that it is emitted.
+    """
+    src = Path(replica_init.__file__).parent.parent.joinpath("__init__.py").read_text()
+    i = src.find("replica source bootstrap failed")
+    assert i != -1, "the bootstrap failure message is gone"
+    window = src[i:i + 700]
+    for needed in ("HOME", "TMPDIR", "read-only"):
+        assert needed in window, f"the message no longer mentions {needed!r}: {window[:200]}"
