@@ -693,28 +693,144 @@ def parse_ngff_multiscales(
             str(a.get("name", "")).lower() if isinstance(a, dict) else str(a).lower()
             for a in raw_axes
         ]
+        # THE TYPES COME BACK TOO, and dropping them was the defect. OME-NGFF
+        # declares what each axis IS -- `{"name": "ch", "type": "channel"}` --
+        # and a reader that keeps only the names has to guess from the name.
+        # The spec does not require the channel axis to be called "c", so a
+        # store that calls it "ch" was read as having no channel axis at all.
+        # `None` per axis where no type was declared, so "declared something
+        # else" and "declared nothing" stay distinguishable: the first is an
+        # answer and the second is why the name fallback exists.
+        axis_types = [
+            (
+                (str(a.get("type")).lower() if a.get("type") else None)
+                if isinstance(a, dict)
+                else None
+            )
+            for a in raw_axes
+        ]
     else:
         # Pre-v0.4: `axes` was optional and the order was fixed.
         axes = list(NGFF_IMPLICIT_AXES)
+        # No declaration at all, which is NOT the same as "these are the types
+        # of the implicit axes". The implicit order is a convention about
+        # names, so the name fallback is the only thing that can read it.
+        axis_types = [None] * len(axes)
 
     return {
         "name": chosen.get("name"),
         "dataset_paths": dataset_paths,
         "axes": axes,
+        "axis_types": axis_types,
     }
 
 
-def ngff_axis_roles(axes: List[str], rank: int) -> Dict[str, Any]:
+#: The OME-NGFF axis type that means "this dimension is channels".
+NGFF_CHANNEL_AXIS_TYPE = "channel"
+
+
+def ngff_channel_axis(
+    axes: List[str], axis_types: Optional[List[Optional[str]]] = None
+) -> int:
+    """The channel axis index, by TYPE where any type is declared, by NAME only
+    where none is.
+
+    ``-1`` when there is no channel axis.
+
+    **The type is the authority and the name is the fallback, and the fallback
+    is reached only when the store declares NO types at all.** OME-NGFF says
+    what an axis IS -- ``{"name": "ch", "type": "channel"}`` -- and nothing in
+    the spec requires a channel axis to be called ``c``. Reading only the name
+    meant a store that called it ``ch`` was reported as having no channel axis,
+    and because the viewer and the trainer both take their channel axis from
+    this one answer, all three agreed on the wrong thing.
+
+    What that cost is milder than it sounds and is recorded because the obvious
+    guess is worse: not "annotated one plane, trained on another", but that a
+    multichannel store could not be trained on at all. The region reader finds
+    the unrecognised channel axis is not a role axis, sees several elements and
+    no plane, and refuses.
+
+    **"Where none is declared" is the condition, and "where no axis is typed
+    `channel`" is NOT.** A review measured the difference and it is the whole
+    rule: with the looser condition, ``(["c", "z", "y", "x"], ["space"] * 4)``
+    answered ``0`` -- a store that declares every axis spatial, and therefore
+    says in terms that it has no channels, still had its ``c``-named SPATIAL
+    axis reported as channels. A declared type that is not ``channel`` is an
+    answer, not a gap.
+
+    A store that types only SOME of its axes is treated as type-declaring, so
+    an untyped axis named ``c`` beside a typed ``y`` is not taken as channels.
+    That is the strict reading and it is deliberate: the cost of it is that
+    such a store reports no channel axis, which makes the region reader REFUSE
+    a multichannel crop -- loud and wrong-but-visible. The cost of the lax
+    reading is reporting a spatial axis as channels, which is silent and gives
+    the viewer and the trainer the same wrong answer. Between a refusal and a
+    quiet mis-read of somebody's image, the refusal is the one to prefer.
+
+    Falling back to the name is not laxity either. ``axes`` was optional before
+    OME-NGFF v0.4 and the order was a convention about names, so a pre-v0.4
+    store declares nothing and the name is the only evidence there is. A caller
+    that passes no ``axis_types`` at all is the same case: it has no types, as
+    opposed to a store that has none.
+
+    **More than one axis typed ``channel`` is REFUSED rather than guessed.**
+    The spec allows at most one, so such a store is malformed, and picking the
+    first would be exactly the silent wrong answer this function exists to
+    stop -- the viewer and trainer would still agree with each other, and both
+    would be wrong about the image. Note this is stricter than the previous
+    behaviour, which would have read such a store as having no channel axis
+    unless one of them happened to be named ``c``.
+    """
+    types = list(axis_types or [])[: len(axes)]
+    typed = [
+        i
+        for i, t in enumerate(types)
+        if isinstance(t, str) and t == NGFF_CHANNEL_AXIS_TYPE
+    ]
+    if len(typed) > 1:
+        named = ", ".join(repr(axes[i]) for i in typed)
+        raise NgffSourceError(
+            f"This OME-Zarr store declares {len(typed)} axes of type "
+            f"'channel' ({named}); OME-NGFF allows at most one, so which "
+            "dimension holds the channels cannot be decided. Fix the store's "
+            "axis metadata."
+        )
+    if typed:
+        return typed[0]
+    if any(isinstance(t, str) and t for t in types):
+        # The store declares types and none of them is `channel`. That is an
+        # answer: it has no channel axis. The name is not consulted.
+        return -1
+    return axes.index("c") if "c" in axes else -1
+
+
+def ngff_axis_roles(
+    axes: List[str],
+    rank: int,
+    axis_types: Optional[List[Optional[str]]] = None,
+) -> Dict[str, Any]:
     """``{"y", "x", "c"}`` axis indices for an array of *rank* dimensions.
 
     Mirrors ``axisRoles`` in ``ngffLayout.ts``, including the fallback: when
     the declared axes cannot be trusted (wrong length, no y/x) Y and X are
     taken to be the two fastest-varying dimensions, which is true of every
     image layout in practice.
+
+    Y and X are still found by NAME, and that is not an oversight: OME-NGFF
+    types both of them ``space``, so the type says which two dimensions are
+    spatial and cannot say which is which. Only the channel axis is decidable
+    from its type, which is why only it moved -- see :func:`ngff_channel_axis`.
+
+    *axis_types* is optional so that a caller which has only names still gets
+    the old behaviour rather than a TypeError. That is a compatibility
+    affordance for pre-existing callers and NOT a licence to omit it: a caller
+    that has the types and does not pass them reintroduces the defect
+    silently. ``parse_ngff_multiscales`` returns them beside ``axes``.
     """
     y = axes.index("y") if "y" in axes else -1
     x = axes.index("x") if "x" in axes else -1
-    c = axes.index("c") if "c" in axes else -1
+    c = ngff_channel_axis(axes, axis_types)
     if not (len(axes) == rank and y >= 0 and x >= 0):
         if rank < 2:
             raise NgffSourceError(
