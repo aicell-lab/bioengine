@@ -19,6 +19,8 @@ Covers:
 
 from __future__ import annotations
 
+import copy
+import fcntl
 import hashlib
 import json
 import math
@@ -2422,6 +2424,20 @@ def datasets_dir(root: Optional[Path] = None) -> Path:
     return d
 
 
+def locks_dir(root: Optional[Path] = None) -> Path:
+    """Where ``write_metadata``'s per-record lock files live.
+
+    Deliberately NOT inside ``datasets/``: that directory holds records and nothing else, and
+    anything that lists it — ``list_dataset_ids``, a backup, an operator's ``ls`` — should not have
+    to know about lock files. Keeping them out also means this change adds no entry to the
+    directory whose exact contents the existing atomicity test asserts.
+    """
+    base = root if root is not None else default_state_root()
+    d = Path(base) / ".locks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def artifact_id_to_filename(artifact_id: str) -> str:
     return artifact_id.replace("/", "__") + ".json"
 
@@ -2551,6 +2567,10 @@ def new_metadata(artifact_id: str, owner: Dict[str, Any]) -> Dict[str, Any]:
         "labels": [],
         "created_at": ts,
         "updated_at": ts,
+        # Lost-update guard. Every stored record carries the revision it was written at;
+        # `write_metadata` refuses a write whose in-hand revision is not the stored one, so a
+        # read-modify-write that raced another writer raises instead of discarding its change.
+        "revision": 1,
     }
 
 
@@ -2563,21 +2583,121 @@ def read_metadata(
     return json.loads(p.read_text())
 
 
+class RecordConflict(RuntimeError):
+    """A whole-record write was refused because the stored record had moved on.
+
+    Raised instead of discarding the concurrent change. Carries both revisions so a caller (or a
+    log line) can say what it expected and what it found.
+    """
+
+    def __init__(self, artifact_id: str, expected: Any, found: Any) -> None:
+        super().__init__(
+            f"record {artifact_id!r} changed under this write: expected revision {expected!r}, "
+            f"stored revision is {found!r}. Re-read the record, re-apply the change, and write "
+            f"again (see update_metadata)."
+        )
+        self.artifact_id = artifact_id
+        self.expected = expected
+        self.found = found
+
+
+_UNSET = object()
+
+
 def write_metadata(
-    metadata: Dict[str, Any], root: Optional[Path] = None
+    metadata: Dict[str, Any],
+    root: Optional[Path] = None,
+    *,
+    expect_revision: Any = _UNSET,
 ) -> Dict[str, Any]:
-    """Atomically write *metadata* (write to a ``.tmp`` file, then
-    ``os.replace``) — same pattern as ``training.write_status`` in the
-    micro-sam app. Stamps ``updated_at`` and returns the written dict."""
+    """Atomically write *metadata*, refusing a write that would discard a concurrent change.
+
+    The file write itself is unchanged: ``.tmp`` then ``os.replace``, so a reader never sees torn
+    JSON. What is added here is a compare-and-set, because atomic-per-file is NOT the same
+    property as "no lost update": two callers that each read, mutate and write the WHOLE record used
+    to lose one change entirely, silently, and the loser was handed back the record it believed it
+    had written.
+
+    The expected revision defaults to the one ON THE RECORD IN HAND — i.e. the revision the caller
+    read. That is what makes this fix cover all of the read-modify-write call sites without editing
+    each one: a stale copy now raises ``RecordConflict`` rather than overwriting. Pass
+    ``expect_revision`` explicitly to assert a particular revision, or ``None`` to force an
+    unconditional write (first write of a record, or a deliberate repair).
+
+    A record already on disk from before this change carries no ``revision``; that is accepted once
+    and stamped, so existing state is not bricked by the upgrade.
+
+    The check and the replace happen under an exclusive lock on a sibling ``.lock`` file, so the
+    window between reading the stored revision and replacing the file cannot be slipped through by
+    another writer in this process or in another one on the same filesystem.
+    """
     artifact_id = metadata["artifact_id"]
     metadata = dict(metadata)
-    metadata["updated_at"] = now_iso()
+    expected = metadata.get("revision") if expect_revision is _UNSET else expect_revision
     p = metadata_path(artifact_id, root)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(metadata, indent=2))
-    os.replace(tmp, p)
+    lock_path = locks_dir(root) / (artifact_id_to_filename(artifact_id) + ".lock")
+    with open(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            stored_rev = None
+            if p.exists():
+                try:
+                    stored_rev = (json.loads(p.read_text()) or {}).get("revision")
+                except (json.JSONDecodeError, OSError):
+                    # An unreadable stored record cannot be compared against. Refusing here would
+                    # strand the dataset with no way to repair it, so fall through to the write and
+                    # let the fresh content replace the damaged file.
+                    stored_rev = None
+            if expected is not None and stored_rev is not None and expected != stored_rev:
+                raise RecordConflict(artifact_id, expected, stored_rev)
+            metadata["revision"] = (stored_rev if isinstance(stored_rev, int) else 0) + 1
+            metadata["updated_at"] = now_iso()
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(metadata, indent=2))
+            os.replace(tmp, p)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return metadata
+
+
+def update_metadata(
+    artifact_id: str,
+    mutate: Any,
+    root: Optional[Path] = None,
+    attempts: int = 8,
+) -> Dict[str, Any]:
+    """Read, apply *mutate*, write — retrying on a conflict so BOTH concurrent changes survive.
+
+    ``mutate(record)`` is called with a private deep copy and may mutate it in place or return a
+    replacement. On ``RecordConflict`` the record is re-read and ``mutate`` is applied again to the
+    winner's version, so the loser's change lands on top instead of being discarded — which is the
+    difference between "no silent loss" (what ``write_metadata`` alone gives) and "both changes
+    survive" (what a caller racing an upload actually needs).
+
+    ``mutate`` must therefore be idempotent-safe to re-apply, which the broker's mutations are:
+    they add or set a named thing rather than, say, incrementing a counter.
+
+    Returns the record as STORED, never the caller's in-hand copy — so a caller cannot be handed a
+    record describing a write that did not land. Raises ``RecordConflict`` if *attempts* is
+    exhausted, and ``KeyError`` if the record does not exist.
+    """
+    last: Optional[RecordConflict] = None
+    for _ in range(max(1, attempts)):
+        current = read_metadata(artifact_id, root=root)
+        if current is None:
+            raise KeyError(f"no stored record for {artifact_id!r}")
+        proposed = mutate(copy.deepcopy(current))
+        if proposed is None:
+            proposed = current
+        proposed["artifact_id"] = artifact_id
+        proposed["revision"] = current.get("revision")
+        try:
+            return write_metadata(proposed, root=root)
+        except RecordConflict as exc:
+            last = exc
+            continue
+    raise last if last is not None else RuntimeError("update_metadata made no attempt")
 
 
 def delete_metadata(artifact_id: str, root: Optional[Path] = None) -> bool:

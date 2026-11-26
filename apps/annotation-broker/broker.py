@@ -3215,8 +3215,15 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         description = description if isinstance(description, str) else ""
-        core.add_label(meta, name, description)  # raises ValueError on a bad name
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+        # Read-modify-write through update_metadata, so a concurrent writer (the annotate
+        # page's index call caches image dimensions on the same record) cannot discard this label
+        # and this call cannot discard its dimensions. The returned record is the STORED one, so a
+        # caller is never handed a record describing a write that did not land.
+        def _add_the_label(record):
+            core.add_label(record, name, description)  # raises ValueError on a bad name
+            return record
+
+        meta = core.update_metadata(artifact_id, _add_the_label, root=STATE_ROOT)
 
         async def _put_label_metadata():
             await self._write_json_file(
@@ -3301,8 +3308,19 @@ class AnnotationBroker:
                     dims_cache[stem] = dims
                     cache_grew = True
             if cache_grew:
-                meta["image_dims"] = dims_cache
-                core.write_metadata(meta, root=STATE_ROOT)
+                # This is a READ path that opportunistically caches image dimensions, and it
+                # is the writer measured racing `create_label`. Merge into the stored record rather
+                # than replacing it wholesale: `meta` was read before the dimension fetches above,
+                # so writing it back would discard anything another call stored meanwhile — a label
+                # being the case users hit. MERGE, not replace, because a concurrent writer may
+                # also have added dimensions we should keep.
+                def _merge_dims(record):
+                    merged = dict(record.get("image_dims") or {})
+                    merged.update(dims_cache)
+                    record["image_dims"] = merged
+                    return record
+
+                meta = core.update_metadata(artifact_id, _merge_dims, root=STATE_ROOT)
         for img in images:
             entry = manifest[img["stem"]]
             dims = (
