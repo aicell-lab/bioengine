@@ -51,6 +51,26 @@ _SEND_FAILURE_MARKERS = (
 )
 
 
+#: The page size used when a directory has to be read in FULL. `list_files` is
+#: paginated with a default page of 1000 and a documented range of 1..10000, so
+#: a single call answers a PAGE, not a directory. This asks for the largest
+#: page the server documents, which keeps the number of round trips down -- the
+#: paging loop is what makes the answer complete, not this number.
+_LIST_PAGE = 10000
+
+#: How many consecutive pages may add NOTHING before the read is called
+#: incomplete. A filtered overlap stalls for at most as many pages as there are
+#: staged-removed entries in the window; a server ignoring `offset` stalls for
+#: ever. Generous, because the cost of being wrong in one direction is a refused
+#: upload and in the other is one extra page read.
+_NO_PROGRESS_PAGES = 8
+
+#: `list_files`'s own default page. Used only to judge whether a SINGLE
+#: unpaginated call can be called complete: a result shorter than this cannot
+#: have been truncated by the default, while one at or above it may have been.
+_SERVER_DEFAULT_PAGE = 1000
+
+
 def _is_send_failure(exc: Exception) -> bool:
     return any(marker in str(exc) for marker in _SEND_FAILURE_MARKERS)
 
@@ -249,11 +269,28 @@ class AnnotationBroker:
         return await core.ensure_staged(call, restage)
 
     async def _list_files_safe(
-        self, artifact_id: str, dir_path: str
+        self, artifact_id: str, dir_path: str, stage: bool = True
     ) -> List[Dict[str, Any]]:
+        """Entries under *dir_path*, staged view by default.
+
+        **`stage=False` does not answer "was this already here?", and nothing
+        in this app may use it as though it did.** The intuition is that the
+        committed view excludes an object the current request has just PUT into
+        the open stage, so comparing the two views would separate "the caller
+        uploaded this" from "this was already somebody's image". Measured
+        against the live artifact manager, it does not: a just-PUT staged object
+        was returned by `stage=True`, by `stage` unset, by `stage=False`, by
+        `version="v0"` and by `version="latest"` alike. A guard built on the
+        difference matches every upload, so it refuses the legitimate ones and
+        still cannot see the case it was written for.
+
+        The route that needs that distinction -- the finishing half of
+        `upload_local_image`, which may delete the object -- therefore gets it
+        from a marker it wrote itself at mint time, not from any listing.
+        """
         try:
             files = await self._am.list_files(
-                artifact_id, dir_path=dir_path, stage=True
+                artifact_id, dir_path=dir_path, stage=stage
             )
             return files or []
         except Exception as exc:
@@ -263,6 +300,174 @@ class AnnotationBroker:
             if _is_send_failure(exc):
                 raise
             return []
+
+    async def _list_files_all(
+        self, artifact_id: str, dir_path: str, stage: bool = True
+    ) -> tuple:
+        """``(entries, complete)`` for *dir_path*, following the server's pagination.
+
+        **A TUPLE, not a list, and that is the point.** A review measured the
+        previous version returning a PARTIAL list silently when a page after the
+        first failed -- 7 of 30 markers, with the past-page unfinished upload
+        listed as an image. For the withholding that is the documented
+        fail-open; for the finish's by-path extras scan it is the data-loss
+        direction, because a missed duplicate marker survives the commit and the
+        sweep later deletes that image. Returning a bare list let every caller
+        treat "all of them" and "as many as I could get" as the same value. A
+        caller that ignores the second element now gets a tuple where it
+        expected a list, which fails loudly.
+
+        `list_files` is paginated and its default page is 1000 entries, so a
+        single call is a PAGE and not a directory. A review measured what that
+        costs where a correctness decision reads the result: with more than 1000
+        markers in ``.uploads/``, everything past the first page was invisible,
+        which re-opened both round-6 consequences one threshold up -- an
+        unfinished upload past the page was not withheld (the size bypass,
+        reachable by minting 1001 names or by one large folder upload), and a
+        duplicate marker past the page survived a successful finish and had the
+        sweep delete the image.
+
+        That is the same defect as the app's own 50-entry cap, with the cap
+        imposed by the server instead, and it deserves the same sentence: a cap
+        on a read that a correctness decision depends on is not a bound, it is a
+        silent wrong answer.
+
+        **The loop stops on an EMPTY page, not on a short one.** A page shorter
+        than the limit asked for is an ordinary answer -- the server may cap the
+        limit below the ask -- so treating "shorter than requested" as "that is
+        all of them" reintroduces the incomplete read. Measured against a paging
+        double whose page is 50: an ask of 10000 came back with 50, the loop
+        ended, and the read was short again. Entries are also de-duplicated by
+        name, so a server that ignores `offset` terminates the loop with a
+        warning instead of spinning -- and the warning says the result may be
+        incomplete, because the one thing this must not do is claim a
+        completeness it cannot have.
+
+        Deliberately NOT bounded by an arbitrary maximum. A cap here would be
+        the very defect being fixed; the directory is finite, and the sweep at
+        the start of every mint keeps it near the number of uploads in flight.
+        The cost of a pathological case -- a caller that mints hundreds of
+        thousands of names -- is read volume on an authenticated, manager-only
+        route, and it is logged from the second page onwards so it is visible
+        rather than inferred.
+        """
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        stalled = 0
+        offset = 0
+        page = 0
+        while True:
+            try:
+                files = await self._am.list_files(
+                    artifact_id,
+                    dir_path=dir_path,
+                    stage=stage,
+                    limit=_LIST_PAGE,
+                    offset=offset,
+                )
+            except TypeError:
+                # An artifact manager (or a test double) that does not accept
+                # limit/offset. Fall back to the single call rather than
+                # failing the route -- and say so, because this is the case
+                # where the answer may be a page rather than a directory.
+                logger.warning(
+                    f"list_files does not accept limit/offset; {dir_path} was "
+                    "read as ONE page and may be incomplete"
+                )
+                # Complete ONLY if the single page is shorter than the server's
+                # documented default -- a full-looking page may be a page. The
+                # previous version returned True unconditionally while the log
+                # above said "may be incomplete", which is the contradiction a
+                # review caught: the log and the return value disagreed, and the
+                # return value is the one callers act on.
+                one = await self._list_files_safe(artifact_id, dir_path, stage)
+                return one, len(one) < _SERVER_DEFAULT_PAGE
+            except Exception as exc:
+                if _is_send_failure(exc):
+                    raise
+                # INCOMPLETE, and said so. Page 0 failing means the directory
+                # could not be read at all; a later page failing means a partial
+                # answer. Both are reported as incomplete, and both are logged
+                # with the offset, because "I read everything" and "I read what
+                # I could" must never be the same return value.
+                logger.warning(
+                    f"listing {dir_path} failed at offset {offset} (page "
+                    f"{page + 1}) after {len(out)} entries: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}. The answer is "
+                    "INCOMPLETE."
+                )
+                return out, False
+            batch = files or []
+            # STOP ONLY ON AN EMPTY PAGE, never on a page shorter than the limit
+            # that was asked for. The server is free to cap the limit below the
+            # ask -- Hypha documents a range, and a page smaller than requested
+            # is a perfectly ordinary answer -- so "shorter than I asked for"
+            # does not mean "that is all of them". Measured: with a paging
+            # double whose page is 50 and an ask of 10000, that test ended the
+            # loop after one page and the read was incomplete again, which is
+            # the very defect this method exists to fix.
+            if not batch:
+                return out, True
+            before = len(seen)
+            for entry in batch:
+                name = entry.get("name") if isinstance(entry, dict) else str(entry)
+                if isinstance(name, str) and name not in seen:
+                    seen.add(name)
+                    out.append(entry)
+            # TWO DIFFERENT THINGS LOOK ALIKE HERE, and neither the naive
+            # version nor my first fix told them apart.
+            #
+            #   * the server IGNORES `offset` and hands back the same page --
+            #     which cannot be read past, so the answer is INCOMPLETE;
+            #   * an ordinary OVERLAP. Hypha applies offset to the RAW S3
+            #     listing and filters staged-removed entries AFTERWARDS, so
+            #     advancing by the SERVED count makes the next window start
+            #     early and re-serve names already seen.
+            #
+            # Comparing the page's CONTENT to the previous page's does not
+            # separate them: measured, with a page size of 2 and one flagged
+            # marker, a genuine overlap served a page IDENTICAL to the previous
+            # one, so a content test called the offset ignored and the finish
+            # refused a valid upload. The distinguishing fact is not what a page
+            # contains but whether progress ever RESUMES: under a filtered
+            # overlap, pages that add nothing new are bounded by the number of
+            # filtered entries, while an ignored offset never progresses again.
+            #
+            # So: tolerate up to _NO_PROGRESS_PAGES consecutive pages that add
+            # nothing, then declare the read incomplete. That is a bound rather
+            # than a proof, and it is deliberately generous; the alternative
+            # designs are recorded on the row.
+            names = [
+                entry.get("name") if isinstance(entry, dict) else str(entry)
+                for entry in batch
+            ]
+            before = len(seen)
+            for entry in batch:
+                name = entry.get("name") if isinstance(entry, dict) else str(entry)
+                if isinstance(name, str) and name not in seen:
+                    seen.add(name)
+                    out.append(entry)
+            if len(seen) == before:
+                stalled += 1
+                if stalled >= _NO_PROGRESS_PAGES:
+                    logger.warning(
+                        f"listing {dir_path} made no progress for {stalled} "
+                        f"consecutive pages at offset {offset}; treating the "
+                        "result as INCOMPLETE"
+                    )
+                    return out, False
+                logger.info(
+                    f"listing {dir_path} overlapped at offset {offset} "
+                    f"({len(batch)} entries, none new); reading on"
+                )
+            else:
+                stalled = 0
+            offset += len(batch)
+            page += 1
+            logger.info(
+                f"{dir_path} has more than {offset} entries; reading page "
+                f"{page + 1}"
+            )
 
     async def _file_exists(self, artifact_id: str, file_path: str) -> bool:
         # Presigning does not check object existence, so a get_file probe can
@@ -343,9 +548,24 @@ class AnnotationBroker:
 
         doc = await self._read_json_file(artifact_id, core.IMAGE_MANIFEST_PATH, None)
         listing = await self._list_files_safe(artifact_id, "images")
+        # Uploads still in flight are withheld from the LISTING side. An object
+        # that has only been PUT would otherwise be a dataset image whether or
+        # not the finishing call was ever made, which is how a caller that
+        # simply never finishes gets past the size ceiling entirely -- measured
+        # in review: 10,000 bytes against a 64-byte ceiling, no finish, listed
+        # as a `local` image. The withholding is what makes the finish a gate.
+        #
+        # The stored manifest is NOT filtered: a successful finish removes its
+        # marker before committing, so a completed image is never withheld, and
+        # filtering a stored entry could hide an image that is genuinely there.
+        # Fail-open by design: a short set here costs a transient extra
+        # name in the list, and the next read recomputes it. `complete` is
+        # discarded DELIBERATELY and named so, rather than silently dropped.
+        withheld, _complete = await self._withheld_upload_paths(artifact_id)
         entries, _ = core.merge_image_manifest(
             core.parse_image_manifest(doc),
             core.image_names_from_listing(listing),
+            withheld_paths=withheld,
             dims=dims,
         )
         self._image_manifest_cache[artifact_id] = (time.time(), entries)
@@ -1354,11 +1574,53 @@ class AnnotationBroker:
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
+            # THE WITHHELD SET IS PASSED HERE TOO, and omitting it was a
+            # measured data-loss hole rather than an oversight about style.
+            # This writes the stored manifest and COMMITS, so an unfinished
+            # upload reconciled in here became a permanent dataset image --
+            # size unchecked, signature unchecked -- just because a manager ran
+            # this call while somebody's upload was open. The expiry sweep then
+            # deleted the object and left the entry behind. It governs the
+            # pruning half as well: a withheld path counts as present, so this
+            # call cannot drop a stored entry on account of an open upload.
+            #
+            # AND IT FAILS CLOSED ON A SHORT READ. The withheld set is computed
+            # fail-open, which is right for a reader and wrong here: this write
+            # is COMMITTED and the stored manifest is never filtered again, so a
+            # transient `.uploads/` error would become a permanent record of an
+            # unchecked upload as a dataset image. Measured: with the marker
+            # listing raising during the sync, the stem was stored, listed, and
+            # committed. Skipping is the honest response rather than refusing,
+            # because this call is documented as idempotent and safe to skip --
+            # a missed sync costs the manifest's extra metadata for those stems,
+            # never their visibility, since reads union the manifest with the
+            # listing anyway.
+            withheld, complete = await self._withheld_upload_paths(artifact_id)
+            if not complete:
+                logger.warning(
+                    f"skipping the manifest write for {artifact_id}: the upload "
+                    "markers could not be read in full, and writing on a short "
+                    "set would record an unfinished upload as an image "
+                    "permanently. Nothing was changed; run this again once the "
+                    "store is healthy."
+                )
+                entries = core.parse_image_manifest(doc)
+                return {
+                    "changed": False,
+                    "images": len(entries),
+                    "remote": sum(
+                        1
+                        for e in entries.values()
+                        if e.get("state") == core.IMAGE_STATE_REMOTE
+                    ),
+                    "skipped": "the upload markers could not be read in full",
+                }
             entries, changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
                 core.image_names_from_listing(listing),
                 dims=dict(meta.get("image_dims") or {}),
                 prune=True,
+                withheld_paths=withheld,
             )
             if changed:
 
@@ -1716,16 +1978,41 @@ class AnnotationBroker:
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
-            entries, _ = core.merge_image_manifest(
-                core.parse_image_manifest(doc),
+            # THE CHECK AND THE WRITE USE DIFFERENT SETS, deliberately, and
+            # separating them is what makes this writer safe without a
+            # fail-closed branch of its own.
+            #
+            # The CHECK wants the widest view -- the stored manifest UNION the
+            # listing, minus withheld names -- because its job is to refuse a
+            # stem that is already an image, and a stem present only as a file
+            # would otherwise be overwritten. A short withheld set makes that
+            # check STRICTER (more names look taken), which is the refusing
+            # direction, so it is safe on a partial read.
+            #
+            # The WRITE takes only the stored manifest plus the remote entry
+            # this call came to add. It no longer folds listing-derived local
+            # names into the committed manifest at all -- so it cannot record
+            # an unfinished upload as an image however the marker read went,
+            # which is the hole a review measured here and at the sync. What
+            # that gives up is incidental manifest healing: a local file absent
+            # from the stored manifest stays absent from it. That costs the
+            # extra metadata for those stems and never their visibility, since
+            # reads union the manifest with the listing anyway, and healing is
+            # exactly what `sync_image_manifest` exists to do.
+            withheld, _complete = await self._withheld_upload_paths(artifact_id)
+            stored = core.parse_image_manifest(doc)
+            visible, _ = core.merge_image_manifest(
+                stored,
                 core.image_names_from_listing(listing),
                 dims=dict(meta.get("image_dims") or {}),
+                withheld_paths=withheld,
             )
-            if stem in entries:
+            if stem in visible:
                 raise ValueError(
                     f"'{stem}' is already an image of this dataset. Pass a "
                     f"different name."
                 )
+            entries = dict(stored)
             entries[stem] = entry
 
             async def _write():
@@ -1739,7 +2026,13 @@ class AnnotationBroker:
             # Staged-only writes reappear as absent after a restage, the same
             # trap sync_image_manifest, delete_label and delete_annotation hit.
             await self._commit_tolerating_pending_uploads(artifact_id)
-            self._image_manifest_cache[artifact_id] = (time.time(), entries)
+            # POPPED, not written. `entries` is now the STORED manifest plus
+            # this import -- deliberately narrower than what a reader sees,
+            # since the write no longer folds in listing-derived names. Seeding
+            # the cache with it would drop every local file from the image list
+            # until the entry expired. The next read rebuilds the union, which
+            # is the only thing that can produce the reader's view.
+            self._image_manifest_cache.pop(artifact_id, None)
 
         if credential:
             credentials = dict(meta.get("ngff_credentials") or {})
@@ -1934,6 +2227,288 @@ class AnnotationBroker:
 
         return {"already": False, "stem": stem, **entries[stem]}
 
+    async def _discard_staged_upload(self, artifact_id: str, path: str) -> bool:
+        """Remove a staged object this app has just refused. True if it went.
+
+        Never raises: every caller is already refusing a request for a reason
+        the caller needs to hear, and a failure to clean up must not replace
+        that reason with a different error. It is logged instead, because an
+        object that could not be removed is still staged and the next commit
+        from any route would publish it.
+        """
+        try:
+            await self._am.remove_file(artifact_id=artifact_id, file_path=path)
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"could not remove the refused upload at {path}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}. It is still staged, "
+                "so the next commit on this artifact would publish it."
+            )
+            return False
+
+    # === the upload marker ===
+    # Provenance for the discard. See the block comment above
+    # `UPLOAD_MARKER_DIR` in broker_core for why no listing can supply it.
+
+    async def _write_upload_marker(self, artifact_id: str, marker: Dict[str, Any]):
+        """Record a minted upload. Raises, so a failure refuses the mint.
+
+        Deliberately not tolerant: a mint whose marker did not land hands the
+        client a URL it can never discharge, and the object it uploads would
+        then be unauthorised litter that nothing is allowed to clean up. Better
+        to refuse the mint and let the client ask again.
+        """
+        marker_path = core.upload_marker_path_for_object(marker["path"])
+        if marker_path is None:  # unreachable: the route built `path` itself
+            raise ValueError("refusing to write a marker for an invalid path")
+        # OVERWRITES any marker already recorded for this path, and that is the
+        # mechanism rather than a side effect: a re-mint of the same object --
+        # a client whose first answer was lost, a second browser tab -- replaces
+        # the one record instead of adding a second one that the finish would
+        # then have to find by listing. The new mint id is what the finish
+        # checks, so the superseded URL stops being dischargeable at the same
+        # moment it stops being the live one.
+        await self._write_json_file(artifact_id, marker_path, marker)
+
+    async def _read_upload_marker(self, artifact_id: str, object_path: Any) -> Any:
+        """The stored marker document for the object at *object_path*, or None.
+
+        Keyed by the OBJECT PATH, not by the mint id: the mint id is what the
+        document is checked AGAINST (`marker_authorises_discard`), not how the
+        document is found. That is what lets the finish read one file by name
+        instead of listing `.uploads/` to discover how many records exist.
+
+        None covers every way the marker can fail to be usable -- an unkeyable
+        path, no such marker, a transport hiccup reading it -- because the
+        route's response to all of them is identical: refuse, touch nothing.
+        """
+        marker_path = core.upload_marker_path_for_object(object_path)
+        if marker_path is None:
+            return None
+        return await self._read_json_file(artifact_id, marker_path, None)
+
+    async def _remove_upload_marker(self, artifact_id: str, object_path: Any) -> bool:
+        """Consume the marker for *object_path*. Never raises; see the discard.
+
+        The local is `marker_path`, not `path`, deliberately: `path` in this
+        module means the IMAGE path, and the two removals must not be confusable
+        -- by a reader or by a textual mutation aimed at one of them.
+        """
+        marker_path = core.upload_marker_path_for_object(object_path)
+        if marker_path is None:
+            return False
+        return await self._remove_marker_file(artifact_id, marker_path)
+
+    async def _remove_marker_file(self, artifact_id: str, marker_path: str) -> bool:
+        """Remove ONE marker file by its path. True if it is gone.
+
+        Never raises: every caller decides for itself what a failure means, and
+        they differ. The housekeeping sweep logs and carries on, because an
+        unswept marker costs disk and the authorisation check treats an expired
+        marker as no marker anyway. The finishing call refuses to commit,
+        because a marker left behind there has the sweep delete a published
+        image. A helper that raised would force one of those two to be wrong.
+
+        The parameter is `marker_path`, not `path`, deliberately: `path` in this
+        module means the IMAGE path, and the two removals must not be confusable
+        -- by a reader or by a textual mutation aimed at one of them.
+        """
+        if not isinstance(marker_path, str) or not marker_path.startswith(
+            f"{core.UPLOAD_MARKER_DIR}/"
+        ):
+            # Refuses rather than removing: this is the one place that deletes a
+            # path it was handed rather than one it built from a validated mint
+            # id, so it checks that the path is inside the marker directory.
+            logger.warning(f"refusing to remove a non-marker path: {marker_path!r}")
+            return False
+        try:
+            await self._am.remove_file(artifact_id=artifact_id, file_path=marker_path)
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"could not remove the upload marker at {marker_path}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}. It will be swept once "
+                "it expires."
+            )
+            return False
+
+    async def _marker_pairs(self, artifact_id: str) -> tuple:
+        """``(pairs, complete)`` where pairs is ``(marker_path, document)``.
+
+        **NO CORRECTNESS DECISION READS THIS ANY MORE, and that is the point of
+        the path-keyed marker.** Both remaining callers are housekeeping:
+
+        * the WITHHOLDING, which is fail-open by design -- an
+          unreadable ``.uploads/`` must not present the dataset as having no
+          images -- so a short read leaves "an abandoned upload is listed until
+          the next mint sweeps it", and it logs that;
+        * the SWEEP, which is best-effort, because less housekeeping this pass
+          costs a later pass rather than a wrong answer.
+
+        The FINISH used to be the third caller, and it was the one that could
+        not tolerate a short read: a duplicate marker it did not see stayed
+        open, withheld the image it had just committed, and then had the sweep
+        delete it. Four review rounds tried to bound this read safely and the
+        bound was wrong in both directions -- a cap short enough to terminate
+        against a server that ignores ``offset`` refused valid uploads once
+        staged removals sat in the directory, and one loose enough not to refuse
+        could not terminate. The finish no longer reads a listing at all: a
+        marker is named from the digest of its object path, so a re-mint
+        overwrites the one record and the finish computes its name. See
+        :func:`broker_core.upload_marker_path_for_object`.
+
+        `complete` is still returned, and still a TUPLE, for the reason the
+        review gave: a caller that ignores completeness then gets a tuple where
+        it expected a list and fails loudly, rather than treating "all of them"
+        and "as many as I could get" as one value. Both callers above log the
+        partial read; neither refuses on it.
+
+        **Uncapped, and it used to be capped at the sweep's limit of 50.** The
+        cap now applies only to how much the sweep DELETES per call, which is
+        the part a caller can inflate. That cap is sound exactly because the
+        sweep is the place where doing less per call is merely slower.
+
+        **The cost, stated rather than hidden**: one listing plus one document
+        read per marker present, so a mint is O(markers present). The documents
+        are read because the path is in the DOCUMENT; the filename is a digest
+        and cannot be inverted. A cheaper withholding is now available and is
+        deliberately not taken here -- for each image name, test whether
+        ``.uploads/<sha256("images/<name>")>.json`` is in the listing, which
+        needs no document reads at all -- because it changes a second mechanism
+        in a round whose scope is the finish. It is a follow-up, not a residual:
+        the current read is correct, only O(markers) rather than O(1).
+        """
+        try:
+            entries, complete = await self._list_files_all(
+                artifact_id, core.UPLOAD_MARKER_DIR
+            )
+        except Exception:
+            return [], False
+        pairs = []
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name.endswith(".json"):
+                continue
+            marker_path = f"{core.UPLOAD_MARKER_DIR}/{name}"
+            try:
+                doc = await self._read_json_file(artifact_id, marker_path, None)
+            except Exception:
+                doc = None
+            pairs.append((marker_path, doc))
+        return pairs, complete
+
+    async def _withheld_upload_paths(self, artifact_id: str) -> tuple:
+        """``(paths, complete)`` -- object paths not yet treatable as images.
+
+        Every marker that parses withholds its path, expired or not. An object
+        that has merely been PUT would otherwise be a dataset image with no size
+        check ever applied: the caller that never finishes is not refused by the
+        finishing check, because it never makes that call.
+
+        Expiry used to lift the withholding, on the reasoning that the sweep was
+        about to delete the object anyway. A review measured the gap that left --
+        the sweep was only reachable by minting a DIFFERENT name -- so the
+        withholding now lasts until the object is actually gone, and the sweep
+        runs at the start of every mint to make sure that happens.
+
+        **`complete` is carried rather than resolved here, and it is a TUPLE**,
+        for the reason the paging read is a tuple: a caller that ignores
+        completeness gets a tuple where it expected a set and fails loudly. It
+        used to return a bare set that was computed fail-open, which meant an
+        unreadable ``.uploads/`` read as "nothing is withheld" at every caller
+        alike -- and a review measured that the callers are NOT alike:
+
+        * a READ may answer on a short set. The effect is transient, the next
+          read recomputes it, and the alternative -- withholding everything on
+          an error -- makes an unreadable ``.uploads/`` present the dataset as
+          having no images at all, a total outage of the image list triggered by
+          housekeeping state, on the annotate page's first call;
+        * a WRITE may not. The manifest write is COMMITTED and the stored
+          manifest is never filtered afterwards, so a short set there turns a
+          transient storage error into a permanent record of an unchecked
+          upload as a dataset image. That is the shape ruled on for the finish
+          in an earlier round -- a partial read must not feed a decision with a
+          lasting effect -- and the writers are on the finish's side of it;
+        * the MINT may answer on a short set because short is the REFUSING
+          direction there: fewer withheld names means more names look taken, so
+          it answers ``already`` rather than minting.
+
+        A short read is logged here once, so every caller's decision is visible
+        in one place rather than repeated at four.
+        """
+        pairs, complete = await self._marker_pairs(artifact_id)
+        if not complete:
+            logger.warning(
+                f"the marker listing for {artifact_id} was INCOMPLETE "
+                f"({len(pairs)} marker(s) read); the withheld set may be short. "
+                "Readers answer anyway; the manifest WRITERS must not."
+            )
+        if not pairs:
+            return frozenset(), complete
+        return core.withheld_upload_paths(pairs), complete
+
+    async def _sweep_expired_markers(self, artifact_id: str) -> int:
+        """Housekeeping: drop expired markers AND the objects they vouch for.
+
+        Dropping the marker is tidiness. Dropping the OBJECT is enforcement, and
+        it is the half that matters: a caller that mints, PUTs an oversized body
+        and never finishes is never refused by the finishing check, so what the
+        abandonment leaves behind has to be removed rather than waited on.
+
+        An expired marker is a sound warrant for that delete for exactly the
+        reason the finish-time discard is sound -- it says this app minted that
+        path for an upload that did not complete, so the object at it was never
+        a dataset image. An unparseable marker authorises no object removal at
+        all; it names no path, and guessing one from the filename is the single
+        way this sweep could delete an image the dataset already had.
+
+        Still best-effort for the MARKER half: the authorisation check treats an
+        expired marker as no marker whether or not this ever ran. Every failure
+        is logged rather than raised into a caller that was in the middle of
+        minting a perfectly good upload.
+        """
+        pairs, complete = await self._marker_pairs(artifact_id)
+        if not complete:
+            # Housekeeping only, so a partial read costs a later sweep rather
+            # than correctness: the authorisation check treats an expired marker
+            # as no marker whether or not it was ever swept, and the withholding
+            # holds a path until its object is gone.
+            logger.info(
+                f"sweeping {artifact_id} from an INCOMPLETE marker listing "
+                f"({len(pairs)} read); the rest waits for the next mint"
+            )
+        if not pairs:
+            return 0
+        # `now` is THIS app's clock, the one that wrote `expires_at`. Never a
+        # listing's `last_modified`: on the production filer the server clock
+        # runs ~79 s ahead of the pods, so that comparison crosses two clocks.
+        now = time.time()
+        abandoned = core.abandoned_upload_removals(pairs, now=now)
+        for marker_path, object_path in abandoned:
+            try:
+                await self._discard_staged_upload(artifact_id, object_path)
+            except Exception as exc:
+                logger.warning(
+                    f"could not discard the abandoned upload {object_path} "
+                    f"(marker {marker_path}): {type(exc).__name__}: "
+                    f"{str(exc)[:160]}"
+                )
+        removals = core.expired_marker_removals(pairs, now=now)
+        gone = 0
+        for marker_path in removals:
+            try:
+                await self._am.remove_file(
+                    artifact_id=artifact_id, file_path=marker_path
+                )
+                gone += 1
+            except Exception as exc:
+                logger.warning(
+                    f"could not sweep the expired marker {marker_path}: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+        return gone
+
     @bioengine.method(context=True)
     async def upload_local_image(
         self,
@@ -1952,6 +2527,13 @@ class AnnotationBroker:
                 "(verifies the bytes landed and commits them)."
             ),
         ),
+        mint_id: str = Field(
+            "",
+            description=(
+                "The 'mint_id' returned by the starting call. Required when "
+                "done=true; a finish without it is refused and changes nothing."
+            ),
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Presigned PUT for ONE local image, in two calls.
@@ -1965,10 +2547,20 @@ class AnnotationBroker:
 
         Call once with ``done=False``:
 
-            {"already": false, "stem", "path", "put_url", "max_bytes"}
+            {"already": false, "stem", "path", "put_url", "max_bytes", "mint_id"}
             {"already": true,  "stem", "path"}   # that stem is already an image
 
-        then, after the PUT lands, once with ``done=True``.
+        then, after the PUT lands, once with ``done=True`` and that ``mint_id``.
+
+        **The ``mint_id`` is what makes the finish safe to act on.** Finishing
+        may have to DELETE the object -- that is what enforcing a size ceiling
+        after the bytes have landed means -- and the one thing it must never
+        delete is an image the dataset already had. No listing can tell those
+        apart (measured: an object just PUT into the stage is returned by every
+        listing view, committed included), so the fact has to be recorded when
+        it is created. The starting call writes a marker outside ``images/``;
+        this id names it. A finish whose marker is missing, expired, or minted
+        for a different path is refused and changes nothing at all.
 
         As with ``materialise_image`` the PUT must send the body **bare, with
         no Content-Type header**: the presigned signature covers that header,
@@ -2014,16 +2606,59 @@ class AnnotationBroker:
             #
             # Reconciling here asks the same question the readers ask, so the
             # answer cannot disagree with them.
+            # THE SWEEP RUNS FIRST, before the listing is read. It used to run
+            # at the END of a successful mint, and a review measured what that
+            # cost: the only way to trigger it was to mint a DIFFERENT name,
+            # because minting the same name returns `already: True` from the
+            # check below and never reaches the sweep. So "mint, PUT oversized,
+            # never finish, wait for expiry" left the object as an image on any
+            # dataset where nobody uploaded anything else.
+            #
+            # Running it here closes that and removes a disagreement at the same
+            # time: an abandoned object is deleted BEFORE the no-overwrite check
+            # reads the listing, so the check cannot answer `already` about a
+            # file that is on its way out, and withholding an expired marker's
+            # path until it is swept can no longer contradict that answer.
+            #
+            # Still best-effort inside: a sweep failure is logged, not raised,
+            # so housekeeping cannot refuse a perfectly good upload.
+            await self._sweep_expired_markers(artifact_id)
+
             doc = await self._read_json_file(
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
+            # A WITHHELD PATH IS NOT TAKEN, and omitting this made a refusal's
+            # own instructions false. The refusals that leave the object staged
+            # -- the marker removal failing, and before it the incomplete
+            # listing -- all tell the caller to "retry with done=false and PUT
+            # again". Without the withheld set here that retry answered
+            # `already: True` for up to the marker's whole hour, because the
+            # object IS in the listing: a dead end, and the round-9 review
+            # blocked on exactly that shape on the sibling path.
+            #
+            # It is sound, not a convenience, and the induction is short: a
+            # marker exists for a path only because this check passed when that
+            # marker was minted, so an object at a withheld path is provably not
+            # a pre-existing image -- which is the same fact that licenses the
+            # discard. It also removes the last disagreement between the readers
+            # and this check: the image list hides a withheld path, and a
+            # re-mint no longer says that same path already exists.
+            #
+            # Fail-open, like the withholding itself: an unreadable `.uploads/`
+            # yields an empty set, so the answer degrades to "already", which is
+            # the refusing direction for a mint and merely unhelpful.
+            # Short is the REFUSING direction here: fewer withheld names
+            # means more names look taken, so an incomplete read answers
+            # `already` rather than minting a URL it should not.
+            withheld, _complete = await self._withheld_upload_paths(artifact_id)
             # prune=False: this is a read, and pruning is for the writer that
             # owns the manifest. A stem whose file has gone is still "taken"
             # for the purposes of not clobbering it here.
             entries, _changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
                 core.image_names_from_listing(listing),
+                withheld_paths=withheld,
             )
             existing = entries.get(stem)
             if isinstance(existing, dict):
@@ -2039,21 +2674,140 @@ class AnnotationBroker:
                     "path": existing.get("path"),
                 }
 
+            # Reaching here means `path` is NOT an image in this dataset, by
+            # the reconciled check above. That is the fact the marker records,
+            # and it is the entire warrant for the discard on the finishing
+            # call: an object with a marker cannot be a pre-existing image,
+            # because a marker is only ever minted after this check passes.
+            # Removing either half breaks the guarantee, so the no-overwrite
+            # check above and the marker requirement below are one mechanism.
+            new_id = core.new_mint_id()
+            marker = core.upload_marker_document(
+                path=path,
+                mint_id=new_id,
+                max_bytes=core.MAX_LOCAL_IMAGE_BYTES,
+                minted_at=time.time(),
+            )
             put_url_holder: Dict[str, str] = {}
 
             async def _mint():
+                # The marker FIRST. A URL handed out before the marker exists
+                # is a URL the client could discharge against no marker if the
+                # marker write then failed, and the finish would refuse an
+                # upload that did everything right.
+                await self._write_upload_marker(artifact_id, marker)
+                # `expires_in` is passed explicitly and SHORT. The default is an
+                # hour, and a presigned PUT stays writable for its whole life:
+                # under edit-staging the URL writes the same key the image lives
+                # at, so after a successful finish a client can PUT an oversized
+                # body to the same URL and nothing re-checks it. Measured in
+                # review -- finish 32 bytes, then PUT 10,000 to the same URL, and
+                # the listing size became 10,000. This app cannot close that
+                # without help from the storage service; what it can do is make
+                # the window minutes instead of an hour.
                 put_url_holder["url"] = await self._am.put_file(
-                    artifact_id, file_path=path
+                    artifact_id,
+                    file_path=path,
+                    expires_in=core.UPLOAD_URL_TTL_S,
                 )
 
             await self._ensure_staged(artifact_id, _mint)
+            # No sweep here any more: it runs at the START of this call, above,
+            # where it is reached whatever the no-overwrite check answers.
             return {
                 "already": False,
                 "stem": stem,
                 "path": path,
                 "put_url": put_url_holder["url"],
                 "max_bytes": core.MAX_LOCAL_IMAGE_BYTES,
+                "mint_id": new_id,
             }
+
+        # THE CEILING, enforced here rather than advertised and forgotten. The
+        # minting call above hands the client `max_bytes`, and until this check
+        # existed nothing compared anything to it: an object of any size whose
+        # first bytes matched the declared format became a dataset image.
+        #
+        # Read from the staged LISTING, not by fetching the object: a staged
+        # listing already reports the size of what was just PUT (measured --
+        # `{"type": "file", "name": ..., "size": 12345, ...}` for a
+        # 12345-byte body), so enforcing the limit costs one listing and never
+        # a download of the very object that is too big to want.
+        #
+        # Checked BEFORE the signature, deliberately: the signature check
+        # fetches the first bytes of the object, and there is no reason to
+        # reach into something already known to be over the limit.
+        # AN EXISTING IMAGE IS NEVER TOUCHED, and the marker is the reason the
+        # discard below is safe. A review measured the hole: the discard removed
+        # whatever sat at `images/<name>` whenever the size check refused, and
+        # an image ALREADY in the dataset can be over this route's ceiling,
+        # because the mounted-folder path has no cap and MAX_LOCAL_IMAGE_BYTES
+        # binds this route only. So one finishing call for an existing image's
+        # filename -- a client that ignores `already: True` and finishes anyway,
+        # a stray retry, or exactly the client bug this ceiling exists for --
+        # deleted that image from the stage, and the next commit from any route
+        # published the removal and orphaned its annotations. Before the discard
+        # existed the same call was a harmless commit.
+        #
+        # THE COMMITTED LISTING CANNOT ANSWER THIS, and an earlier round of this
+        # fix assumed it could. Measured against the live artifact manager: an
+        # object PUT into an open stage is returned by `stage=True`, by `stage`
+        # unset, by `stage=False`, by `version="v0"` and by `version="latest"`
+        # alike. So "is `<name>` in the committed listing?" is true for every
+        # upload that has landed, and a guard asking it would have refused every
+        # legitimate finish while still not distinguishing the case it was
+        # written for. That is why provenance is RECORDED at mint time instead.
+        #
+        # The marker is therefore not a convenience: it is the only fact
+        # available that separates "this request's object" from "somebody's
+        # image". No marker means no permission to touch anything -- not the
+        # object, not the manifest, not the stage.
+        marker = await self._read_upload_marker(artifact_id, path)
+        if not core.marker_authorises_discard(
+            marker, path=path, mint_id=mint_id, now=time.time()
+        ):
+            raise ValueError(
+                f"This upload of '{name}' cannot be completed and NOTHING was "
+                "changed. Finishing needs the 'mint_id' returned by the call "
+                "that handed out the upload URL, and that upload must still be "
+                "open: the record of it is missing, already used, older than "
+                f"{int(core.UPLOAD_MARKER_TTL_S)} seconds, or belongs to a "
+                "different file. Start again with done=false, PUT the bytes, "
+                "and finish with the 'mint_id' from that answer."
+            )
+
+        listing = await self._list_files_safe(artifact_id, "images")
+        refusal = core.oversized_image_refusal(
+            name,
+            core.file_size_from_listing(listing, name),
+            core.MAX_LOCAL_IMAGE_BYTES,
+        )
+        if refusal:
+            # THE STAGED OBJECT IS REMOVED, and raising without removing it was
+            # a defect rather than an omission: a review measured that the
+            # dataset's image list is built from the STAGED listing, so an
+            # object left at `images/<stem><ext>` becomes an image anyway --
+            # the refusal would have stopped only THIS route's commit. Three
+            # consequences, all measured: the stem appeared in the image
+            # manifest after the refusal; a re-mint answered `already: True`,
+            # so the user could not retry that name with a correct file; and
+            # the next commit from any route, which commits the whole stage,
+            # would have made the oversized object permanent.
+            #
+            # Removed on the unreadable-size refusal too, deliberately. That
+            # message also covers "the object is not there", and removing
+            # something absent is a no-op -- while leaving something present
+            # whose size cannot be read is exactly the case the ceiling exists
+            # for. A removal that fails is logged and does not replace the
+            # refusal: the caller must still hear why the upload was rejected.
+            #
+            # THE MARKER GOES WITH THE OBJECT. Leaving it would let the same
+            # mint id be finished again against whatever lands at that path
+            # next, and the whole point of consuming it here is that one mint
+            # authorises exactly one finish.
+            await self._discard_staged_upload(artifact_id, path)
+            await self._remove_upload_marker(artifact_id, path)
+            raise ValueError(refusal)
 
         # A presigned PUT reports success from S3, not from the artifact
         # manager, so the client saying it uploaded an image is not evidence
@@ -2064,11 +2818,82 @@ class AnnotationBroker:
         # with nothing pointing back here.
         head = await self._object_head(artifact_id, path, 8)
         if not core.header_matches_ext(ext, head):
+            # DISCARDED on this refusal too, for the same measured reason as
+            # the size refusal above: the dataset's image list is built from the
+            # staged listing, so an object left at `images/<stem><ext>` becomes
+            # an image anyway and the refusal would have stopped only THIS
+            # route's commit. The object the marker vouches for is not a readable
+            # image, and publishing it is the outcome the check exists to stop.
+            # Safe for exactly the same reason the size discard is safe -- the
+            # marker -- and unsafe without it, which is why this moved only now.
+            await self._discard_staged_upload(artifact_id, path)
+            await self._remove_upload_marker(artifact_id, path)
             raise ValueError(
                 f"The bytes at '{path}' are not a {ext.lstrip('.').upper()} "
                 f"image. The upload did not land, or something other than the "
-                f"file was stored. Re-run with done=False and PUT again, "
-                f"sending the body with no Content-Type header."
+                f"file was stored, so it was not accepted. Re-run with "
+                f"done=False and PUT again, sending the body with no "
+                f"Content-Type header."
+            )
+        # THE MARKER FOR THIS PATH IS CONSUMED, and the consumption FAILS
+        # CLOSED. Both of those were measured as defects before they were rules.
+        #
+        # A removal that fails must stop the commit. It used to be best-effort:
+        # `_remove_upload_marker` never raises, so the commit went ahead and the
+        # leftover marker had the sweep delete the committed image later. Hypha
+        # carries out a staged removal of a committed file on the next commit,
+        # so that loss becomes permanent. Refusing here leaves the object staged
+        # and still withheld, which the next mint's sweep clears and the client
+        # can retry -- the cost of the safe direction is an error on an upload
+        # that was otherwise fine, and that is the right way round.
+        #
+        # Consumed BEFORE the commit, so the commit publishes the image without
+        # it. Removing it afterwards would leave the removal staged and waiting
+        # on somebody else's commit, which is how `.uploads/` would end up in a
+        # published dataset.
+        #
+        # ONE MARKER, FOUND BY NAME, WITH NO LISTING. This is where four review
+        # rounds went, so the reasoning is worth keeping. More than one marker
+        # for one path used to be ordinary -- a client whose mint answer was lost
+        # asks again, two browser tabs upload the same filename -- and each one
+        # left behind withheld the committed image and then had the expiry sweep
+        # delete it. Consuming them meant FINDING them, which meant listing
+        # `.uploads/`, which is paginated: a short read left a duplicate alive
+        # (data loss through housekeeping), and every bound tight enough to
+        # terminate against a server that ignores `offset` refused valid uploads
+        # once a few staged removals sat in the directory (a clause-2
+        # regression). A cap cannot decide this correctly in either direction,
+        # because the question itself was the mistake.
+        #
+        # So the marker is keyed by the OBJECT PATH -- `.uploads/<sha256(path)>`
+        # -- and a re-mint overwrites the one file instead of adding a second.
+        # The duplicate cannot exist, so the finish does not look for one: it
+        # computes the name from the path it is finishing and removes that file.
+        # Authorisation is unchanged and still comes from the DOCUMENT (this
+        # path, this mint id, unexpired), checked above, so the filename is a
+        # lookup key and confers nothing. Nothing here paginates, so nothing
+        # here can be short.
+        # ONE KNOWN WRINKLE OF REUSING A FILENAME, read out of Hypha rather
+        # than measured here, and recorded so the next reader does not have to
+        # rediscover it. Removing a COMMITTED path appends a `_remove` entry to
+        # the staging list, and a later put_file to the SAME path is not added,
+        # because the staging check matches on path alone and finds that entry.
+        # So after an abandoned upload's object and marker are published by
+        # somebody's commit and then swept, a re-upload of the same name --
+        # before any further commit -- is still hidden from staged listings, and
+        # its finish reads the size as unreadable and refuses ONCE. That
+        # refusal's own discard and marker removal clear the flags, so the
+        # retry works. One spurious refusal, no loss and no bypass. It applies
+        # to object paths too, which were already reused; the path-keyed marker
+        # only adds a second filename with the same property.
+        own = core.upload_marker_path_for_object(path)
+        if own is None or not await self._remove_marker_file(artifact_id, own):
+            raise RuntimeError(
+                f"'{name}' was uploaded and checked, but the record of the "
+                "upload could not be cleared, so it was NOT published. "
+                "Publishing with that record still in place would have let "
+                "housekeeping delete the image later. Nothing was committed; "
+                "retry with done=false and PUT again."
             )
         await self._commit_tolerating_pending_uploads(artifact_id)
         # Drop the cached image list. Every other route that adds or removes an

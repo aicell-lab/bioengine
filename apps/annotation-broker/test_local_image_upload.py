@@ -27,6 +27,14 @@ import pytest
 
 import broker_core as core
 
+# Nothing is in flight in these cases, said explicitly rather than with a bare
+# `frozenset()`. `merge_image_manifest` REQUIRES `withheld_paths` and has no
+# default, because omitting it is silent and changes correctness: a review
+# measured the two manifest writers omitting it and recording somebody's
+# unfinished upload as a permanent dataset image. A test that does not exercise
+# the withholding still has to say so.
+NOTHING_WITHHELD = frozenset()
+
 
 # ── the format rule, which did not exist server-side before ─────────────────
 
@@ -205,7 +213,9 @@ def test_the_manifest_entry_is_the_one_RECONCILIATION_produces_not_a_new_shape()
     listing = core.image_names_from_listing([{"name": name, "type": "file"}])
     assert listing == [name]
 
-    reconciled, changed = core.merge_image_manifest({}, listing)
+    reconciled, changed = core.merge_image_manifest(
+        {}, listing, withheld_paths=NOTHING_WITHHELD
+    )
 
     assert changed is True
     assert reconciled == {stem: core.local_image_entry(name)}
