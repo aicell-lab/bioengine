@@ -1351,10 +1351,21 @@ class AnnotationBroker:
             await _rm_dir(folder)
 
         await self._ensure_staged(artifact_id, _do)
-        meta["labels"] = [
-            l for l in meta.get("labels", []) or [] if l.get("name") != name
-        ]
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+
+        # Read-modify-write through update_metadata: `meta` was read before the awaits
+        # above, and those awaits DELETE the label's files. Writing the stale record
+        # here is the same half-commit as import_ngff_image had -- the compare-and-set
+        # would refuse it once anything else had written, leaving the label in the
+        # record while its folder is already gone, which is worse than either outcome
+        # alone. On a record that predates the revision stamp it instead erased the
+        # concurrent change outright. Re-reading and re-applying drops the label from
+        # whatever is current.
+        def _drop_the_label(record: Dict[str, Any]) -> None:
+            record["labels"] = [
+                l for l in record.get("labels", []) or [] if l.get("name") != name
+            ]
+
+        meta = core.update_metadata(artifact_id, _drop_the_label, root=STATE_ROOT)
         # Persist the deletion into the committed version as well: staged
         # removals alone leave the last committed snapshot holding the label
         # files. Reuses the ACL mirror cycle (commit + re-stage, tolerant of

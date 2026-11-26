@@ -2632,12 +2632,16 @@ def write_metadata(
     another writer in this process or in another one on the same filesystem.
 
     LIMITATION, STATED BECAUSE IT IS LOAD-BEARING: that last sentence is only true where
-    ``fcntl.flock`` actually locks. It is advisory, and on an NFSv3 mount without ``local_lock``
-    it answers ``ENOLCK`` — and the broker's state root lives on a shared NFS mount. Where the
-    lock does not hold, two writers can both read ``stored_rev`` as 5, both pass the comparison,
-    both write revision 6, and one change is lost again: the compare-and-set is not atomic
-    without it. ``ENOLCK`` would surface as a bare ``OSError`` from here, which fails closed
-    rather than silently, but it fails EVERY write on such a mount.
+    ``fcntl.flock`` actually locks. It is advisory, and there are filesystems on which it does
+    not hold. Where it does not, two writers can both read ``stored_rev`` as 5, both pass the
+    comparison, both write revision 6, and one change is lost again — the compare-and-set is
+    not atomic without it.
+
+    What filesystem this state root is actually on, and how ``flock`` behaves there, is NOT
+    measured here and no claim is made about it. An earlier version of this docstring asserted
+    a specific mount type and a specific failure; both were unverified, and if the second were
+    true it would be a deployment blocker rather than a note in a comment. Whoever needs the
+    guarantee should measure the mount.
 
     What does not depend on the lock: the staging file is named per writer (below), so a shared
     scratch file can never publish a document assembled from two writers. That failure mode is
@@ -2645,6 +2649,16 @@ def write_metadata(
     """
     artifact_id = metadata["artifact_id"]
     metadata = dict(metadata)
+    # `expected is None` used to mean TWO different things, and conflating them left
+    # every already-deployed record unguarded. A caller passing `expect_revision=None`
+    # is asking for an unconditional write (a first write, a deliberate repair). A
+    # record read from disk that simply predates this change ALSO has no revision, and
+    # defaulting from it produced None -- which the check below then read as "do not
+    # compare". Measured at this head before the fix: a legacy record, a concurrent
+    # label write that stamped revision 1, then a stale whole-record write -> ACCEPTED,
+    # and the new label erased. Every record on a deployed worker predates this change,
+    # so that was the reported bug surviving the fix on every existing dataset.
+    unconditional = expect_revision is None
     expected = (
         metadata.get("revision") if expect_revision is _UNSET else expect_revision
     )
@@ -2654,20 +2668,33 @@ def write_metadata(
     with open(lock_path, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
+            # `comparable` is tracked separately from `stored_rev`, because None is a
+            # legitimate stored value (a record written before this change) and must not
+            # be confused with "there is nothing to compare against".
             stored_rev = None
+            comparable = False
             if p.exists():
                 try:
                     stored_rev = (json.loads(p.read_text()) or {}).get("revision")
+                    comparable = True
                 except (json.JSONDecodeError, OSError):
                     # An unreadable stored record cannot be compared against. Refusing here would
                     # strand the dataset with no way to repair it, so fall through to the write and
                     # let the fresh content replace the damaged file.
                     stored_rev = None
-            if (
-                expected is not None
-                and stored_rev is not None
-                and expected != stored_rev
-            ):
+                    comparable = False
+            # A missing in-hand revision now requires the STORED record to have none
+            # either. That is what covers a record written before this change: its first
+            # post-upgrade write still succeeds (both sides None) and stamps it, and any
+            # OTHER stale copy of it is refused from then on.
+            #
+            # Two cases deliberately skip the comparison, and neither can lose a change:
+            #   * `unconditional` -- an explicit `expect_revision=None` (a create, a repair);
+            #   * `not comparable` -- no stored record at all, or an unreadable one. A
+            #     record that does not exist cannot have moved on, and a fresh record
+            #     carries `revision: 1` from `new_metadata`, so comparing it against a
+            #     missing file would refuse every creation.
+            if not unconditional and comparable and expected != stored_rev:
                 raise RecordConflict(artifact_id, expected, stored_rev)
             metadata["revision"] = (
                 stored_rev if isinstance(stored_rev, int) else 0
@@ -2680,8 +2707,8 @@ def write_metadata(
             # rather than one field, which is strictly worse than the lost update this
             # function exists to prevent.
             #
-            # `fcntl.flock` is advisory, and on an NFSv3 mount without `local_lock` it
-            # answers ENOLCK; the broker's state root lives on exactly such a shared mount.
+            # `fcntl.flock` is advisory and there are filesystems on which it does not
+            # hold. Which one this state root is on is NOT measured here.
             # So the lock cannot be assumed to hold, and a unique name removes the
             # shared-file failure whether it holds or not. Note what this does NOT fix: the
             # revision compare-and-set above still depends on the lock for its atomicity,
