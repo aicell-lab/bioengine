@@ -193,11 +193,20 @@ def session_dir(session_id: str) -> Path:
     return candidate
 
 
-def session_backend(session_id: str) -> str:
+def session_backend(session_id: str, *, status: Optional[Dict[str, Any]] = None) -> str:
     """Fine-tuning backend a session used — 'microsam' (default) or 'cellpose'.
+
     Recorded in status.json at session start; the two backends save their
-    checkpoint in different places, so this drives ``checkpoint_path``."""
-    return read_status(session_id).get("backend", "microsam")
+    checkpoint in different places, so this drives ``checkpoint_path``.
+
+    *status* lets a caller that has ALREADY read the record answer from it
+    instead of reading it again. `get_status` does, and that one re-read was
+    half the cost of the run listing: it is called once per run, so a history
+    of N runs read 2N records where N would do.
+    """
+    if status is None:
+        status = read_status(session_id)
+    return status.get("backend", "microsam")
 
 
 # Our public cpsam/cpdino model_type strings → the cellpose ``pretrained_model``
@@ -333,13 +342,19 @@ def detect_gpu_memory() -> Dict[str, Any]:
     }
 
 
-def checkpoint_path(session_id: str) -> Path:
+def checkpoint_path(
+    session_id: str, *, status: Optional[Dict[str, Any]] = None
+) -> Path:
     """Servable checkpoint for a finished session, by backend:
     micro-sam's torch_em writes ``<dir>/checkpoints/<name>/best.pt``; cellpose's
     ``train_seg`` (save_path=<dir>, model_name='model') writes ``<dir>/models/model``.
+
+    *status* is passed straight to `session_backend`, so a caller holding the
+    record already does not pay for a second read of it. `get_status` calls
+    this on every run it reports.
     """
     sdir = session_dir(session_id)
-    if session_backend(session_id) == "cellpose":
+    if session_backend(session_id, status=status) == "cellpose":
         return sdir / "models" / "model"
     return sdir / "checkpoints" / session_id / "best.pt"
 
@@ -949,6 +964,158 @@ def caller_is_workspace_admin(
     return grants.get(workspace) in OWNERLESS_GRANTS
 
 
+# The dataset a run was trained on, recorded at start_training. The field a
+# RUN carries, not the artifact a run is STORED in — those are different things
+# and the names are close enough to confuse.
+#
+# Present only on runs started from version 0.30.42 onwards. Everything older
+# has no dataset, which is not a defect to repair: nothing recorded one, so
+# inferring it now would be the same guess that was refused for `owner`. A run
+# with no dataset simply has no co-managers and falls back to owner-or-admin.
+DATASET_FIELD = "dataset_artifact_id"
+
+
+# The ACL value an owner or manager of a dataset holds, as written by the
+# annotation broker's `build_acl_permissions`: owner and managers get "*",
+# annotators get "r+", and a PUBLIC dataset additionally gets the wildcard KEY
+# "*" mapped to "r+".
+#
+# ⚠ The manager VALUE and the wildcard KEY are the same string, "*". They mean
+# opposite things, and conflating them hands co-manager rights to every caller
+# alive on any public dataset:
+#
+#     perms.get("*")            -> the PUBLIC grant, "r+"      NOT a manager test
+#     perms.get(caller) == "*"  -> this caller is a manager     the real test
+#
+# So the caller's own key is looked up and the wildcard key is never consulted.
+# This is the same narrowing `caller_is_workspace_admin` makes for workspace
+# grants, for the same reason, and a mutant that reads the wildcard turns the
+# public-dataset test red.
+DATASET_MANAGER_PERMISSION = "*"
+
+
+def caller_manages_dataset(permissions: Any, context: Any) -> bool:
+    """True iff *context*'s caller owns or manages the artifact *permissions* came from.
+
+    *permissions* is a Hypha artifact's ``config.permissions`` mapping, already
+    fetched by the caller of this function -- kept separate from the fetch so
+    the rule is synchronous, pure, and testable without a server.
+
+    Matches the caller's id first and then their email, mirroring the broker's
+    own ``_acl_key``, which prefers id over email when writing the ACL. Checking
+    only one of the two would silently miss datasets whose ACL was keyed by the
+    other.
+
+    Never consults the wildcard key -- see the note above the constant.
+    """
+    if not isinstance(permissions, dict) or not isinstance(context, dict):
+        return False
+    user = context.get("user")
+    if not isinstance(user, dict):
+        return False
+    for key in (user.get("id"), user.get("email")):
+        if not isinstance(key, str) or not key or key == DATASET_MANAGER_PERMISSION:
+            # A caller whose own id is literally "*" would otherwise read the
+            # public grant as its own. No such id should exist; refusing costs
+            # nothing and removes the question.
+            continue
+        if permissions.get(key) == DATASET_MANAGER_PERMISSION:
+            return True
+    return False
+
+
+def _owner_or_comanager(
+    status: Dict[str, Any], context: Any, writable_datasets: Any
+) -> bool:
+    """The two legs SHARED by seeing and resuming: owner match, or co-manager.
+
+    Takes the run's STATUS rather than its id, so a caller that has already
+    read the record does not read it again. The listing reads every run once
+    through `get_status` and then asks this question about it; resolving the id
+    here instead meant the same file was opened three times per listed run --
+    261 runs became 783 reads on the production store. Passing the status is
+    not the same as passing the ANSWER: the rule still lives here and in one
+    place.
+
+    False means "neither leg applies", which leaves the caller's own
+    administrator rule to decide. Those rules are NOT the same for seeing and
+    resuming, which is why this stops here rather than answering.
+
+    *writable_datasets* is computed SERVER-SIDE from the caller's injected
+    context before this is reached; it is not a parameter a caller can supply.
+    It is passed in rather than resolved here because resolving it is an async
+    artifact-manager round trip while this is synchronous and runs once per run.
+    """
+    owner = status.get("owner")
+    if isinstance(owner, str) and owner:
+        caller = caller_identity(context).get("owner")
+        if caller is not None and caller == owner:
+            return True
+    dataset = status.get(DATASET_FIELD)
+    if isinstance(dataset, str) and dataset and dataset in writable_datasets:
+        return True
+    return False
+
+
+def caller_may_see_run(
+    session_id: str,
+    context: Any,
+    *,
+    writable_datasets: Any = frozenset(),
+    status: Any = None,
+) -> bool:
+    """True iff this run belongs in the caller's listing.
+
+    The caller owns it, or manages its dataset, or it has no owner at all and
+    the caller administers ``bioimage-io``.
+
+    **An administrator does NOT see other people's owned runs**, and that is not
+    an oversight to tidy up later. Admin rights grant the unattributable rows,
+    not everybody's history. Stopping somebody else's run is a different rule --
+    see `caller_may_mutate` -- and the two are deliberately not the same width.
+    A test pins this exact asymmetry; if it ever becomes wrong, it should change
+    because somebody decided to widen a privacy boundary, not because a
+    refactor unified two rules that only looked alike.
+
+    *status* lets a caller that has ALREADY read this run's record hand it over
+    instead of having it read again -- the listing does, once per run. It is the
+    record, never the verdict: the rule below is the only one, and supplying a
+    status cannot change what it decides.
+
+    Fails closed: an unreadable context yields no identity and no authority, and
+    *writable_datasets* defaults to empty.
+    """
+    st = read_status(session_id) if status is None else status
+    if _owner_or_comanager(st, context, writable_datasets):
+        return True
+    owner = st.get("owner")
+    if isinstance(owner, str) and owner:
+        # Somebody else's, and attributable. Not an administrator's to browse.
+        return False
+    return caller_is_workspace_admin(context)
+
+
+def caller_may_resume_run(
+    session_id: str, context: Any, *, writable_datasets: Any = frozenset()
+) -> bool:
+    """True iff the caller may continue training from this run's checkpoint.
+
+    The caller owns it, or manages its dataset, or administers ``bioimage-io``.
+
+    Wider than `caller_may_see_run` on the administrator leg ONLY, and that
+    matches what resume did before co-managers existed: it was gated by
+    `caller_may_mutate`, under which an administrator could resume any run. This
+    keeps that, adds the dataset manager, and changes nothing else.
+
+    So an administrator can resume a run it cannot list. That reads odd and it
+    is the PRE-EXISTING shape, preserved on purpose: narrowing it here would be
+    a second unrequested change riding along with this one.
+    """
+    if _owner_or_comanager(read_status(session_id), context, writable_datasets):
+        return True
+    return caller_is_workspace_admin(context)
+
+
 class NotTheOwner(PermissionError):
     """A caller asked to change a run that is not theirs.
 
@@ -1002,6 +1169,60 @@ def require_caller_may_mutate(session_id: str, context: Any) -> None:
         raise NotTheOwner(
             "this training run belongs to another caller; only its owner or a "
             "workspace administrator can change it"
+        )
+
+
+def run_names_on_disk() -> "tuple[List[str], List[str]]":
+    """``(run names, skipped names)`` under the sessions root.
+
+    THE ONLY place that iterates the sessions root. Both the listing and the
+    dataset scan need the same walk with the same "is this actually a run"
+    rules, and a second copy of it is a second place for those rules to drift.
+    The containment guard counts the root-resolving call sites and refused this
+    when it started life as a duplicate loop, which was the right answer.
+
+    (Mind the prose here: that guard greps SOURCE LINES, so naming the helper it
+    counts -- even inside a docstring -- is itself a third match and fails it.
+    Measured, after exactly that happened.)
+
+    A name that is not a session id goes to *skipped* rather than raising: the
+    rule is validate what a CALLER hands us, tolerate what we FIND. A directory
+    this server could not have created does not belong in the history, but
+    neither does it get to take the history down for everybody.
+    """
+    root = sessions_root()
+    names: List[str] = []
+    skipped: List[str] = []
+    for d in sorted(root.iterdir()) if root.exists() else []:
+        if not (d.is_dir() and (d / "status.json").exists()):
+            continue
+        if not SESSION_ID_PATTERN.match(d.name):
+            skipped.append(d.name)
+            continue
+        names.append(d.name)
+    return names, skipped
+
+
+def require_caller_may_resume_run(
+    session_id: str, context: Any, *, writable_datasets: Any = frozenset()
+) -> None:
+    """:func:`caller_may_resume_run`, or raise :class:`NotTheOwner`.
+
+    Raises the SAME class as the mutate gate, deliberately. A caller refused a
+    resume and a caller refused an export have learned exactly the same thing --
+    "not yours" -- and giving the two refusals different types would let a
+    caller tell which of the two rules it fell foul of, which is a readout of
+    whether they are a co-manager of a dataset they cannot otherwise see.
+
+    Like its sibling, the message says nothing about whether the run exists, who
+    owns it, or which dataset it belongs to.
+    """
+    if not caller_may_resume_run(
+        session_id, context, writable_datasets=writable_datasets
+    ):
+        raise NotTheOwner(
+            "this training run belongs to another caller; only its owner, a "
+            "manager of its dataset, or a workspace administrator can use it"
         )
 
 
@@ -1158,7 +1379,7 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
             "message": "no such session",
         }
     st["session_id"] = session_id
-    st["checkpoint_available"] = checkpoint_path(session_id).exists()
+    st["checkpoint_available"] = checkpoint_path(session_id, status=st).exists()
     # The config a run used, so a history listing can say WHAT was trained and not
     # merely that something was. It was already persisted per run and reachable only
     # from inside this app; `{}` for a run that died before the file was written.
@@ -1179,7 +1400,46 @@ def get_status(session_id: str, *, include_private: bool = False) -> Dict[str, A
     return st
 
 
-def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
+def scan_runs_for_listing() -> Tuple[Dict[str, Dict[str, Any]], List[str], List[str]]:
+    """ONE walk of the sessions root, for the listing that needs both halves.
+
+    Returns ``(records, dataset_ids, skipped)``: every run's full record keyed
+    by session id, the distinct ``dataset_artifact_id`` values across them in
+    first-seen order, and the names that were skipped.
+
+    Exists because the published listing needs the dataset ids BEFORE it can
+    filter -- resolving which of them the caller manages is one artifact-manager
+    round trip each, and must happen once per call rather than once per run --
+    and then needs the records themselves. Asking for those separately read
+    every record twice over, on top of the read inside `get_status`: measured
+    at 3 reads per run, so 783 of them for the 261 runs on the production
+    store. A previous commit claimed to have removed that and had not; this is
+    the combined scan that actually does, and `test_the_PUBLISHED_listing_reads_each_record_ONCE`
+    measures the path the caller really takes rather than an inner helper.
+    """
+    records: Dict[str, Dict[str, Any]] = {}
+    datasets: Dict[str, None] = {}
+    names, skipped = run_names_on_disk()
+    for name in names:
+        try:
+            status = get_status(name, include_private=True)
+        except InvalidSessionId:
+            skipped.append(name)
+            continue
+        records[name] = status
+        dataset = status.get(DATASET_FIELD)
+        if isinstance(dataset, str) and dataset:
+            datasets.setdefault(dataset, None)
+    return records, list(datasets), skipped
+
+
+def list_sessions(
+    context: Any,
+    *,
+    writable_datasets: Any = frozenset(),
+    records: Optional[Dict[str, Dict[str, Any]]] = None,
+    skipped: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """The runs this caller may see, keyed by session id, owner redacted.
 
     *context* is REQUIRED and has no default, deliberately. There is no
@@ -1188,11 +1448,21 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
     signature available with a filtered sibling beside it would make the open
     behaviour one forgotten argument away.
 
-    A run is visible iff its recorded owner IS this caller, or it carries no
-    owner and the caller may see ownerless runs. Both legs fail closed: an
-    unreadable context yields no identity, no authority, and so an empty
-    listing. The owner is read here and redacted from everything returned, so
-    the field decides visibility and is never itself published.
+    Visibility is exactly `caller_may_see_run`: the caller owns the run, or
+    the run names a dataset the caller manages, or the run has no owner and the
+    caller administers ``bioimage-io``. The listing does NOT re-implement that
+    test -- it calls it -- because a listing carrying its own private copy of
+    the rule is how a caller comes to be shown a run it is then refused.
+
+    *writable_datasets* is resolved ONCE per call by the async entry point and
+    passed in; see its docstring for why it is not resolved here. Defaulting it
+    to empty keeps every existing caller -- and every test -- on the
+    owner-or-admin behaviour unless co-manager access is deliberately supplied.
+
+    All legs fail closed: an unreadable context yields no identity, no
+    authority, and so an empty listing. The owner is read here and redacted from
+    everything returned, so the field decides visibility and is never itself
+    published.
 
     **A directory that is not a session is SKIPPED, not fatal.** `get_status`
     validates the id, so listing a directory whose name is not a session id
@@ -1204,38 +1474,51 @@ def list_sessions(context: Any) -> Dict[str, Dict[str, Any]]:
     all is not. Skipped names are logged with a bounded sample, since they are
     attacker-controlled.
     """
-    identity = caller_identity(context)
-    caller = identity.get("owner")
-    see_ownerless = caller_is_workspace_admin(context)
-
-    root = sessions_root()
     out: Dict[str, Dict[str, Any]] = {}
-    skipped: List[str] = []
-    for d in sorted(root.iterdir()) if root.exists() else []:
-        if not (d.is_dir() and (d / "status.json").exists()):
-            continue
-        if not SESSION_ID_PATTERN.match(d.name):
-            skipped.append(d.name)
-            continue
+    if records is not None:
+        # Already read by `scan_runs_for_listing`; re-reading them here is the
+        # cost this parameter exists to avoid. The names IT skipped have to be
+        # passed in with them: this function logs them, and a caller that
+        # supplies records but drops the skip list silently removes the only
+        # trace a stray directory leaves. That regressed once, when the single
+        # scan was introduced and the published entry point discarded them.
+        names = list(records)
+        skipped = list(skipped or [])
+    else:
+        names, found_skipped = run_names_on_disk()
+        skipped = list(skipped or []) + found_skipped
+    for name in names:
         try:
-            status = get_status(d.name, include_private=True)
+            status = (
+                records[name]
+                if records is not None
+                else get_status(name, include_private=True)
+            )
         except InvalidSessionId:
             # The name passed but a deeper layer refused it -- today that means
             # a directory whose NAME is a valid session id but which is a
             # SYMLINK out of the sessions root. Skipped like a bad name, so one
             # bad link cannot take the whole history down.
-            skipped.append(d.name)
+            skipped.append(name)
             continue
-        owner = status.get("owner")
-        if isinstance(owner, str) and owner:
-            # A recorded owner is matched EXACTLY, and only against a caller we
-            # could actually read. `caller is None` must never match a run.
-            visible = caller is not None and caller == owner
-        else:
-            # No owner, or one unusable as an identity. Both are unattributable.
-            visible = see_ownerless
-        if visible:
-            out[d.name] = redact_private(status)
+        # ONE test, shared with resume, rather than a second copy of the rule
+        # here: a listing that decides visibility by its own private copy of the
+        # rule is exactly how a caller comes to be shown a run that resume then
+        # refuses, and the drift is silent when it happens.
+        #
+        # The status just read is handed over rather than re-read. An earlier
+        # version resolved the id inside the gate, which opened the same file
+        # three times per listed run -- 261 runs became 783 reads on the
+        # production store, for a listing that used to do one each. Passing the
+        # RECORD is not passing the ANSWER: the rule is still the gate's.
+        #
+        # ORDER IS LOAD-BEARING: `redact_private` mutates this dict in place and
+        # strips `owner`, which is the field the gate compares. Redacting first
+        # would make every owned run invisible to its own owner.
+        if caller_may_see_run(
+            name, context, writable_datasets=writable_datasets, status=status
+        ):
+            out[name] = redact_private(status)
     if skipped:
         print(
             f"[model-finetune] skipped {len(skipped)} session directory(ies) that "

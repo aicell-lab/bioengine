@@ -273,8 +273,15 @@ def _sessions_root_calls(module_file: str) -> dict:
 SESSIONS_ROOT_CALLS = {
     # builds every session path, and validates the id before it does
     "session_dir": 1,
-    # iterates the root to list what is there
-    "list_sessions": 1,
+    # iterates the root to list what is there. CHANGED DELIBERATELY: this used
+    # to be `list_sessions`, which walked the root itself. The co-manager
+    # listing needs the records and the dataset ids from ONE walk -- asking
+    # separately read every record three times over, 783 reads for the 261 runs
+    # on the production store -- so the walk moved into this single helper and
+    # `list_sessions` now delegates to it. The guard is unchanged in strength:
+    # still three scopes, still one call each, and `list_sessions` reaching the
+    # root again would now be a FOURTH entry and go red.
+    "run_names_on_disk": 1,
     # probes that the root accepts a WRITE. It has to read the root to write
     # in it, and it deliberately does not build a session path: a health check
     # that created a session directory would be a side effect on every probe.
@@ -302,9 +309,14 @@ def test_no_path_helper_bypasses_the_chokepoint():
 #: was about and round 5 found untested: my earlier controls added a NEW
 #: function, and a new function is caught by a set of names just as well, so
 #: they could not tell a per-function COUNT from a set.
+#: The synthetic module the controls build. It has to name the SAME scopes as
+#: `SESSIONS_ROOT_CALLS`, or "a module with exactly the allowed callers passes"
+#: is a claim about a module the guard does not actually allow. `list_sessions`
+#: became `run_names_on_disk` when the root walk moved into that single helper;
+#: see the constant for why.
 _ALLOWED_BODIES = {
     "session_dir": "    root = sessions_root()\n",
-    "list_sessions": "    root = sessions_root()\n",
+    "run_names_on_disk": "    root = sessions_root()\n",
     "assert_sessions_root_writable": "    root = sessions_root()\n",
 }
 
@@ -333,9 +345,9 @@ def _point_guard_at(tmp_path, monkeypatch, name, bodies=None, extra=""):
         # proved the old version of this control was satisfied by a set,
         # because it added a function called `list_sessions_extra` instead.
         (
-            "a SECOND call inside list_sessions itself",
+            "a SECOND call inside run_names_on_disk itself",
             {
-                "list_sessions": (
+                "run_names_on_disk": (
                     "    root = sessions_root()\n"
                     "    leak = sessions_root() / 'x'\n"
                     "    return root, leak\n"
@@ -397,7 +409,7 @@ def test_a_DOCSTRING_mentioning_the_function_is_not_a_call_site(tmp_path, monkey
         'Calling sessions_root() is the subject of this sentence.\n"""\n'
         "def sessions_root():\n    pass\n"
         "def session_dir(sid):\n    root = sessions_root()\n"
-        "def list_sessions(ctx):\n    root = sessions_root()\n"
+        "def run_names_on_disk():\n    root = sessions_root()\n"
         "def assert_sessions_root_writable():\n"
         '    """Mentions sessions_root() in its own docstring too."""\n'
         "    root = sessions_root()\n"

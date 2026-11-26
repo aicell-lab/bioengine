@@ -439,14 +439,26 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context):
+    def spy(context, *, writable_datasets=frozenset(), records=None, skipped=None):
         seen["context"] = context
+        seen["writable_datasets"] = writable_datasets
+        seen["records"] = records
         return {"sentinel": {}}
 
+    class _AM:
+        async def read(self, artifact_id):
+            return {"config": {"permissions": {}}}
+
+    class _Hypha:
+        async def get_service(self, name):
+            return _AM()
+
     monkeypatch.setattr(training, "list_sessions", spy)
+    monkeypatch.setattr(training, "scan_runs_for_listing", lambda: ({}, [], []))
     cls = _entry_class()
     fn = getattr(cls, "list_training_sessions")
     inst = cls.__new__(cls)
+    inst._hypha = _Hypha()
     out = await fn(inst, context=ADMIN)
     assert out == {"sentinel": {}}
     assert seen["context"] is ADMIN, seen
@@ -918,11 +930,28 @@ def test_that_structural_guard_CAN_fail(tmp_path):
 
 
 async def _start(cls, inst, resume_from, who):
+    # `init_checkpoint` and `init_from_pool` are passed EXPLICITLY as None, and that
+    # is load-bearing rather than tidiness. These tests call the undecorated method
+    # directly, so a parameter left out keeps its `Field(...)` object as its value --
+    # and `start_training` opens by refusing more than one of init_checkpoint,
+    # resume_session_id and init_from_pool, counting anything that is `not None and
+    # != ""`. Two FieldInfo objects count as two supplied arguments, so every call
+    # here died on that ValueError before reaching the gate under test.
+    #
+    # `dataset_artifact_id` is explicit for the same reason and a different route: a
+    # FieldInfo is truthy, so this row's new dataset-claim check ran on it and failed
+    # reaching the artifact manager -- which short-circuited the resume gate the
+    # control below asserts was CONSULTED. Four tests in this file were being decided
+    # by an argument-shape accident rather than by ownership; measured, the three
+    # lines take them from 4 failed to 4 passed.
     return await cls.start_training(
         inst,
         train_images=["a.tif"],
         train_labels=["b.tif"],
         resume_session_id=resume_from,
+        init_checkpoint=None,
+        init_from_pool=None,
+        dataset_artifact_id=None,
         context=who,
     )
 
@@ -966,38 +995,59 @@ async def test_resuming_YOUR_OWN_run_gets_past_the_gate(runs):
     sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
     cls, inst = _entry()
     seen = []
-    real = training.require_caller_may_mutate
+    # Resume is gated by require_caller_may_RESUME_run, not by the mutate gate:
+    # a dataset's managers may continue a colleague's training, while stopping,
+    # exporting and contributing stay with the owner. Spying on the mutate gate
+    # here would pass vacuously -- it is never called on this path any more.
+    real = training.require_caller_may_resume_run
 
-    def spy(session_id, context):
+    def spy(session_id, context, **kw):
         seen.append(session_id)
-        return real(session_id, context)
+        return real(session_id, context, **kw)
 
-    training.require_caller_may_mutate = spy
+    training.require_caller_may_resume_run = spy
     try:
         with pytest.raises(Exception) as exc:
             await _start(cls, inst, sid, ctx(ME, anonymous=False))
     finally:
-        training.require_caller_may_mutate = real
+        training.require_caller_may_resume_run = real
     assert seen == [sid], f"the gate was not consulted for the resume: {seen}"
     assert not isinstance(exc.value, training.NotTheOwner)
 
 
 @pytest.mark.asyncio
-async def test_NOT_resuming_does_not_consult_the_gate_at_all(runs):
+async def test_NOT_resuming_does_not_consult_EITHER_gate(runs):
     """The paired control the other way: a normal start must not be gated on
-    anything, or every caller would need an owned run to train at all."""
+    anything, or every caller would need an owned run to train at all.
+
+    It spies BOTH gates deliberately. This row moves the resume check from
+    `require_caller_may_mutate` to `require_caller_may_resume_run`, so a control
+    that watched only the mutate gate would keep passing while the resume gate
+    was consulted on every plain start -- the exact regression it exists to
+    catch, made invisible by the very change under review.
+    """
     cls, inst = _entry()
-    seen = []
-    real = training.require_caller_may_mutate
+    seen = {"mutate": [], "resume": []}
+    real_mutate = training.require_caller_may_mutate
+    real_resume = training.require_caller_may_resume_run
 
-    def spy(session_id, context):
-        seen.append(session_id)
-        return real(session_id, context)
+    def spy_mutate(session_id, context, **kw):
+        seen["mutate"].append(session_id)
+        return real_mutate(session_id, context, **kw)
 
-    training.require_caller_may_mutate = spy
+    def spy_resume(session_id, context, **kw):
+        seen["resume"].append(session_id)
+        return real_resume(session_id, context, **kw)
+
+    training.require_caller_may_mutate = spy_mutate
+    training.require_caller_may_resume_run = spy_resume
     try:
         with pytest.raises(Exception):
             await _start(cls, inst, None, ctx(ANON_A))
     finally:
-        training.require_caller_may_mutate = real
-    assert seen == [], f"a plain start consulted the resume gate: {seen}"
+        training.require_caller_may_mutate = real_mutate
+        training.require_caller_may_resume_run = real_resume
+    assert seen == {
+        "mutate": [],
+        "resume": [],
+    }, f"a plain start consulted a run-ownership gate: {seen}"
