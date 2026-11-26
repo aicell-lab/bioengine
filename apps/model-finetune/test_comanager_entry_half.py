@@ -224,6 +224,24 @@ async def test_the_LISTING_passes_only_the_RESOLVED_datasets_not_all_of_them(
 # they survived the resolver tests above: nothing drove the call.
 
 
+#: Parameters that must be handed over EXPLICITLY as None, because these tests call
+#: the undecorated method directly. A parameter left out keeps its `Field(...)`
+#: object as its value, and `start_training` opens by refusing more than one of
+#: `init_checkpoint`, `resume_session_id` and `init_from_pool`, counting anything
+#: that is `not None and != ""`. Two FieldInfo objects count as two supplied
+#: arguments, so the call died on that ValueError before reaching the gate under
+#: test -- which made the REFUSAL tests fail for the wrong reason and, worse, made
+#: the paired controls pass for the wrong reason: they accept "any exception other
+#: than NotTheOwner" as proof the gate let the call through, and an argument-count
+#: ValueError satisfies that without the gate ever running.
+_MUTUALLY_EXCLUSIVE_STARTS = {
+    "init_checkpoint": None,
+    "resume_session_id": None,
+    "init_from_pool": None,
+    "dataset_artifact_id": None,
+}
+
+
 async def _start(inst, cls, **kwargs):
     """Call start_training far enough to exercise its gates and no further.
 
@@ -233,6 +251,8 @@ async def _start(inst, cls, **kwargs):
     for an unrelated reason, which the tests below distinguish by exception
     type rather than by "it raised".
     """
+    for name, default in _MUTUALLY_EXCLUSIVE_STARTS.items():
+        kwargs.setdefault(name, default)
     return await cls.start_training(inst, **kwargs)
 
 

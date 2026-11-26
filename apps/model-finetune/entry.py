@@ -2152,6 +2152,14 @@ class EntryApp:
         served = "cpsam" if training.session_backend(session_id) == "cellpose" else None
         await self._check_runtime_available(served)
         export_id = uuid.uuid4().hex
+        # WHO asked, recorded from the injected context at creation time. The
+        # export id is a handle to this run's weights, so the handle has to be
+        # bound to an identity -- `export_model` being owner-or-admin says
+        # nothing about who may later USE the id it returns. Stored under
+        # underscore keys so the single projection in `get_export_status`,
+        # which drops everything starting with "_", keeps the creator out of
+        # every response without a second rule to keep in step.
+        creator = training.caller_identity(context)
         request = {
             "name": name,
             "description": description,
@@ -2167,6 +2175,8 @@ class EntryApp:
             download_url=None,
             size_bytes=None,
             error=None,
+            _owner=creator.get("owner"),
+            _owner_anonymous=creator.get("owner_anonymous"),
         )
         self._export_tasks[export_id] = asyncio.create_task(
             self._run_export(export_id, session_id, request)
@@ -2238,9 +2248,11 @@ class EntryApp:
         finally:
             export_hb.cancel()
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def get_export_status(
-        self, export_id: str = Field(..., description="export_id from export_model.")
+        self,
+        export_id: str = Field(..., description="export_id from export_model."),
+        context=None,
     ) -> Dict[str, Any]:
         """Export progress. ``status`` ∈ {PENDING, BUILDING, READY, FAILED}.
         ``download_url`` (6h TTL) + ``size_bytes`` are set on READY; ``error`` on
@@ -2250,12 +2262,19 @@ class EntryApp:
         feed back into ``start_training(init_checkpoint=...)``."""
         import training
 
+        # BEFORE the record is read, so the refusal cannot depend on what the
+        # record says. An unauthorised caller must not be able to tell "not
+        # yours" from "no such export": both come out of this call. (`get_export`
+        # does NOT write the swept record -- an earlier version of this comment
+        # said it did -- so the ordering is about the refusal, not a side
+        # effect.)
+        training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
         return {k: v for k, v in rec.items() if not k.startswith("_")}
 
-    @bioengine.method
+    @bioengine.method(context=True)
     async def push_export(
         self,
         export_id: str = Field(..., description="A READY export_id from export_model."),
@@ -2265,6 +2284,7 @@ class EntryApp:
             "match the 'files' from get_export_status; mint the URLs via the draft "
             "artifact's put_file with the user's token.",
         ),
+        context=None,
     ) -> Dict[str, Any]:
         """Stream the built package files straight into a draft artifact so the
         browser never moves the ~350 MB twice. The frontend creates the staged
@@ -2273,6 +2293,10 @@ class EntryApp:
         reads the artifact."""
         import training
 
+        # The sharper half of the same gap: this streams the whole package --
+        # weights included -- to any presigned URL the caller hands over. Gated
+        # before the record is read, for the same reason as the status read.
+        training.require_caller_may_use_export(export_id, context)
         rec = training.get_export(export_id)
         if not rec:
             raise KeyError(f"Unknown export_id '{export_id}'.")
@@ -2281,13 +2305,32 @@ class EntryApp:
                 f"Export '{export_id}' is not READY (status={rec.get('status')})."
             )
         pkg_dir = Path(rec["_package_dir"])
-        pushed = []
-        for rel, url in files.items():
-            fpath = pkg_dir / rel
+        # EVERY name is bounded BEFORE the first byte moves, not as each file
+        # comes up. `files` keys come from the caller: before this bound
+        # existed, a key was joined to the package directory unchecked and a
+        # caller holding any READY export of their own could push
+        # "../../<another run>/best.pt" -- another run's checkpoint -- to a URL
+        # of their choosing. `package_member_path` requires the name to be one
+        # this export ANNOUNCED and to resolve inside the package.
+        #
+        # Validating the whole mapping first is the review's point and it is
+        # right: checking inside the loop meant a push whose last key was bad
+        # had already streamed the earlier files. Nothing leaked -- they were
+        # the caller's own announced files -- but a refused push that half
+        # happened is a worse thing to explain than one that did nothing.
+        resolved = []
+        for rel in files:
+            fpath = training.package_member_path(
+                pkg_dir, rel, announced=rec.get("files")
+            )
             if not fpath.is_file():
                 raise FileNotFoundError(
                     f"Package file '{rel}' not found for export '{export_id}'."
                 )
+            resolved.append((rel, files[rel], fpath))
+
+        pushed = []
+        for rel, url, fpath in resolved:
             resp = await self._put_file(url, fpath, timeout=600.0)
             resp.raise_for_status()
             pushed.append(rel)
