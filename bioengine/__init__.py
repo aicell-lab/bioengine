@@ -119,9 +119,29 @@ def _install_replica_bootstrap_finder() -> None:
                 except Exception:
                     import traceback
 
+                    # Say where the cause is NOT, because this message was read as
+                    # the read-only-HOME defect for days. HOME and TMPDIR are set by
+                    # the replica's ``runtime_env`` env_vars before any import, so a
+                    # failure here does NOT leave the replica on the image's
+                    # read-only ``/home/ray`` — the symptom that sent the original
+                    # diagnosis two steps away from its cause.
+                    #
+                    # The values are REPORTED rather than asserted. The hook can fail
+                    # before its own HOME assignment (a missing
+                    # BIOENGINE_ARTIFACT_VERSION, or an mkdir that raises, both
+                    # precede it), so a message claiming "HOME is already set" would
+                    # be false on exactly those paths. Printing what HOME and TMPDIR
+                    # actually are cannot be false, and it answers the question a
+                    # reader of this traceback is about to ask.
                     print(
                         "BioEngine: replica source bootstrap failed — user "
-                        "source will not be on sys.path. Traceback:",
+                        "source will not be on sys.path. HOME and TMPDIR are "
+                        "already set by the replica's runtime_env before any "
+                        "import, so this is NOT the read-only-HOME defect: "
+                        f"HOME={_os.environ.get('HOME')!r} "
+                        f"TMPDIR={_os.environ.get('TMPDIR')!r}. "
+                        "The cause is in the source sync below, not in the "
+                        "replica environment. Traceback:",
                         flush=True,
                     )
                     traceback.print_exc()
