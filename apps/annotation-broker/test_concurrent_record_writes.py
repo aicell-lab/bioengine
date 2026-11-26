@@ -89,9 +89,10 @@ def test_interleaved_label_and_upload_writes_both_survive(tmp_path):
 
     stored = _stored(tmp_path)
     assert _label_names(stored) == ["cells"], f"label lost: {stored.get('labels')!r}"
-    assert sorted(stored["image_dims"]) == ["picked-scan", "picked-scan-2"], (
-        f"second image lost: {stored.get('image_dims')!r}"
-    )
+    assert sorted(stored["image_dims"]) == [
+        "picked-scan",
+        "picked-scan-2",
+    ], f"second image lost: {stored.get('image_dims')!r}"
 
 
 def test_stale_copies_racing_through_update_metadata_both_survive(tmp_path):
@@ -103,7 +104,9 @@ def test_stale_copies_racing_through_update_metadata_both_survive(tmp_path):
     _seed(tmp_path)
     first = bc.read_metadata(AID, root=tmp_path)
     second = bc.read_metadata(AID, root=tmp_path)
-    assert first["revision"] == second["revision"], "both sides must start from one revision"
+    assert (
+        first["revision"] == second["revision"]
+    ), "both sides must start from one revision"
 
     bc.add_label(first, "cells", "")
     bc.write_metadata(first, root=tmp_path)  # lands; revision moves on
@@ -129,7 +132,9 @@ def test_threaded_label_and_upload_writes_both_survive(tmp_path):
     def run(mutate):
         def body():
             try:
-                bc.read_metadata(AID, root=tmp_path)  # read before the barrier: a real race
+                bc.read_metadata(
+                    AID, root=tmp_path
+                )  # read before the barrier: a real race
                 ready.wait()
                 bc.update_metadata(AID, mutate, root=tmp_path)
             except BaseException as exc:  # noqa: BLE001
@@ -149,10 +154,13 @@ def test_threaded_label_and_upload_writes_both_survive(tmp_path):
     assert not errors, f"a writer raised: {errors!r}"
 
     stored = _stored(tmp_path)
-    assert _label_names(stored) == ["cells"], f"label lost under concurrency: {stored.get('labels')!r}"
-    assert sorted(stored["image_dims"]) == ["picked-scan", "picked-scan-2"], (
-        f"image lost under concurrency: {stored.get('image_dims')!r}"
-    )
+    assert _label_names(stored) == [
+        "cells"
+    ], f"label lost under concurrency: {stored.get('labels')!r}"
+    assert sorted(stored["image_dims"]) == [
+        "picked-scan",
+        "picked-scan-2",
+    ], f"image lost under concurrency: {stored.get('image_dims')!r}"
 
 
 def test_many_concurrent_label_writes_all_survive(tmp_path):
@@ -217,12 +225,16 @@ def test_update_metadata_returns_what_is_stored_not_the_caller_copy(tmp_path):
     """clause 2's shape: a caller is never handed a record describing a write that did not land."""
     _seed(tmp_path)
     returned = bc.update_metadata(AID, _add_label("cells"), root=tmp_path)
-    assert returned == _stored(tmp_path), "the returned record differs from the stored one"
+    assert returned == _stored(
+        tmp_path
+    ), "the returned record differs from the stored one"
 
 
 def test_update_metadata_on_a_missing_record_raises(tmp_path):
     with pytest.raises(KeyError):
-        bc.update_metadata("bioimage-io/annotation-does-not-exist", _add_label("x"), root=tmp_path)
+        bc.update_metadata(
+            "bioimage-io/annotation-does-not-exist", _add_label("x"), root=tmp_path
+        )
 
 
 # ---------------------------------------------------------------------------

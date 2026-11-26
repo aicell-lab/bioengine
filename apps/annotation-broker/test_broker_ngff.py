@@ -894,14 +894,26 @@ class TestImportKeepsTheCredentialOutOfTheArtifact:
         assert "secret-123" not in blob
         assert out["source"]["store_root"] == self.UNTOKENED
 
+    # Both of these now read the STORED record instead of the fixture's in-memory
+    # `_state["meta"]`. The import records the credential through `update_metadata`,
+    # which re-reads the record and re-applies the change, so that a long import
+    # cannot strand itself behind a write refused for being stale. That re-read is
+    # the point of the fix, and it means the credential no longer lands in the dict
+    # the fixture happens to be holding.
+    #
+    # The negative case matters more than it looks: `"ngff_credentials" not in
+    # <the fake>` would keep passing even if a credential WERE written, because the
+    # write now goes somewhere that dict cannot see. Asserting on the fake would be
+    # asserting on the harness rather than on the behaviour.
     async def test_the_token_lands_in_broker_metadata(self, tokened):
         await tokened.import_ngff_image("ws/ds", self.TOKENED, stem="s", context=None)
-        creds = tokened._state["meta"]["ngff_credentials"]
-        assert creds == {self.UNTOKENED: "secret-123"}
+        stored = bc.read_metadata("ws/ds", root=bk.STATE_ROOT) or {}
+        assert stored.get("ngff_credentials") == {self.UNTOKENED: "secret-123"}
 
     async def test_an_untokened_source_records_no_credential(self, importer):
         await importer.import_ngff_image("ws/ds", ROOT, stem="s", context=None)
-        assert "ngff_credentials" not in importer._state["meta"]
+        stored = bc.read_metadata("ws/ds", root=bk.STATE_ROOT) or {}
+        assert "ngff_credentials" not in stored
 
 
 class TestGetImageUrl:

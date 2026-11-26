@@ -2630,10 +2630,24 @@ def write_metadata(
     The check and the replace happen under an exclusive lock on a sibling ``.lock`` file, so the
     window between reading the stored revision and replacing the file cannot be slipped through by
     another writer in this process or in another one on the same filesystem.
+
+    LIMITATION, STATED BECAUSE IT IS LOAD-BEARING: that last sentence is only true where
+    ``fcntl.flock`` actually locks. It is advisory, and on an NFSv3 mount without ``local_lock``
+    it answers ``ENOLCK`` — and the broker's state root lives on a shared NFS mount. Where the
+    lock does not hold, two writers can both read ``stored_rev`` as 5, both pass the comparison,
+    both write revision 6, and one change is lost again: the compare-and-set is not atomic
+    without it. ``ENOLCK`` would surface as a bare ``OSError`` from here, which fails closed
+    rather than silently, but it fails EVERY write on such a mount.
+
+    What does not depend on the lock: the staging file is named per writer (below), so a shared
+    scratch file can never publish a document assembled from two writers. That failure mode is
+    removed outright rather than serialised away.
     """
     artifact_id = metadata["artifact_id"]
     metadata = dict(metadata)
-    expected = metadata.get("revision") if expect_revision is _UNSET else expect_revision
+    expected = (
+        metadata.get("revision") if expect_revision is _UNSET else expect_revision
+    )
     p = metadata_path(artifact_id, root)
     p.parent.mkdir(parents=True, exist_ok=True)
     lock_path = locks_dir(root) / (artifact_id_to_filename(artifact_id) + ".lock")
@@ -2649,13 +2663,41 @@ def write_metadata(
                     # strand the dataset with no way to repair it, so fall through to the write and
                     # let the fresh content replace the damaged file.
                     stored_rev = None
-            if expected is not None and stored_rev is not None and expected != stored_rev:
+            if (
+                expected is not None
+                and stored_rev is not None
+                and expected != stored_rev
+            ):
                 raise RecordConflict(artifact_id, expected, stored_rev)
-            metadata["revision"] = (stored_rev if isinstance(stored_rev, int) else 0) + 1
+            metadata["revision"] = (
+                stored_rev if isinstance(stored_rev, int) else 0
+            ) + 1
             metadata["updated_at"] = now_iso()
-            tmp = p.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(metadata, indent=2))
-            os.replace(tmp, p)
+            # A PER-WRITER staging name, and the lock above is NOT a sufficient substitute.
+            # `p.with_suffix(".json.tmp")` is derived from the artifact id alone, so two
+            # writers staging at the same moment share one scratch file and `os.replace`
+            # can publish a document assembled from both halves -- losing the WHOLE record
+            # rather than one field, which is strictly worse than the lost update this
+            # function exists to prevent.
+            #
+            # `fcntl.flock` is advisory, and on an NFSv3 mount without `local_lock` it
+            # answers ENOLCK; the broker's state root lives on exactly such a shared mount.
+            # So the lock cannot be assumed to hold, and a unique name removes the
+            # shared-file failure whether it holds or not. Note what this does NOT fix: the
+            # revision compare-and-set above still depends on the lock for its atomicity,
+            # which is called out in the docstring.
+            #
+            # The name still ends in `.tmp` and no longer matches `*.json`, so
+            # `list_dataset_ids`' glob and its `.tmp` filter both continue to exclude it.
+            tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_text(json.dumps(metadata, indent=2))
+                os.replace(tmp, p)
+            except BaseException:
+                # Do not leave a half-written scratch file behind on a failure; it would
+                # accumulate in the state root and never be read by anything.
+                tmp.unlink(missing_ok=True)
+                raise
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return metadata
@@ -2687,9 +2729,16 @@ def update_metadata(
         current = read_metadata(artifact_id, root=root)
         if current is None:
             raise KeyError(f"no stored record for {artifact_id!r}")
-        proposed = mutate(copy.deepcopy(current))
+        # Keep a reference to the copy that was handed to `mutate`. Falling back to
+        # `current` instead would DISCARD an in-place mutation: a `mutate` that edits the
+        # record and returns None -- which the docstring above invites, and which is the
+        # natural way to write one -- would then store the unmodified record and report
+        # success. Measured: `import_ngff_image`'s credential write silently vanished that
+        # way, and the only visible symptom was a key missing from the stored record.
+        working = copy.deepcopy(current)
+        proposed = mutate(working)
         if proposed is None:
-            proposed = current
+            proposed = working
         proposed["artifact_id"] = artifact_id
         proposed["revision"] = current.get("revision")
         try:

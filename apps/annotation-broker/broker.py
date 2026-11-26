@@ -2270,10 +2270,20 @@ class AnnotationBroker:
             self._image_manifest_cache.pop(artifact_id, None)
 
         if credential:
-            credentials = dict(meta.get("ngff_credentials") or {})
-            credentials[untokened] = credential
-            meta["ngff_credentials"] = credentials
-            core.write_metadata(meta, root=STATE_ROOT)
+            # Read-modify-write through update_metadata, because THIS is the widest window
+            # in the broker: `meta` was read at the top of this method, and everything
+            # between there and here awaits network work -- staging, the upload, and the
+            # commit. Writing `meta` whole would now be refused by the revision check (good:
+            # it is a stale copy), but refused AFTER the image has already been imported,
+            # which strands a successful import behind a failed credential write and asks
+            # the caller to repeat the upload. Re-reading and re-applying lands the
+            # credential on top of whatever else changed meanwhile.
+            def _store_credential(record: Dict[str, Any]) -> None:
+                credentials = dict(record.get("ngff_credentials") or {})
+                credentials[untokened] = credential
+                record["ngff_credentials"] = credentials
+
+            core.update_metadata(artifact_id, _store_credential, root=STATE_ROOT)
 
         return {"stem": stem, **entry}
 
@@ -3215,6 +3225,7 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         description = description if isinstance(description, str) else ""
+
         # Read-modify-write through update_metadata, so a concurrent writer (the annotate
         # page's index call caches image dimensions on the same record) cannot discard this label
         # and this call cannot discard its dimensions. The returned record is the STORED one, so a
