@@ -19,6 +19,8 @@ Covers:
 
 from __future__ import annotations
 
+import copy
+import fcntl
 import hashlib
 import json
 import math
@@ -2422,6 +2424,20 @@ def datasets_dir(root: Optional[Path] = None) -> Path:
     return d
 
 
+def locks_dir(root: Optional[Path] = None) -> Path:
+    """Where ``write_metadata``'s per-record lock files live.
+
+    Deliberately NOT inside ``datasets/``: that directory holds records and nothing else, and
+    anything that lists it — ``list_dataset_ids``, a backup, an operator's ``ls`` — should not have
+    to know about lock files. Keeping them out also means this change adds no entry to the
+    directory whose exact contents the existing atomicity test asserts.
+    """
+    base = root if root is not None else default_state_root()
+    d = Path(base) / ".locks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def artifact_id_to_filename(artifact_id: str) -> str:
     return artifact_id.replace("/", "__") + ".json"
 
@@ -2551,6 +2567,10 @@ def new_metadata(artifact_id: str, owner: Dict[str, Any]) -> Dict[str, Any]:
         "labels": [],
         "created_at": ts,
         "updated_at": ts,
+        # Lost-update guard. Every stored record carries the revision it was written at;
+        # `write_metadata` refuses a write whose in-hand revision is not the stored one, so a
+        # read-modify-write that raced another writer raises instead of discarding its change.
+        "revision": 1,
     }
 
 
@@ -2563,21 +2583,197 @@ def read_metadata(
     return json.loads(p.read_text())
 
 
+class RecordConflict(RuntimeError):
+    """A whole-record write was refused because the stored record had moved on.
+
+    Raised instead of discarding the concurrent change. Carries both revisions so a caller (or a
+    log line) can say what it expected and what it found.
+    """
+
+    def __init__(self, artifact_id: str, expected: Any, found: Any) -> None:
+        super().__init__(
+            f"record {artifact_id!r} changed under this write: expected revision {expected!r}, "
+            f"stored revision is {found!r}. Re-read the record, re-apply the change, and write "
+            f"again (see update_metadata)."
+        )
+        self.artifact_id = artifact_id
+        self.expected = expected
+        self.found = found
+
+
+_UNSET = object()
+
+
 def write_metadata(
-    metadata: Dict[str, Any], root: Optional[Path] = None
+    metadata: Dict[str, Any],
+    root: Optional[Path] = None,
+    *,
+    expect_revision: Any = _UNSET,
 ) -> Dict[str, Any]:
-    """Atomically write *metadata* (write to a ``.tmp`` file, then
-    ``os.replace``) — same pattern as ``training.write_status`` in the
-    micro-sam app. Stamps ``updated_at`` and returns the written dict."""
+    """Atomically write *metadata*, refusing a write that would discard a concurrent change.
+
+    The file write itself is unchanged: ``.tmp`` then ``os.replace``, so a reader never sees torn
+    JSON. What is added here is a compare-and-set, because atomic-per-file is NOT the same
+    property as "no lost update": two callers that each read, mutate and write the WHOLE record used
+    to lose one change entirely, silently, and the loser was handed back the record it believed it
+    had written.
+
+    The expected revision defaults to the one ON THE RECORD IN HAND — i.e. the revision the caller
+    read. That is what makes this fix cover all of the read-modify-write call sites without editing
+    each one: a stale copy now raises ``RecordConflict`` rather than overwriting. Pass
+    ``expect_revision`` explicitly to assert a particular revision, or ``None`` to force an
+    unconditional write (first write of a record, or a deliberate repair).
+
+    A record already on disk from before this change carries no ``revision``; that is accepted once
+    and stamped, so existing state is not bricked by the upgrade.
+
+    The check and the replace happen under an exclusive lock on a sibling ``.lock`` file, so the
+    window between reading the stored revision and replacing the file cannot be slipped through by
+    another writer in this process or in another one on the same filesystem.
+
+    LIMITATION, STATED BECAUSE IT IS LOAD-BEARING: that last sentence is only true where
+    ``fcntl.flock`` actually locks. It is advisory, and there are filesystems on which it does
+    not hold. Where it does not, two writers can both read ``stored_rev`` as 5, both pass the
+    comparison, both write revision 6, and one change is lost again — the compare-and-set is
+    not atomic without it.
+
+    What filesystem this state root is actually on, and how ``flock`` behaves there, is NOT
+    measured here and no claim is made about it. An earlier version of this docstring asserted
+    a specific mount type and a specific failure; both were unverified, and if the second were
+    true it would be a deployment blocker rather than a note in a comment. Whoever needs the
+    guarantee should measure the mount.
+
+    What does not depend on the lock: the staging file is named per writer (below), so a shared
+    scratch file can never publish a document assembled from two writers. That failure mode is
+    removed outright rather than serialised away.
+    """
     artifact_id = metadata["artifact_id"]
     metadata = dict(metadata)
-    metadata["updated_at"] = now_iso()
+    # `expected is None` used to mean TWO different things, and conflating them left
+    # every already-deployed record unguarded. A caller passing `expect_revision=None`
+    # is asking for an unconditional write (a first write, a deliberate repair). A
+    # record read from disk that simply predates this change ALSO has no revision, and
+    # defaulting from it produced None -- which the check below then read as "do not
+    # compare". Measured at this head before the fix: a legacy record, a concurrent
+    # label write that stamped revision 1, then a stale whole-record write -> ACCEPTED,
+    # and the new label erased. Every record on a deployed worker predates this change,
+    # so that was the reported bug surviving the fix on every existing dataset.
+    unconditional = expect_revision is None
+    expected = (
+        metadata.get("revision") if expect_revision is _UNSET else expect_revision
+    )
     p = metadata_path(artifact_id, root)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(metadata, indent=2))
-    os.replace(tmp, p)
+    lock_path = locks_dir(root) / (artifact_id_to_filename(artifact_id) + ".lock")
+    with open(lock_path, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            # `comparable` is tracked separately from `stored_rev`, because None is a
+            # legitimate stored value (a record written before this change) and must not
+            # be confused with "there is nothing to compare against".
+            stored_rev = None
+            comparable = False
+            if p.exists():
+                try:
+                    stored_rev = (json.loads(p.read_text()) or {}).get("revision")
+                    comparable = True
+                except (json.JSONDecodeError, OSError):
+                    # An unreadable stored record cannot be compared against. Refusing here would
+                    # strand the dataset with no way to repair it, so fall through to the write and
+                    # let the fresh content replace the damaged file.
+                    stored_rev = None
+                    comparable = False
+            # A missing in-hand revision now requires the STORED record to have none
+            # either. That is what covers a record written before this change: its first
+            # post-upgrade write still succeeds (both sides None) and stamps it, and any
+            # OTHER stale copy of it is refused from then on.
+            #
+            # Two cases deliberately skip the comparison, and neither can lose a change:
+            #   * `unconditional` -- an explicit `expect_revision=None` (a create, a repair);
+            #   * `not comparable` -- no stored record at all, or an unreadable one. A
+            #     record that does not exist cannot have moved on, and a fresh record
+            #     carries `revision: 1` from `new_metadata`, so comparing it against a
+            #     missing file would refuse every creation.
+            if not unconditional and comparable and expected != stored_rev:
+                raise RecordConflict(artifact_id, expected, stored_rev)
+            metadata["revision"] = (
+                stored_rev if isinstance(stored_rev, int) else 0
+            ) + 1
+            metadata["updated_at"] = now_iso()
+            # A PER-WRITER staging name, and the lock above is NOT a sufficient substitute.
+            # `p.with_suffix(".json.tmp")` is derived from the artifact id alone, so two
+            # writers staging at the same moment share one scratch file and `os.replace`
+            # can publish a document assembled from both halves -- losing the WHOLE record
+            # rather than one field, which is strictly worse than the lost update this
+            # function exists to prevent.
+            #
+            # `fcntl.flock` is advisory and there are filesystems on which it does not
+            # hold. Which one this state root is on is NOT measured here.
+            # So the lock cannot be assumed to hold, and a unique name removes the
+            # shared-file failure whether it holds or not. Note what this does NOT fix: the
+            # revision compare-and-set above still depends on the lock for its atomicity,
+            # which is called out in the docstring.
+            #
+            # The name still ends in `.tmp` and no longer matches `*.json`, so
+            # `list_dataset_ids`' glob and its `.tmp` filter both continue to exclude it.
+            tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_text(json.dumps(metadata, indent=2))
+                os.replace(tmp, p)
+            except BaseException:
+                # Do not leave a half-written scratch file behind on a failure; it would
+                # accumulate in the state root and never be read by anything.
+                tmp.unlink(missing_ok=True)
+                raise
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return metadata
+
+
+def update_metadata(
+    artifact_id: str,
+    mutate: Any,
+    root: Optional[Path] = None,
+    attempts: int = 8,
+) -> Dict[str, Any]:
+    """Read, apply *mutate*, write — retrying on a conflict so BOTH concurrent changes survive.
+
+    ``mutate(record)`` is called with a private deep copy and may mutate it in place or return a
+    replacement. On ``RecordConflict`` the record is re-read and ``mutate`` is applied again to the
+    winner's version, so the loser's change lands on top instead of being discarded — which is the
+    difference between "no silent loss" (what ``write_metadata`` alone gives) and "both changes
+    survive" (what a caller racing an upload actually needs).
+
+    ``mutate`` must therefore be idempotent-safe to re-apply, which the broker's mutations are:
+    they add or set a named thing rather than, say, incrementing a counter.
+
+    Returns the record as STORED, never the caller's in-hand copy — so a caller cannot be handed a
+    record describing a write that did not land. Raises ``RecordConflict`` if *attempts* is
+    exhausted, and ``KeyError`` if the record does not exist.
+    """
+    last: Optional[RecordConflict] = None
+    for _ in range(max(1, attempts)):
+        current = read_metadata(artifact_id, root=root)
+        if current is None:
+            raise KeyError(f"no stored record for {artifact_id!r}")
+        # Keep a reference to the copy that was handed to `mutate`. Falling back to
+        # `current` instead would DISCARD an in-place mutation: a `mutate` that edits the
+        # record and returns None -- which the docstring above invites, and which is the
+        # natural way to write one -- would then store the unmodified record and report
+        # success. Measured: `import_ngff_image`'s credential write silently vanished that
+        # way, and the only visible symptom was a key missing from the stored record.
+        working = copy.deepcopy(current)
+        proposed = mutate(working)
+        if proposed is None:
+            proposed = working
+        proposed["artifact_id"] = artifact_id
+        proposed["revision"] = current.get("revision")
+        try:
+            return write_metadata(proposed, root=root)
+        except RecordConflict as exc:
+            last = exc
+            continue
+    raise last if last is not None else RuntimeError("update_metadata made no attempt")
 
 
 def delete_metadata(artifact_id: str, root: Optional[Path] = None) -> bool:
