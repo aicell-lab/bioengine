@@ -32,6 +32,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -212,6 +213,94 @@ def _sync_source_from_hypha(
     )
 
 
+#: A claim older than this is treated as abandoned. Generous on purpose: a slow first
+#: sync of a large artifact over a loaded NFS mount is not a dead replica, and breaking a
+#: live claim is worse than waiting.
+_CLAIM_STALE_S = 900
+#: How long to wait for someone else's claim before giving up LOUDLY.
+_CLAIM_WAIT_S = 600
+
+
+def _store_now(app_dir: Path) -> float:
+    """Return "now" as the STORE's clock sees it.
+
+    Staleness must compare two timestamps from ONE clock. ``time.time()`` is the pod's
+    clock and ``st_mtime`` is the NFS server's, and on the de.NBI share the server is
+    measured **78.6 s ahead** of the pods — so ``time.time() - st_mtime`` goes negative
+    and a naive age test reads a brand-new claim as ancient, or an abandoned one as
+    fresh. Writing a probe into the same directory and stat-ing it yields a timestamp
+    stamped by the same clock that stamped the claim.
+    """
+    probe = app_dir / f".claim-probe-{os.getpid()}"
+    try:
+        probe.touch()
+        return probe.stat().st_mtime
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Path:
+    """Serialise same-store source materialisation with an atomic directory create.
+
+    ``fcntl.flock`` used to do this and **cannot** on the production store: the de.NBI
+    app directory is an NFS mount with no lock manager, so ``flock(LOCK_EX)`` raises
+    ``OSError: [Errno 37] No locks available``. That escaped ``setup_replica_environment``
+    before it had set ``HOME``, was swallowed by the bootstrap finder, and left the
+    replica serving with ``HOME=/home/ray`` — read-only in the published image. Measured
+    on one production app: 4 ENOLCK against 2 of the resulting read-only write failures.
+
+    ``mkdir`` is atomic on NFS (it is a single namespace operation, not a byte-range
+    lock), so exactly one of N racing replicas creates the directory and the rest see
+    ``FileExistsError``. Degrading to an **unlocked** sync was considered and rejected:
+    ENOLCK is frequent on this mount, not rare, so the unlocked path would have become
+    the normal path and concurrent writers into one tree the normal case.
+
+    Failure is LOUD — this raises rather than proceeding unclaimed.
+    """
+    claim = app_dir / ".claim"
+    deadline = time.monotonic() + _CLAIM_WAIT_S
+    while True:
+        try:
+            # NOT exist_ok=True: the collision IS the signal being waited on.
+            claim.mkdir()
+            return claim
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(
+                f"BioEngine: cannot create the source claim directory {claim}: {exc}. "
+                f"The replica refuses to materialise source without a claim."
+            ) from exc
+
+        try:
+            age = _store_now(app_dir) - claim.stat().st_mtime
+        except OSError:
+            # It vanished between the mkdir and the stat — the holder finished. Retry.
+            continue
+
+        if age > _CLAIM_STALE_S:
+            logger.warning(
+                f"BioEngine: breaking an abandoned source claim at {claim} "
+                f"(age {age:.0f}s > {_CLAIM_STALE_S}s, both times from the store's clock)"
+            )
+            try:
+                claim.rmdir()
+            except OSError:
+                pass  # someone else broke it first; the next mkdir decides
+            continue
+
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"BioEngine: timed out after {_CLAIM_WAIT_S}s waiting for the source "
+                f"claim at {claim}, held by another replica for {age:.0f}s. Refusing to "
+                f"materialise source without a claim."
+            )
+        time.sleep(2)
+
+
 def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     """Populate ``app_dir/source`` so it matches the artifact's ``version``.
 
@@ -222,7 +311,9 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
     2. ``BIOENGINE_ARTIFACT_FILES_URL`` (+ optional ``_DOWNLOAD_TOKEN``) —
        per-file incremental Hypha sync (:func:`_sync_source_from_hypha`).
 
-    A single ``fcntl`` lock per node serialises concurrent same-node starts.
+    Concurrent same-store starts are serialised by :func:`_acquire_claim`, an atomic
+    ``mkdir``. It replaced an ``fcntl`` lock, which cannot work on an NFS store without
+    a lock manager — see that function for the measured failure.
     """
     source = app_dir / "source"
     version_marker = app_dir / ".version"
@@ -249,28 +340,45 @@ def _ensure_source(app_dir: Path, version: str, logger: logging.Logger) -> Path:
             logger.info(f"BioEngine: source mirrored from local path {candidate}")
             return source
 
-    import fcntl
-
-    lock_path = app_dir / ".lock"
-    with open(lock_path, "w") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        try:
-            files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
-            if not files_url:
-                raise RuntimeError(
-                    "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
-                    "the app source. The worker is expected to populate it (and "
-                    "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
-                    "constructing the runtime_env for the task or deployment."
-                )
-            token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
-            _sync_source_from_hypha(
-                files_url, version, token, source, snapshot_path, logger
+    claim = _acquire_claim(app_dir, logger)
+    try:
+        # Inside the claim it is safe to trust the marker: it is written only after a
+        # sync has completed, so a racing replica that waited here finds the winner's
+        # tree already correct and uses it instead of re-downloading the same bytes.
+        if (
+            source.is_dir()
+            and version_marker.is_file()
+            and version_marker.read_text().strip() == identity
+        ):
+            logger.info(
+                f"BioEngine: source already at {identity}; another replica "
+                f"materialised it"
             )
-            version_marker.write_text(identity)
             return source
-        finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+        files_url = os.environ.get("BIOENGINE_ARTIFACT_FILES_URL")
+        if not files_url:
+            raise RuntimeError(
+                "BIOENGINE_ARTIFACT_FILES_URL is not set; cannot materialise "
+                "the app source. The worker is expected to populate it (and "
+                "optionally BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN) when "
+                "constructing the runtime_env for the task or deployment."
+            )
+        token = os.environ.get("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN") or None
+        _sync_source_from_hypha(
+            files_url, version, token, source, snapshot_path, logger
+        )
+        version_marker.write_text(identity)
+        return source
+    finally:
+        try:
+            claim.rmdir()
+        except OSError as exc:
+            # Leaving it behind would stall every later replica for _CLAIM_WAIT_S
+            # before the staleness check frees it, so say so rather than passing.
+            logger.warning(
+                f"BioEngine: could not release the source claim {claim}: {exc}"
+            )
 
 
 def setup_replica_environment() -> None:

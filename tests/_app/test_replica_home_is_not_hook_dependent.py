@@ -42,6 +42,7 @@ it, which is what makes it the right lever, but an app is free to ignore it.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -240,3 +241,182 @@ def test_the_fixture_really_starts_from_the_read_only_default(hook_env) -> None:
     """Without this, both tests above could pass on a machine where HOME happens to
     already point somewhere under tmp_path, and would be asserting nothing."""
     assert os.environ["HOME"] == "/home/ray"
+
+
+# ─────────────────── leg 3: the lock that cannot work on NFS ───────────────────
+#
+# The measured production trigger. `_ensure_source` serialised concurrent replicas with
+# `fcntl.flock(LOCK_EX)` on the app directory. That directory is an NFS mount with no lock
+# manager, so the call raises `OSError: [Errno 37] No locks available` — six lines before
+# HOME was set, escaping `setup_replica_environment`, swallowed by the bootstrap finder,
+# leaving the replica serving with HOME=/home/ray. One production app showed 4 ENOLCK
+# against 2 of the resulting read-only write failures.
+#
+# The lock is REPLACED, not dropped: `mkdir` is atomic on NFS. Degrading to an unlocked
+# sync was rejected because ENOLCK is frequent on this mount, so the unlocked path would
+# have become the normal path and concurrent writers into one tree the normal case.
+
+
+def _sync_env(monkeypatch, tmp_path):
+    app_dir = tmp_path / "ws-test-my-app"
+    monkeypatch.setenv("BIOENGINE_APP_DIR", str(app_dir))
+    monkeypatch.setenv("BIOENGINE_ARTIFACT_VERSION", "1.2.3")
+    monkeypatch.setenv("BIOENGINE_ARTIFACT_ID", "ws-test/my-app")
+    monkeypatch.setenv("BIOENGINE_ARTIFACT_FILES_URL", "https://example.invalid/files")
+    monkeypatch.setenv("HOME", "/home/ray")
+    monkeypatch.delenv("BIOENGINE_ARTIFACT_DOWNLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BIOENGINE_LOCAL_ARTIFACT_PATH", raising=False)
+    calls = []
+    held = []
+
+    def fake_sync(files_url, version, token, source, snapshot_path, logger):
+        calls.append(version)
+        # Was the claim actually HELD while the sync ran? Without this the release
+        # assertions below pass on code that never takes a claim at all — a vacuous
+        # pass that reads exactly like a real one.
+        held.append((app_dir / ".claim").is_dir())
+        Path(source).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(replica_init, "_sync_source_from_hypha", fake_sync)
+    return app_dir, calls, held
+
+
+def test_the_module_takes_no_byte_range_lock_AT_ALL(monkeypatch, tmp_path):
+    """Structural, so the lock cannot quietly come back.
+
+    Asserted over the AST rather than the text: the docstrings deliberately *mention*
+    `fcntl.flock` to explain why it was removed, and a grep would score that prose as the
+    defect. This looks for an import of, or an attribute access on, `fcntl`.
+    """
+    import ast as _ast
+
+    tree = _ast.parse(Path(replica_init.__file__).read_text())
+    bad = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            bad += [a.name for a in node.names if a.name.split(".")[0] == "fcntl"]
+        elif isinstance(node, _ast.ImportFrom) and (node.module or "").startswith("fcntl"):
+            bad.append(node.module)
+        elif isinstance(node, _ast.Attribute) and isinstance(node.value, _ast.Name):
+            if node.value.id == "fcntl":
+                bad.append(f"fcntl.{node.attr}")
+    assert bad == [], f"replica_init still uses fcntl: {bad}"
+
+
+def test_ENOLCK_no_longer_stops_a_replica_reaching_ready(monkeypatch, tmp_path):
+    """THE PRODUCTION ARM. flock raises ENOLCK exactly as the de.NBI mount makes it.
+
+    On the previous code this is the failure: `_ensure_source` propagates ENOLCK out of
+    `setup_replica_environment` before HOME is assigned. Here the call must complete with
+    a writable HOME, because no byte-range lock is taken at all.
+
+    Patching `fcntl.flock` to raise is what makes this an arm rather than a restatement of
+    the structural test above: it fails loudly if any code path still reaches a flock,
+    including one added later in a helper this test does not know about.
+    """
+    import errno
+    import fcntl
+
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+
+    def enolck(*_a, **_k):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", enolck)
+    replica_init.setup_replica_environment()
+
+    assert os.environ["HOME"] == str(app_dir / "home")
+    assert Path(os.environ["HOME"]).is_dir()
+    assert calls == ["1.2.3"], "the source sync must still have happened"
+
+
+def test_the_claim_is_HELD_during_the_sync_and_released_after(monkeypatch, tmp_path):
+    """Both halves, so neither can pass vacuously.
+
+    "Released afterwards" alone is true of code that never claims anything — it was, on
+    the parent commit, where this assertion passed while measuring nothing.
+    """
+    app_dir, _calls, held = _sync_env(monkeypatch, tmp_path)
+    replica_init.setup_replica_environment()
+    assert held == [True], "the sync ran without the claim being held"
+    assert not (app_dir / ".claim").exists(), "the claim was not released"
+
+
+def test_the_claim_is_released_even_when_the_sync_RAISES(monkeypatch, tmp_path):
+    """A claim leaked on the error path would stall every later replica for the full wait."""
+    app_dir, _calls, held = _sync_env(monkeypatch, tmp_path)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("files endpoint returned 503")
+
+    seen = []
+
+    def boom_seeing_claim(*_a, **_k):
+        seen.append((app_dir / ".claim").is_dir())
+        raise RuntimeError("files endpoint returned 503")
+
+    monkeypatch.setattr(replica_init, "_sync_source_from_hypha", boom_seeing_claim)
+    with pytest.raises(RuntimeError, match="503"):
+        replica_init.setup_replica_environment()
+    assert seen == [True], "the failing sync ran without the claim being held"
+    assert not (app_dir / ".claim").exists(), "the claim leaked on the error path"
+
+
+def test_a_second_replica_uses_the_winners_tree_instead_of_re_downloading(
+    monkeypatch, tmp_path
+):
+    """The marker is only written after a completed sync, so trusting it inside the claim
+    is safe — and it is what makes the loser cheap rather than a duplicate download."""
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    replica_init.setup_replica_environment()
+    replica_init.setup_replica_environment()
+    assert calls == ["1.2.3"], f"the source was re-synced: {calls}"
+
+
+def test_an_abandoned_claim_is_broken(monkeypatch, tmp_path):
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    claim = app_dir / ".claim"
+    claim.mkdir()
+    old = time.time() - (replica_init._CLAIM_STALE_S + 600)
+    os.utime(claim, (old, old))
+    replica_init.setup_replica_environment()
+    assert calls == ["1.2.3"]
+    assert os.environ["HOME"] == str(app_dir / "home")
+
+
+def test_a_LIVE_claim_makes_it_fail_LOUDLY_not_sync_unclaimed(monkeypatch, tmp_path):
+    """The whole point of replacing the lock rather than dropping it.
+
+    A fresh claim held by someone else must stop this replica with a raise. If it instead
+    proceeded, two replicas would write one tree concurrently — which is exactly what the
+    rejected "tolerate ENOLCK by skipping the lock" design would have done, routinely.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / ".claim").mkdir()
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0)
+    with pytest.raises(RuntimeError, match="claim"):
+        replica_init.setup_replica_environment()
+    assert calls == [], "it synced anyway, without a claim"
+
+
+def test_staleness_survives_a_SKEWED_POD_CLOCK(monkeypatch, tmp_path):
+    """The de.NBI NFS server clock is measured 78.6 s AHEAD of the pods.
+
+    So `time.time() - st_mtime` is the wrong subtraction, and at a large enough skew it
+    reads a brand-new claim as abandoned and breaks it — reintroducing concurrent writers
+    through the staleness path instead of the lock path. `_store_now` stats a probe it
+    writes into the same directory, so both times come from the store's clock.
+
+    Driven by moving the POD clock far forward: a live claim must still be respected.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / ".claim").mkdir()  # fresh, so it must NOT be broken
+    skew = replica_init._CLAIM_STALE_S * 10
+    monkeypatch.setattr(replica_init.time, "time", lambda: time.time() + skew)
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0)
+    with pytest.raises(RuntimeError, match="claim"):
+        replica_init.setup_replica_environment()
+    assert calls == [], "a skewed pod clock broke a live claim and synced anyway"
