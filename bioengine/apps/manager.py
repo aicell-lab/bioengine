@@ -905,8 +905,65 @@ class AppsManager:
 
         return application_id
 
+    @staticmethod
+    def _describe_resource_shortfall(
+        required_resources: Dict[str, int],
+        free_per_node: Dict[str, Dict[str, float]],
+        proxy_memory_in_gb: Optional[float] = None,
+    ) -> str:
+        """Render a refusal that names the proxy reservation and the free figures.
+
+        Two things the bare ``Requested: {...}`` dict cannot tell a caller:
+
+        * the memory asked of Ray is the app's deployments **plus** the
+          ``ProxyDeployment`` reservation, so it exceeds what the caller wrote.
+          The excess is a flat ``proxy_memory_in_gb`` (default 0.5 GiB), not a
+          percentage, so it is proportionally largest for the smallest requests.
+        * what was actually free. ``free_per_node`` is computed by the caller and
+          is in scope at every refusal site.
+
+        ``proxy_memory_in_gb`` may be None when the reservation is unknown; the
+        total is then reported without a split rather than with a guessed one.
+        """
+        mib = 1024 * 1024
+        total_mem = int(required_resources.get("memory", 0))
+        parts = []
+        if proxy_memory_in_gb:
+            proxy_mem = int(proxy_memory_in_gb * (1024**3))
+            own_mem = max(0, total_mem - proxy_mem)
+            parts.append(
+                f"Requested: {own_mem // mib} MiB for the app's deployments "
+                f"+ {proxy_mem // mib} MiB for the BioEngine proxy "
+                f"= {total_mem // mib} MiB"
+            )
+        else:
+            parts.append(f"Requested: {total_mem // mib} MiB total")
+        parts.append(
+            f"{required_resources.get('num_cpus', 0)} CPU, "
+            f"{required_resources.get('num_gpus', 0)} GPU, "
+            f"{required_resources.get('VRAM_MB', 0)} MiB VRAM"
+        )
+        if free_per_node:
+            per_node = "; ".join(
+                f"{node_id}: {int(free['memory']) // mib} MiB, "
+                f"{free['num_cpus']} CPU, {free['num_gpus']} GPU"
+                for node_id, free in free_per_node.items()
+            )
+            parts.append(f"Free now — {per_node}")
+        else:
+            parts.append("Free now — no node reported capacity")
+        if proxy_memory_in_gb:
+            parts.append(
+                "The proxy reservation is the deploy-time proxy_memory_in_gb "
+                f"(here {proxy_memory_in_gb} GiB); it is added to every app."
+            )
+        return ". ".join(parts) + "."
+
     async def _check_resources(
-        self, application_id: str, required_resources: Dict[str, int]
+        self,
+        application_id: str,
+        required_resources: Dict[str, int],
+        proxy_memory_in_gb: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Verify that sufficient resources are available for deploying an application.
@@ -1033,14 +1090,22 @@ class AppsManager:
 
         if insufficient_resources:
             if self.ray_cluster.mode != "external-cluster":
-                self.logger.error(
-                    f"Insufficient resources for application '{application_id}'. "
-                    f"Requested: {required_resources}"
+                # The requested memory is the sum over the app's deployments PLUS
+                # the ProxyDeployment's own reservation, so it is larger than the
+                # number the caller wrote. Decompose it: a caller who asked for a
+                # node-sized value otherwise reads a refusal quoting a figure they
+                # never typed. And name what was free — free_per_node is already
+                # computed above, and the external-cluster branch below already
+                # reports it.
+                detail = self._describe_resource_shortfall(
+                    required_resources, free_per_node, proxy_memory_in_gb
                 )
-                raise ValueError(
+                message = (
                     f"Insufficient resources for application '{application_id}'. "
-                    f"Requested: {required_resources}"
+                    f"{detail}"
                 )
+                self.logger.error(message)
+                raise ValueError(message)
             else:
                 self.logger.warning(
                     f"Currently insufficient resources for application '{application_id}'. "
@@ -3999,6 +4064,7 @@ class AppsManager:
             resource_shortfall = await self._check_resources(
                 application_id=application_id,
                 required_resources=app.metadata["resources"],
+                proxy_memory_in_gb=app.metadata.get("proxy_memory_in_gb"),
             )
 
             # Derive static site URL from the manifest's frontend_entry field.
