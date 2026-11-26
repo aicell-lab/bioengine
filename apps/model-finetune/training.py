@@ -432,6 +432,12 @@ def checkpoint_path(
     return sdir / "checkpoints" / session_id / "best.pt"
 
 
+#: The mode a run's `status.json` must carry. Named here, beside the writer,
+#: because the writer is what a later change would touch -- see the block in
+#: `write_status` for why 0o600 and not merely "nothing world-writable".
+STATUS_FILE_MODE = 0o600
+
+
 def _status_path(session_id: str) -> Path:
     return session_dir(session_id) / "status.json"
 
@@ -931,6 +937,30 @@ def _write_status_locked(p, session_id: str, fields: Dict[str, Any]) -> Dict[str
     # to be on the same one as the target.
     fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=".status-", suffix=".tmp")
     try:
+        # THE MODE IS 0o600 AND IT IS REQUESTED, NOT INHERITED.
+        #
+        # This file carries the run's `owner`, and the owner field is what every
+        # permission check on the run is matched against, so the mode is part of
+        # the access story rather than a detail of how the write is done. A
+        # world-writable status file puts "whose run is this" within reach of
+        # anything else running in the container.
+        #
+        # `mkstemp` already creates at 0o600, so this looks redundant. It is
+        # not, for two reasons. It makes the restriction a DECISION that
+        # survives a rewrite of this function -- `Path.write_text` creates at
+        # `0o666 & ~umask`, and whoever rewrites this reads this comment, not
+        # the test. And `mkstemp`'s 0o600 is NOT umask-proof: it calls
+        # `os.open(..., 0o600)` and the umask masks that too; it merely looks
+        # immune because an ordinary umask never clears the OWNER bits. An
+        # explicit `fchmod` is what actually makes the mode independent of the
+        # umask the process happens to carry.
+        #
+        # `os.replace` installs this inode over the target, so the mode is
+        # re-established on every write rather than preserved from the first
+        # one. Pinned by apps/model-finetune/test_status_file_mode.py; the
+        # legacy 0o777 files already on the production store are a separate
+        # matter and no code change reaches them.
+        os.fchmod(fd, STATUS_FILE_MODE)
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(cur))
         os.replace(tmp_name, p)
@@ -1130,10 +1160,31 @@ def _owner_or_comanager(
     artifact-manager round trip while this is synchronous and runs once per run.
     """
     owner = status.get("owner")
-    if isinstance(owner, str) and owner:
+    has_owner = isinstance(owner, str) and bool(owner)
+    if has_owner:
         caller = caller_identity(context).get("owner")
         if caller is not None and caller == owner:
             return True
+    # THE CO-MANAGER LEG REQUIRES THE RUN TO HAVE AN OWNER, and without this
+    # line it did not. A run with no recorded owner on a dataset the caller
+    # manages returned True here, which made an OWNERLESS run visible to a
+    # co-manager and resumable by one.
+    #
+    # Two things said that is wrong, and they agreed with each other before the
+    # code did. The lead's ruling on this row: the widening applies to OWNED
+    # runs only -- a co-manager sees the runs of other MANAGERS on that
+    # dataset -- and ownerless runs stay admin-only. And the shipped README
+    # already said "resuming an ownerless run requires `rw`/admin on
+    # `bioimage-io`, because with no recorded owner there is nobody for the
+    # ownership check to match you against".
+    #
+    # So the rule is not "a manager of the dataset may act on anything filed
+    # under it": it is "a manager may act on a COLLEAGUE's run", and an
+    # ownerless run has no colleague. The administrator leg in each caller --
+    # `caller_may_see_run`, `caller_may_resume_run` -- is what reaches those,
+    # and it is deliberately not widened here.
+    if not has_owner:
+        return False
     dataset = status.get(DATASET_FIELD)
     if isinstance(dataset, str) and dataset and dataset in writable_datasets:
         return True
