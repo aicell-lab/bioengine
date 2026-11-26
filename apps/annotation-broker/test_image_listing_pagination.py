@@ -46,7 +46,8 @@ import time
 import pytest
 
 import broker_core as core
-from test_broker_ngff import bk
+from test_broker_ngff import ROOT, bk
+from test_broker_ngff import importer as importer  # a fixture, re-exported here
 
 ARTIFACT = "ws/ds"
 
@@ -352,6 +353,37 @@ async def test_the_MINT_still_answers_ALREADY_for_an_image_on_a_LATER_PAGE(
 
     assert out["already"] is True, out
     assert out["path"] == f"images/{last}"
+
+
+async def test_the_IMPORT_REFUSES_on_a_short_listing(monkeypatch, importer):
+    """The NGFF import's no-overwrite check gets looser the same way the mint's
+    does. Its write is the stored manifest plus this one entry, so a local file
+    on a later page is shadowed rather than deleted — the stem resolves to a
+    remote source and the object at `images/<stem><ext>` becomes unreachable
+    through the manifest while still occupying the path.
+
+    Uses the ngff fixture rather than this file's, because `import_ngff_image`
+    probes a remote store before it ever reads the listing, and a fixture that
+    faked the probe here would be a second, divergent copy of that one.
+    """
+
+    async def _short(_a, _dir_path, stage=True):
+        return [], False
+
+    monkeypatch.setattr(importer, "_list_files_all", _short)
+
+    with pytest.raises(RuntimeError) as exc:
+        await importer.import_ngff_image("ws/ds", ROOT, context=None)
+
+    assert "could not be listed in full" in str(exc.value)
+    assert "NOTHING was imported" in str(exc.value)
+
+
+async def test_the_IMPORT_STILL_WORKS_when_the_listing_is_COMPLETE(importer):
+    """The control for the test above."""
+    out = await importer.import_ngff_image("ws/ds", ROOT, context=None)
+    assert out["stem"] == "sample"
+    assert out["state"] == "remote"
 
 
 async def test_the_FINISH_REFUSES_AND_DISCARDS_on_a_short_listing(monkeypatch):
