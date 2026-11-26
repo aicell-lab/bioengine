@@ -461,3 +461,115 @@ def test_checkpoints_live_in_the_models_subfolder_named_by_REGISTRY_KEY():
     assert cm.MODELS_SUBDIR == "models"
     assert cm.DECODER_SUFFIX == "_decoder"
     assert cm.CACHE_DIR_ENV == "MICROSAM_CACHEDIR"
+
+
+# ── round 2: a mismatch is decidable without the missing hasher ──────────────
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_a_MISMATCH_is_reported_even_when_the_provenance_leg_is_SKIPPED(tmp_path):
+    """The round-2 probe. A wrong file must read as wrong, not as unverifiable.
+
+    Measured at the refused head: a file whose sha256 did not match raised the
+    provenance refusal instead of reporting the mismatch, and the message said
+    the file "matched [sha256]" -- which was false. What a missing hasher costs
+    is the ability to call a file GOOD, never the ability to call it WRONG.
+    """
+    _write(tmp_path, GENERALIST, b"the wrong bytes")
+    p = cm.models_dir(tmp_path) / GENERALIST
+    other_sha = _d(b"some other bytes", "sha256").split(":", 1)[1]
+    expectation = {"xxh128": "a" * 32, "sha256": other_sha}
+
+    rec = cm.verify_member(p, expectation)
+
+    assert rec["intact"] is False, rec
+    assert rec["checked"] == ["sha256"], rec
+    assert rec["skipped"] == ["xxh128"], rec
+    assert cm.member_is_intact(p, expectation) is False
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_the_refusal_message_does_not_claim_a_MATCH_that_did_not_happen(tmp_path):
+    """The message itself, asserted, because this one was actively misleading.
+
+    A refusal that says a file matched when it did not sends a reader looking
+    for a missing dependency instead of at the corrupt file in front of them.
+    """
+    _write(tmp_path, GENERALIST, b"the wrong bytes")
+    p = cm.models_dir(tmp_path) / GENERALIST
+    other_sha = _d(b"some other bytes", "sha256").split(":", 1)[1]
+
+    # No raise at all now, so there is no message to be wrong. The paired
+    # assertion is that the GOOD file still produces the provenance refusal,
+    # otherwise this test would pass with the refusal removed entirely.
+    assert (
+        cm.verify_member(p, {"xxh128": "a" * 32, "sha256": other_sha})["intact"]
+        is False
+    )
+
+    good = b"exactly these bytes"
+    _write(tmp_path, PLAIN, good)
+    with pytest.raises(cm.MirrorError) as exc:
+        cm.verify_member(
+            cm.models_dir(tmp_path) / PLAIN,
+            {"xxh128": "a" * 32, "sha256": _d(good, "sha256").split(":", 1)[1]},
+        )
+    assert "PROVENANCE is unverified" in str(exc.value)
+    assert "nothing it was checked against disagreed" in str(exc.value)
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_a_corrupt_member_still_LANDS_IN_A_BUCKET_rather_than_raising(tmp_path):
+    """The consequence the review traced: `seed_plan` raised instead of planning.
+
+    A provably corrupt file with two digests recorded used to raise "PROVENANCE
+    is unverified", so the one case the buckets exist to separate became an
+    exception. It must land in `replace` when the mirror can supply a copy and
+    in `corrupt_unavailable` when it cannot.
+    """
+    _write(tmp_path, GENERALIST, b"the wrong bytes")
+    wanted = {
+        GENERALIST: {
+            "xxh128": "a" * 32,
+            "sha256": _d(b"some other bytes", "sha256").split(":", 1)[1],
+        }
+    }
+
+    assert cm.seed_plan(tmp_path, wanted, available=[GENERALIST])["replace"] == [
+        GENERALIST
+    ]
+    assert cm.seed_plan(tmp_path, wanted, available=[])["corrupt_unavailable"] == [
+        GENERALIST
+    ]
+
+
+@pytest.mark.skipif(
+    HAVE_XXHASH, reason="only reachable where xxh128 cannot be computed"
+)
+def test_seed_plan_can_PASS_THE_WAIVER_THROUGH_and_refuses_by_default(tmp_path):
+    """Planning happens in the runtime, where `xxhash` may be absent. Without a
+    way to pass the waiver, a two-digest manifest made every planning call raise
+    rather than produce a plan -- and the default must still be the refusing
+    one, or the waiver is not a decision anybody takes."""
+    good = b"exactly these bytes"
+    _write(tmp_path, GENERALIST, good)
+    wanted = {
+        GENERALIST: {
+            "xxh128": "a" * 32,
+            "sha256": _d(good, "sha256").split(":", 1)[1],
+        }
+    }
+
+    with pytest.raises(cm.MirrorError, match="PROVENANCE is unverified"):
+        cm.seed_plan(tmp_path, wanted, available=[GENERALIST])
+
+    plan = cm.seed_plan(
+        tmp_path, wanted, available=[GENERALIST], allow_unverified_provenance=True
+    )
+    assert plan["ok"] == [GENERALIST], plan

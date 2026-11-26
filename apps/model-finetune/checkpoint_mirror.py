@@ -296,16 +296,34 @@ def verify_member(
             "alongside the registry's xxh128 so there is something to fall back "
             "to."
         )
+
+    # A MISMATCH IS REPORTED BEFORE A SKIPPED LEG IS REFUSED, and the order is a
+    # fix rather than a style. The other way round, a file whose sha256 did not
+    # match raised the provenance refusal instead -- and that message said the
+    # file "matched [sha256]", which was false. A review measured it, and its
+    # consequence in `seed_plan`: a provably corrupt file with two digests
+    # recorded raised "PROVENANCE is unverified" rather than landing in
+    # `replace` or `corrupt_unavailable`, so the one case the buckets exist to
+    # separate became an exception instead.
+    #
+    # The principle: a mismatch is DECIDABLE without the missing hasher. What
+    # the skipped leg costs is the ability to say a file is GOOD, never the
+    # ability to say it is WRONG.
+    if mismatched:
+        record["intact"] = False
+        return record
+
     if record["skipped"] and not allow_unverified_provenance:
         raise MirrorError(
-            f"{p.name} matched {record['checked']} but {record['skipped']} could "
-            "not be computed here, so its PROVENANCE is unverified. Refusing: "
-            "a matching sha256 proves the mirror has not changed since we hashed "
-            "it, not that the bytes are upstream's. Install `xxhash`, or pass "
+            f"{p.name} matched {record['checked']}, and nothing it was checked "
+            f"against disagreed, but {record['skipped']} could not be computed "
+            "here, so its PROVENANCE is unverified. Refusing: a matching sha256 "
+            "proves the mirror has not changed since we hashed it, not that the "
+            "bytes are upstream's. Install `xxhash`, or pass "
             "allow_unverified_provenance=True at a call site where integrity "
             "alone is the documented standard."
         )
-    record["intact"] = not mismatched
+    record["intact"] = True
     return record
 
 
@@ -348,6 +366,7 @@ def seed_plan(
     wanted: Mapping[str, str],
     *,
     available: Optional[Iterable[str]] = None,
+    allow_unverified_provenance: bool = False,
 ) -> Dict[str, List[str]]:
     """What to do for each wanted member, as four disjoint lists.
 
@@ -391,6 +410,15 @@ def seed_plan(
 
     The five are disjoint and their union is exactly *wanted*, so a caller can
     assert that and catch a member silently dropped by a future change.
+
+    *allow_unverified_provenance* is passed straight through to
+    :func:`verify_member`. It has to exist here because planning happens in the
+    runtime, where `xxhash` may be absent: without it, a two-digest manifest
+    would make every planning call raise rather than produce a plan. The default
+    stays the refusing one, so a caller that wants a plan computed on integrity
+    alone says so. **Nothing in this module asserts that `xxhash` is present
+    where seeding runs** -- it is in pooch's dependency path in the runtime
+    image, which is a reason to expect it, not a check that it is there.
     """
     have = None if available is None else set(available)
     plan: Dict[str, List[str]] = {
@@ -405,7 +433,15 @@ def seed_plan(
         parse_expectation(digest)  # fail closed before any filesystem work
         path = target / key
         present = path.is_file()
-        intact = member_is_intact(path, digest) if present else False
+        intact = (
+            member_is_intact(
+                path,
+                digest,
+                allow_unverified_provenance=allow_unverified_provenance,
+            )
+            if present
+            else False
+        )
         mirrored = have is None or key in have
         # PRESENCE IS TESTED BEFORE AVAILABILITY, and the order is the fix: the
         # other way round, a corrupt file the mirror lacks never reaches a
