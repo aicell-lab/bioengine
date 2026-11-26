@@ -121,8 +121,17 @@ class _Store:
         self.removed: list = []
         self.committed = 0
         self.put_file_calls: list = []  # (file_path, expires_in) per mint
+        self.listing_calls: list = []  # (dir_path, offset, asked, served) per read
 
     # -- the artifact-manager surface the route uses -------------------
+    async def list_files(
+        self, _artifact_id, dir_path=None, stage=True, limit=None, offset=0
+    ):
+        """The artifact-manager surface the paging loop calls, WITH limit and
+        offset. Separate from `listing` so a test can see which pages were
+        asked for."""
+        return self.listing(dir_path, stage=stage, limit=limit, offset=offset)
+
     async def put_file(self, _artifact_id, file_path=None, expires_in=None):
         # `expires_in` is RECORDED, not ignored. The real `put_file` defaults it
         # to an hour and the route now passes a short value deliberately, so a
@@ -147,10 +156,19 @@ class _Store:
         self.published[path] = body
         self.objects[path] = body
 
-    def listing(self, dir_path: str, stage: bool = True):
+    #: Entries one `list_files` call returns. The real one is PAGINATED -- its
+    #: default page is 1000 and the documented maximum is 10000 -- so a double
+    #: that answered the whole directory in one call modelled a server that does
+    #: not exist, and a review measured the consequence: everything past the
+    #: first page was invisible to a decision that had to see all of it. Small
+    #: here so the paging path is exercised by tens of entries rather than
+    #: thousands.
+    page_size = 50
+
+    def listing(self, dir_path: str, stage: bool = True, limit=None, offset=0):
         # `stage` is accepted and IGNORED, on purpose: see the class docstring.
         # The real store answers both views the same for a staged object, and a
-        # double that disagreed with it is what let the previous round ship.
+        # double that disagreed with it is what let a previous round ship.
         source = {**self.published, **self.objects}
         out = []
         for path, body in sorted(source.items()):
@@ -158,7 +176,16 @@ class _Store:
             if head != dir_path:
                 continue
             out.append({"name": nm, "type": "file", "size": len(body)})
-        return out
+        start = int(offset or 0)
+        asked = int(limit) if limit else self.page_size
+        size = min(asked, self.page_size)  # the server's own page caps the ask
+        # BOTH numbers are recorded: what was ASKED for and what was SERVED. The
+        # whole round-7 finding is that those differ, so a record that kept only
+        # the served size could not show whether the caller asked for more --
+        # which is what a first version of this test tried to assert and could
+        # not.
+        self.listing_calls.append((dir_path, start, asked, size))
+        return out[start : start + size]
 
 
 def _store_broker(monkeypatch, store, *, ceiling):
@@ -185,6 +212,11 @@ def _store_broker(monkeypatch, store, *, ceiling):
 
     async def _list_files_safe(_a, dir_path, stage=True):
         return store.listing(dir_path, stage=stage)
+
+    # `_list_files_all` is NOT replaced: it is the paging loop under test, and
+    # it must drive the store's own pagination. It calls `self._am.list_files`,
+    # which is the store, so only the AM surface below needs to accept the
+    # limit/offset it passes.
 
     async def _ensure_staged(_a, fn):
         return await fn()
@@ -1047,3 +1079,98 @@ async def test_the_sweep_still_CAPS_WHAT_IT_REMOVES_per_call(monkeypatch):
         f"{core.UPLOAD_MARKER_SWEEP_LIMIT}"
     )
     assert swept < 60, "the sweep is unbounded"
+
+
+# ── round 7: the server's own page is a cap too ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_marker_read_FOLLOWS_the_servers_pagination(monkeypatch):
+    """Round 7's probe. `list_files` is paginated; one call is a PAGE.
+
+    With the double's page at 50 and 60 markers in flight, everything past the
+    first page used to be invisible to the withholding -- the size bypass
+    again, now reachable by minting one more than the server's page rather than
+    one more than the app's own former cap.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    assert store.page_size == 50, "the double must page for this test to mean anything"
+
+    mints = {}
+    for i in range(60):
+        name = f"img{i:02d}.png"
+        mints[name] = await b.upload_local_image(ARTIFACT, name)
+
+    last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
+    store.put(mints[last]["put_url"], _png(10000))  # 156x the ceiling, no finish
+
+    pairs = await b._marker_pairs(ARTIFACT)
+    manifest = await b._image_manifest(ARTIFACT)
+
+    assert (
+        len(pairs) == 60
+    ), f"the marker read stopped at a page boundary: {len(pairs)} of 60 seen"
+    stem = last.rsplit(".", 1)[0]
+    assert stem not in manifest, (
+        "an unfinished oversized upload whose marker lies past the server's "
+        f"first page is listed as a dataset image: {stem}"
+    )
+    # And it really did page, rather than the double handing over everything.
+    marker_reads = [c for c in store.listing_calls if c[0] == core.UPLOAD_MARKER_DIR]
+    assert (
+        len(marker_reads) >= 2
+    ), f"only one page was requested, so nothing was paged: {marker_reads}"
+
+
+@pytest.mark.asyncio
+async def test_a_page_SHORTER_than_asked_for_does_not_end_the_read(monkeypatch):
+    """The termination rule, asserted directly, because getting it wrong is how
+    the first attempt at this fix failed.
+
+    The loop asks for the largest page the server documents and the double caps
+    it at 50. If "shorter than I asked for" ended the read, every directory
+    would be truncated to one page -- which is what happened, and what the test
+    above caught.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    for i in range(60):
+        await b.upload_local_image(ARTIFACT, f"img{i:02d}.png")
+
+    entries = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+
+    assert len(entries) == 60, len(entries)
+    asks = [c for c in store.listing_calls if c[0] == core.UPLOAD_MARKER_DIR]
+    # c = (dir_path, offset, ASKED, SERVED). The ask must exceed the server's
+    # page, and the server must have served less -- that is the shape of the
+    # answer the loop has to keep reading through.
+    assert any(
+        c[2] > store.page_size for c in asks
+    ), f"the loop never asked for more than the server's page: {asks[:3]}"
+    assert any(
+        c[2] > c[3] for c in asks
+    ), f"no call was served less than it asked for: {asks[:3]}"
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_IGNORES_OFFSET_terminates_the_read(monkeypatch):
+    """The pathological case, because an unbounded loop is worse than a short
+    read. A page that repeats what has already been seen ends the loop, and the
+    broker logs that the answer may be incomplete rather than claiming it is
+    whole."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+    for i in range(60):
+        await b.upload_local_image(ARTIFACT, f"img{i:02d}.png")
+
+    async def ignores_offset(_a, dir_path=None, stage=True, limit=None, offset=0):
+        return store.listing(dir_path, stage=stage, limit=limit, offset=0)
+
+    monkeypatch.setattr(store, "list_files", ignores_offset)
+
+    entries = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
+
+    assert (
+        len(entries) == store.page_size
+    ), f"expected to stop after the repeated page: {len(entries)}"

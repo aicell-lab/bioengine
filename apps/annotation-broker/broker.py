@@ -51,6 +51,14 @@ _SEND_FAILURE_MARKERS = (
 )
 
 
+#: The page size used when a directory has to be read in FULL. `list_files` is
+#: paginated with a default page of 1000 and a documented range of 1..10000, so
+#: a single call answers a PAGE, not a directory. This asks for the largest
+#: page the server documents, which keeps the number of round trips down -- the
+#: paging loop is what makes the answer complete, not this number.
+_LIST_PAGE = 10000
+
+
 def _is_send_failure(exc: Exception) -> bool:
     return any(marker in str(exc) for marker in _SEND_FAILURE_MARKERS)
 
@@ -280,6 +288,107 @@ class AnnotationBroker:
             if _is_send_failure(exc):
                 raise
             return []
+
+    async def _list_files_all(
+        self, artifact_id: str, dir_path: str, stage: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Every entry under *dir_path*, following the server's pagination.
+
+        `list_files` is paginated and its default page is 1000 entries, so a
+        single call is a PAGE and not a directory. A review measured what that
+        costs where a correctness decision reads the result: with more than 1000
+        markers in ``.uploads/``, everything past the first page was invisible,
+        which re-opened both round-6 consequences one threshold up -- an
+        unfinished upload past the page was not withheld (the size bypass,
+        reachable by minting 1001 names or by one large folder upload), and a
+        duplicate marker past the page survived a successful finish and had the
+        sweep delete the image.
+
+        That is the same defect as the app's own 50-entry cap, with the cap
+        imposed by the server instead, and it deserves the same sentence: a cap
+        on a read that a correctness decision depends on is not a bound, it is a
+        silent wrong answer.
+
+        **The loop stops on an EMPTY page, not on a short one.** A page shorter
+        than the limit asked for is an ordinary answer -- the server may cap the
+        limit below the ask -- so treating "shorter than requested" as "that is
+        all of them" reintroduces the incomplete read. Measured against a paging
+        double whose page is 50: an ask of 10000 came back with 50, the loop
+        ended, and the read was short again. Entries are also de-duplicated by
+        name, so a server that ignores `offset` terminates the loop with a
+        warning instead of spinning -- and the warning says the result may be
+        incomplete, because the one thing this must not do is claim a
+        completeness it cannot have.
+
+        Deliberately NOT bounded by an arbitrary maximum. A cap here would be
+        the very defect being fixed; the directory is finite, and the sweep at
+        the start of every mint keeps it near the number of uploads in flight.
+        The cost of a pathological case -- a caller that mints hundreds of
+        thousands of names -- is read volume on an authenticated, manager-only
+        route, and it is logged from the second page onwards so it is visible
+        rather than inferred.
+        """
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        offset = 0
+        page = 0
+        while True:
+            try:
+                files = await self._am.list_files(
+                    artifact_id,
+                    dir_path=dir_path,
+                    stage=stage,
+                    limit=_LIST_PAGE,
+                    offset=offset,
+                )
+            except TypeError:
+                # An artifact manager (or a test double) that does not accept
+                # limit/offset. Fall back to the single call rather than
+                # failing the route -- and say so, because this is the case
+                # where the answer may be a page rather than a directory.
+                logger.warning(
+                    f"list_files does not accept limit/offset; {dir_path} was "
+                    "read as ONE page and may be incomplete"
+                )
+                return await self._list_files_safe(artifact_id, dir_path, stage)
+            except Exception as exc:
+                if _is_send_failure(exc):
+                    raise
+                return out
+            batch = files or []
+            # STOP ONLY ON AN EMPTY PAGE, never on a page shorter than the limit
+            # that was asked for. The server is free to cap the limit below the
+            # ask -- Hypha documents a range, and a page smaller than requested
+            # is a perfectly ordinary answer -- so "shorter than I asked for"
+            # does not mean "that is all of them". Measured: with a paging
+            # double whose page is 50 and an ask of 10000, that test ended the
+            # loop after one page and the read was incomplete again, which is
+            # the very defect this method exists to fix.
+            if not batch:
+                return out
+            before = len(seen)
+            for entry in batch:
+                name = entry.get("name") if isinstance(entry, dict) else str(entry)
+                if isinstance(name, str) and name not in seen:
+                    seen.add(name)
+                    out.append(entry)
+            if len(seen) == before:
+                # A non-empty page that added nothing new: the server is
+                # ignoring `offset` and handing back the same page. Stopping is
+                # the only termination available, and it is logged as a WARNING
+                # because the answer may be incomplete -- the one thing this
+                # method must not do is claim completeness it cannot have.
+                logger.warning(
+                    f"listing {dir_path} returned a repeated page at offset "
+                    f"{offset}; stopping, and the result may be incomplete"
+                )
+                return out
+            offset += len(batch)
+            page += 1
+            logger.info(
+                f"{dir_path} has more than {offset} entries; reading page "
+                f"{page + 1}"
+            )
 
     async def _file_exists(self, artifact_id: str, file_path: str) -> bool:
         # Presigning does not check object existence, so a get_file probe can
@@ -2093,7 +2202,7 @@ class AnnotationBroker:
         filename is which object a marker authorises touching.
         """
         try:
-            entries = await self._list_files_safe(artifact_id, core.UPLOAD_MARKER_DIR)
+            entries = await self._list_files_all(artifact_id, core.UPLOAD_MARKER_DIR)
         except Exception:
             return []
         pairs = []

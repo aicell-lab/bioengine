@@ -613,16 +613,25 @@ async def test_a_SWEEP_FAILURE_does_not_cost_a_good_mint(monkeypatch):
     """
     store = _Store()
     b = _store_broker(monkeypatch, store, ceiling=64)
-    real_listing = b._list_files_safe
+    # Broken at the STORE, not at `_list_files_safe`. The sweep reads the marker
+    # directory through the paging loop, which calls `self._am.list_files`
+    # directly -- so patching `_list_files_safe` stopped observing the sweep
+    # when paging was introduced, and this test's own guard caught that by
+    # reporting that the sweep never ran rather than passing quietly.
+    real_list = store.list_files
     calls = []
 
-    async def _breaks_on_the_marker_dir(artifact_id, dir_path, stage=True):
+    async def _breaks_on_the_marker_dir(
+        artifact_id, dir_path=None, stage=True, limit=None, offset=0
+    ):
         calls.append(dir_path)
         if dir_path == core.UPLOAD_MARKER_DIR:
             raise RuntimeError("the marker listing failed")
-        return await real_listing(artifact_id, dir_path, stage=stage)
+        return await real_list(
+            artifact_id, dir_path=dir_path, stage=stage, limit=limit, offset=offset
+        )
 
-    monkeypatch.setattr(b, "_list_files_safe", _breaks_on_the_marker_dir)
+    monkeypatch.setattr(store, "list_files", _breaks_on_the_marker_dir)
 
     out = await b.upload_local_image(ARTIFACT, "scan01.png")
 
