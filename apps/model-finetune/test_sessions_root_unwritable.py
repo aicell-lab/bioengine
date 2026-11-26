@@ -17,8 +17,26 @@ Two things are pinned here:
 
 The second is the one that matters. A clearer error on a replica nobody removes
 is a better-labelled outage, not a fix.
+
+HOW THE UNWRITABLE STORE IS MODELLED, AND WHY IT IS NOT A CHMOD. The first
+version of this file made a directory mode 0o555 and asserted the write failed.
+That works for an ordinary user and does NOT work for root, which ignores the
+permission bits -- and CI runs as root. Measured: all seven tests resting on it
+failed in CI with `DID NOT RAISE`, while passing locally under an unprivileged
+uid. The file's own fixture-blocks-a-write controls are what reported it, which
+is exactly their job, but the failure mode is worth naming: a permission-based
+fixture is silently inert in the one environment that gates the merge.
+
+So the refusal is injected at the syscall boundary instead, with the errno the
+production fault actually raised -- EROFS, a read-only filesystem -- and scoped
+to paths under the fake home. That is environment-independent, and it models the
+measured fault more precisely than a mode change does. The permission-based
+arms are KEPT as additional evidence that a real filesystem refusal reaches the
+same code path, and they skip where they cannot bite rather than passing
+vacuously there.
 """
 
+import errno
 import os
 import stat
 import time
@@ -28,14 +46,61 @@ import pytest
 
 import training
 
+# CI runs as root, where a chmod cannot make a directory unwritable. The
+# permission-based arms below are skipped there rather than passing for the
+# wrong reason; the injected arms carry the behaviour in every environment.
+root_cannot_be_denied = pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason=(
+        "running as root, which ignores permission bits: a chmod-based "
+        "fixture cannot deny a write here, so this arm would pass vacuously. "
+        "The EROFS-injecting arms cover the behaviour."
+    ),
+)
+
+
+def _refuse_under(root: Path, method_name: str, monkeypatch):
+    """Make one `Path` method raise EROFS for anything under *root*.
+
+    Injected at the boundary the code under test actually calls, with the errno
+    the production fault raised, so the error the app sees is the error it saw
+    on the cluster. Scoped to *root* so the rest of the process -- pytest's own
+    tmp handling included -- is untouched.
+    """
+    real = getattr(Path, method_name)
+
+    def refusing(self, *args, **kwargs):
+        if self == root or root in self.parents:
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method_name, refusing)
+
 
 @pytest.fixture()
 def unwritable_home(tmp_path, monkeypatch):
-    """A home directory that cannot be written into.
+    """A home directory that exists, can be listed, and refuses a `mkdir`.
 
-    Mode 0o555 is read+execute: the directory can be listed and traversed, so
-    this is the real shape of the failure -- a readable path that refuses a
-    `mkdir` -- rather than a path that simply does not exist.
+    That is the real shape of the failure -- a readable path the store cannot be
+    created under -- rather than a path that simply does not exist. The refusal
+    is EROFS, injected at `Path.mkdir`: the same errno the production replica's
+    read-only home raised, and the only way to get it in an environment that may
+    be running as root. See the module docstring.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    _refuse_under(home, "mkdir", monkeypatch)
+    return home
+
+
+@pytest.fixture()
+def unwritable_home_by_permission(tmp_path, monkeypatch):
+    """The same condition produced by a real permission bit, not an injection.
+
+    Kept so that something asserts a genuine filesystem refusal reaches the same
+    code path. Only meaningful for an unprivileged uid, hence
+    `root_cannot_be_denied` on every test that uses it.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -55,11 +120,28 @@ def writable_home(tmp_path, monkeypatch):
 
 
 def test_the_fixture_really_blocks_a_write(unwritable_home):
-    """THE CONTROL FOR THE FILE. If the directory is writable after all -- which
-    is what happens when these run as root -- every assertion below passes for
-    the wrong reason, so the inability to write is asserted directly first."""
-    with pytest.raises(OSError):
+    """THE CONTROL FOR THE FILE. If the store can be created after all, every
+    assertion below passes for the wrong reason, so the refusal is asserted
+    directly first -- and by errno, not merely as "some OSError", so that the
+    fault being modelled is the measured one and not an unrelated failure."""
+    with pytest.raises(OSError) as exc:
         (unwritable_home / "probe").mkdir()
+    assert exc.value.errno == errno.EROFS, exc.value
+
+
+@root_cannot_be_denied
+def test_a_REAL_permission_bit_also_blocks_the_store(unwritable_home_by_permission):
+    """And the injection is not the only thing that produces this.
+
+    This is the arm that would be vacuous as root; it is skipped there instead.
+    Its errno is EACCES rather than EROFS -- a different refusal reaching the
+    same handler, which is the point of keeping it.
+    """
+    with pytest.raises(OSError) as exc:
+        (unwritable_home_by_permission / "probe").mkdir()
+    assert exc.value.errno == errno.EACCES, exc.value
+    with pytest.raises(training.SessionsRootUnavailable):
+        training.sessions_root()
 
 
 def test_an_unwritable_root_raises_a_NAMED_error(unwritable_home):
@@ -186,6 +268,26 @@ def read_only_existing_store(tmp_path, monkeypatch):
     home = tmp_path / "home"
     store = home / ".bioengine" / "micro_sam_sessions"
     store.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    # `mkdir` is deliberately NOT refused: the whole point of this fixture is a
+    # store that CAN be "created" -- `mkdir(exist_ok=True)` succeeds on it --
+    # and refuses every write. Refusing mkdir too would collapse it into the
+    # fixture above and the gap would stop being modelled.
+    _refuse_under(store, "write_text", monkeypatch)
+    _refuse_under(store, "open", monkeypatch)
+    return store
+
+
+@pytest.fixture()
+def read_only_store_by_permission(tmp_path, monkeypatch):
+    """The write-refusing store produced by a real permission bit.
+
+    The counterpart of `unwritable_home_by_permission`, and skipped as root for
+    the same reason.
+    """
+    home = tmp_path / "home"
+    store = home / ".bioengine" / "micro_sam_sessions"
+    store.mkdir(parents=True)
     os.chmod(store, stat.S_IRUSR | stat.S_IXUSR)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
     yield store
@@ -193,10 +295,29 @@ def read_only_existing_store(tmp_path, monkeypatch):
 
 
 def test_the_read_only_store_fixture_really_blocks_a_write(read_only_existing_store):
-    """THE CONTROL. As root the chmod does not bite and everything below would
-    pass for the wrong reason, so the refusal is asserted directly first."""
-    with pytest.raises(OSError):
+    """THE CONTROL. If the store accepts a write after all, everything below
+    passes for the wrong reason, so the refusal is asserted directly first."""
+    with pytest.raises(OSError) as exc:
         (read_only_existing_store / "probe").write_text("x")
+    assert exc.value.errno == errno.EROFS, exc.value
+
+
+@root_cannot_be_denied
+def test_a_REAL_read_only_store_is_also_refused_by_the_probe(
+    read_only_store_by_permission,
+):
+    """A genuine filesystem refusal reaching the writability probe.
+
+    Vacuous as root, so skipped there; the EROFS-injecting arm above carries the
+    behaviour everywhere.
+    """
+    with pytest.raises(OSError) as exc:
+        (read_only_store_by_permission / "probe").write_text("x")
+    assert exc.value.errno == errno.EACCES, exc.value
+    # Creating it still succeeds -- that is the gap -- and the probe still refuses.
+    assert training.sessions_root() == read_only_store_by_permission
+    with pytest.raises(training.SessionsRootUnavailable, match="refuses writes"):
+        training.assert_sessions_root_writable()
 
 
 def test_CREATING_the_store_SUCCEEDS_even_though_it_refuses_writes(

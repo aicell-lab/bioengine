@@ -273,8 +273,15 @@ def _sessions_root_calls(module_file: str) -> dict:
 SESSIONS_ROOT_CALLS = {
     # builds every session path, and validates the id before it does
     "session_dir": 1,
-    # iterates the root to list what is there
-    "list_sessions": 1,
+    # iterates the root to list what is there. CHANGED DELIBERATELY: this used
+    # to be `list_sessions`, which walked the root itself. The co-manager
+    # listing needs the records and the dataset ids from ONE walk -- asking
+    # separately read every record three times over, 783 reads for the 261 runs
+    # on the production store -- so the walk moved into this single helper and
+    # `list_sessions` now delegates to it. The guard is unchanged in strength:
+    # still three scopes, still one call each, and `list_sessions` reaching the
+    # root again would now be a FOURTH entry and go red.
+    "run_names_on_disk": 1,
     # probes that the root accepts a WRITE. It has to read the root to write
     # in it, and it deliberately does not build a session path: a health check
     # that created a session directory would be a side effect on every probe.
@@ -297,58 +304,87 @@ def test_no_path_helper_bypasses_the_chokepoint():
     )
 
 
-_ALLOWED_MODULE = (
-    "def sessions_root():\n    pass\n"
-    "def session_dir(sid):\n    root = sessions_root()\n"
-    "def list_sessions(ctx):\n    root = sessions_root()\n"
-    "def assert_sessions_root_writable():\n    root = sessions_root()\n"
-)
+#: The body of each permitted function in the fake module. Parameterised, so a
+#: control can put an extra call INSIDE one of them -- which is the case round 4
+#: was about and round 5 found untested: my earlier controls added a NEW
+#: function, and a new function is caught by a set of names just as well, so
+#: they could not tell a per-function COUNT from a set.
+#: The synthetic module the controls build. It has to name the SAME scopes as
+#: `SESSIONS_ROOT_CALLS`, or "a module with exactly the allowed callers passes"
+#: is a claim about a module the guard does not actually allow. `list_sessions`
+#: became `run_names_on_disk` when the root walk moved into that single helper;
+#: see the constant for why.
+_ALLOWED_BODIES = {
+    "session_dir": "    root = sessions_root()\n",
+    "run_names_on_disk": "    root = sessions_root()\n",
+    "assert_sessions_root_writable": "    root = sessions_root()\n",
+}
 
 
-def _point_guard_at(tmp_path, monkeypatch, name, extra=""):
-    """Write a fake module with exactly the allowed callers, plus *extra*."""
+def _module_source(bodies=None, extra=""):
+    merged = {**_ALLOWED_BODIES, **(bodies or {})}
+    src = "def sessions_root():\n    pass\n"
+    for name, body in merged.items():
+        src += f"def {name}(*a, **k):\n{body}"
+    return src + extra
+
+
+def _point_guard_at(tmp_path, monkeypatch, name, bodies=None, extra=""):
+    """Write a fake module with the permitted functions, optionally altered."""
     fake = tmp_path / name
-    fake.write_text(_ALLOWED_MODULE + extra)
+    fake.write_text(_module_source(bodies, extra))
     monkeypatch.setattr(training, "__file__", str(fake))
     return fake
 
 
 @pytest.mark.parametrize(
-    "label, extra",
+    "label, bodies, extra",
     [
-        # main's own control used exactly this shape, at MODULE level. My first
-        # AST rewrite moved it inside a function, so the control stopped
-        # testing the case it existed for. It is back where it belongs.
-        ("a module-level call", 'sneaky = sessions_root() / "x"\n'),
-        # Neither module nor function scope, and also missed by the set.
-        ("a class-body call", "class C:\n    ROOT = sessions_root()\n"),
-        # THE one a set of names cannot see: a SECOND, unvalidated use in an
-        # already-allowed function. main's exact line count caught it.
+        # THE case a set of names cannot see, and now it really is inside an
+        # allowed function: `list_sessions` reaching the root TWICE. Round 5
+        # proved the old version of this control was satisfied by a set,
+        # because it added a function called `list_sessions_extra` instead.
         (
-            "a second call in a permitted function",
-            "def list_sessions_extra(ctx):\n    return sessions_root() / ctx\n",
+            "a SECOND call inside run_names_on_disk itself",
+            {
+                "run_names_on_disk": (
+                    "    root = sessions_root()\n"
+                    "    leak = sessions_root() / 'x'\n"
+                    "    return root, leak\n"
+                )
+            },
+            "",
         ),
-        # An unlisted function, which every version of the guard caught.
+        # A closure nested inside an allowed function. Attributed to ITSELF,
+        # so this tests the nesting rule rather than the count -- labelled for
+        # what it measures, which the previous label overstated.
+        (
+            "a closure nested inside session_dir, attributed to itself",
+            {
+                "session_dir": (
+                    "    def inner():\n"
+                    "        return sessions_root()\n"
+                    "    return inner()\n"
+                )
+            },
+            "",
+        ),
+        # main's own control used exactly this shape, at MODULE level.
+        ("a module-level call", None, 'sneaky = sessions_root() / "x"\n'),
+        ("a class-body call", None, "class C:\n    ROOT = sessions_root()\n"),
         (
             "an unlisted function",
+            None,
             "def sneaky(sid):\n    return sessions_root() / sid\n",
-        ),
-        # A closure is attributed to itself, so it reads as an unlisted scope
-        # rather than as a second use of its parent.
-        (
-            "a closure inside a permitted function",
-            "def session_dir_helper():\n"
-            "    def inner():\n        return sessions_root()\n"
-            "    return inner\n",
         ),
     ],
 )
-def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch, label, extra):
+def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch, label, bodies, extra):
     """The controls for the structural test above, which reads a file and so
-    can silently measure the wrong thing. Each shape must make it complain,
-    and three of these were MISSED by the set-of-names version I briefly
-    replaced main's line count with."""
-    _point_guard_at(tmp_path, monkeypatch, "fake_training.py", extra)
+    can silently measure the wrong thing -- as two of these did until round 5
+    of the review mutated the assertion back to a set of names and watched
+    every one of them still pass."""
+    _point_guard_at(tmp_path, monkeypatch, "fake_training.py", bodies, extra)
     with pytest.raises(AssertionError):
         test_no_path_helper_bypasses_the_chokepoint()
 
@@ -373,7 +409,7 @@ def test_a_DOCSTRING_mentioning_the_function_is_not_a_call_site(tmp_path, monkey
         'Calling sessions_root() is the subject of this sentence.\n"""\n'
         "def sessions_root():\n    pass\n"
         "def session_dir(sid):\n    root = sessions_root()\n"
-        "def list_sessions(ctx):\n    root = sessions_root()\n"
+        "def run_names_on_disk():\n    root = sessions_root()\n"
         "def assert_sessions_root_writable():\n"
         '    """Mentions sessions_root() in its own docstring too."""\n'
         "    root = sessions_root()\n"
