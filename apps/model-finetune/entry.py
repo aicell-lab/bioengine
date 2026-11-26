@@ -3050,6 +3050,24 @@ class EntryApp:
         # Committed ONCE, and after every upload has been awaited. A commit
         # taken while uploads were still in flight would publish a version the
         # read-back below then compares against an incomplete set.
+        # WHAT THIS RETRY DOES AND DOES NOT COVER, because a review found the
+        # comment claiming more than the code delivers.
+        #
+        # It retries the commit ALONE, so it covers a TRANSIENT commit failure
+        # and nothing else. It cannot win the race named in
+        # `_persist_run_record`'s docstring: there, another writer's commit
+        # clears the ARTIFACT-LEVEL stage flag, and that flag stays cleared
+        # until somebody re-stages -- so a second `commit` fails for exactly
+        # the reason the first did. The per-record path survives that race
+        # because its retry repeats `edit(stage=True)` as well.
+        #
+        # Re-staging here would mean calling `edit(stage=True)` AFTER the
+        # uploads, and whether that preserves or discards a staged upload is
+        # NOT measured -- every other caller stages before uploading, so
+        # nothing in this file establishes it. Doing it on an assumption could
+        # throw away the whole upload phase to save a commit. So the narrow
+        # retry stays, and the behaviour under a cleared flag is: fail closed,
+        # record `commit_error`, and still report (there is an arm for it).
         commit_error = None
         if stage_error is None:
             commit_error = await _retrying(
@@ -3140,6 +3158,20 @@ class EntryApp:
         # serves hashes to what the plan said it would. Dropping the last term
         # is what let a record land with the wrong content and still be called
         # complete.
+        # "NOT LANDED" AND "LANDED, BUT NOT BY OUR COMMIT" ARE DIFFERENT, and a
+        # report that cannot distinguish them invites the wrong repair. When
+        # another writer's commit publishes this replica's staged uploads and
+        # clears the flag under it, the commit here fails while the artifact
+        # verifiably holds every planned record. `complete` stays False --
+        # this replica did not establish that state and should not claim it --
+        # but a caller seeing only False would re-run, and re-uploading 313
+        # records to fix nothing is the cost of not saying so.
+        plan["records_present_despite_commit_error"] = bool(
+            (stage_error or commit_error)
+            and verify_error is None
+            and not plan["mismatched"]
+            and set(plan["ids"]) <= set(verified)
+        )
         plan["complete"] = (
             not failed
             and set(written) == set(plan["ids"])

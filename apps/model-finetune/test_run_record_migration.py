@@ -91,6 +91,15 @@ class FakeAM:
         #: fail in production; the backfill must report rather than raise.
         self.fail_edits = 0
         self.fail_commits = 0
+        #: Whether the artifact is staged. Defaults True so the existing arms
+        #: are undisturbed; it only bites with `sticky_unstage` below.
+        self.staged = True
+        #: Model the REAL race: another writer's commit clears the
+        #: artifact-level stage flag and it STAYS cleared until someone
+        #: re-stages. A commit-only retry therefore fails again for exactly
+        #: the reason the first attempt did -- which `fail_commits` (raise
+        #: once, then succeed) does NOT model.
+        self.sticky_unstage = False
         #: Uploads in flight, and the high-water mark, so a test can assert
         #: the concurrency BOUND rather than hoping.
         self.in_flight = 0
@@ -104,15 +113,22 @@ class FakeAM:
         if self.fail_edits > 0:
             self.fail_edits -= 1
             raise RuntimeError("artifact is not in staging mode")
+        self.staged = True
 
     async def put_file(self, artifact_id=None, file_path=None, **kw):
         return f"https://upload.example/{file_path}"
 
     async def commit(self, artifact_id=None, **kw):
         self.commits += 1
+        if self.sticky_unstage:
+            # Another writer published and cleared the flag. It stays cleared.
+            self.staged = False
+        if not self.staged:
+            raise RuntimeError("artifact is not in staging mode")
         if self.fail_commits > 0:
             self.fail_commits -= 1
-            raise RuntimeError("artifact is not in staging mode")
+            raise RuntimeError("transient commit failure")
+        self.staged = False
 
     async def list_files(
         self, artifact_id=None, dir_path=None, limit=1000, offset=0, **kw
@@ -668,7 +684,11 @@ def test_a_commit_that_KEEPS_failing_RETURNS_A_REPORT_rather_than_raising(store)
 
     assert plan["complete"] is False, plan
     assert plan["commit_error"], "the commit failure was not recorded"
-    assert "staging" in plan["commit_error"], plan["commit_error"]
+    # A TRANSIENT failure, which is what `fail_commits` models and the only thing a
+    # commit-only retry can cover. The stage-flag race is a different mode with its
+    # own arm below, and conflating them is what made the earlier comment overstate
+    # what this retry does.
+    assert "transient" in plan["commit_error"], plan["commit_error"]
     # the read-back still ran, so the caller gets a verdict and not a silence
     assert "verified" in plan and "mismatched" in plan, plan
 
@@ -726,3 +746,57 @@ def test_nothing_is_recorded_as_pushed_when_the_commit_FAILED(store):
 
     assert plan["complete"] is False, plan
     assert inst._runs_pushed == {}, inst._runs_pushed
+
+
+def test_a_STICKY_cleared_stage_flag_fails_CLOSED_and_says_the_records_are_there(store):
+    """The race the retry CANNOT win, modelled the way the flag actually behaves.
+
+    `fail_commits` raises once and then succeeds, which no cleared stage flag does:
+    the flag stays cleared until someone re-stages, so a commit-only retry fails
+    again for exactly the reason the first attempt did. A review pointed out that the
+    "loses the race once" arm above therefore only proves the retry handles a
+    TRANSIENT error -- this one pins the real case.
+
+    Required behaviour: fail closed, report rather than raise, and tell the caller the
+    records are nonetheless present -- because another writer's commit published this
+    replica's staged uploads. Without that last part a caller sees `complete: False`
+    and re-runs, re-uploading every record to fix nothing.
+    """
+    ids = []
+    for i in range(1, 7):
+        sid = f"2026-01-01-0000{i:02d}-5555555{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    am.sticky_unstage = True
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="6")  # must NOT raise
+
+    assert plan["complete"] is False, plan
+    assert plan["commit_error"], "the cleared flag was not recorded"
+    assert "staging" in plan["commit_error"], plan["commit_error"]
+    # the retry could not win it, and the count says so rather than the comment
+    assert am.commits == 2, f"commits={am.commits}"
+    assert am.edits == 1, f"the commit retry re-staged; edits={am.edits}"
+    # and the records ARE in the artifact, which the report must say
+    assert plan["verified"] == 6, plan
+    assert plan["mismatched"] == [], plan
+    assert plan["records_present_despite_commit_error"] is True, plan
+
+
+def test_a_CLEAN_run_does_not_claim_records_present_despite_a_commit_error(store):
+    """THE CONTROL: the new field must not be true when nothing went wrong.
+
+    A field that is always true carries no information, and this one exists precisely
+    to distinguish two outcomes.
+    """
+    for i in range(1, 4):
+        store(f"2026-01-01-0000{i:02d}-6666666{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    assert plan["complete"] is True, plan
+    assert plan["records_present_despite_commit_error"] is False, plan
