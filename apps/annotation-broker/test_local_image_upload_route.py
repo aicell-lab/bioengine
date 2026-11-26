@@ -149,7 +149,11 @@ def _open_mint(b, path="images/scan01.png", *, ttl_s=core.UPLOAD_MARKER_TTL_S):
     other collaborator in this fixture.
     """
     mint_id = core.new_mint_id()
-    b._tstate["markers"][core.upload_marker_path(mint_id)] = (
+    # Keyed by the OBJECT PATH, as the app keys it: the marker filename is the
+    # digest of the path and the mint id lives in the document. Keying this
+    # fixture by the mint id instead would record a marker the finish cannot
+    # find, which is a fixture that tests nothing.
+    b._tstate["markers"][core.upload_marker_path_for_object(path)] = (
         core.upload_marker_document(
             path=path,
             mint_id=mint_id,

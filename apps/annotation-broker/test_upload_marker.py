@@ -36,8 +36,10 @@ marker, and a finish for an image that was already there.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import pathlib
+import re
 import time
 
 import pytest
@@ -50,34 +52,63 @@ from test_local_image_upload_route import ARTIFACT
 # ── the pure parts ─────────────────────────────────────────────────────────
 
 
-def test_a_marker_path_is_built_only_from_a_VALID_mint_id():
-    mint_id = core.new_mint_id()
-    assert core.upload_marker_path(mint_id) == f".uploads/{mint_id}.json"
+def test_a_marker_path_is_the_DIGEST_of_its_object_path():
+    """One path, one marker file, and the name is computable from the path.
+
+    That is the mechanism the round-10 review asked for: the finish can find
+    its record without listing a paginated directory, and a re-mint overwrites
+    one file instead of leaving a second for a scan to find.
+    """
+    expected = hashlib.sha256(b"images/scan01.png").hexdigest()
+    assert (
+        core.upload_marker_path_for_object("images/scan01.png")
+        == f".uploads/{expected}.json"
+    )
+    # Deterministic for one path, and different for different paths -- without
+    # both, a constant filename would satisfy the line above.
+    assert core.upload_marker_path_for_object(
+        "images/scan01.png"
+    ) == core.upload_marker_path_for_object("images/scan01.png")
+    assert core.upload_marker_path_for_object(
+        "images/scan01.png"
+    ) != core.upload_marker_path_for_object("images/scan02.png")
 
 
 @pytest.mark.parametrize(
-    "bad",
+    "hostile",
     [
-        "",
-        None,
-        12345,
-        "../images/scan01.png",
-        "..%2Fimages",
-        "a/b",
-        "/abs",
-        "ABCDEF01234567890123456789012345",  # uppercase hex
-        "0123456789abcdef",  # too short
-        core.new_mint_id() + "0",  # too long
-        core.new_mint_id() + "/../x",
-        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",  # right length, not hex
+        "../../etc/passwd",
+        "images/../../etc/passwd",
+        "/abs/path.png",
+        "images/..%2F..%2Fx.png",
+        "images/a\nb.png",
+        "images/" + "x" * 500 + ".png",
+        "images/\x00.png",
     ],
 )
-def test_a_mint_id_THAT_COULD_NAME_A_PATH_yields_NO_marker_path(bad):
-    """The mint id becomes a filename, so an id that could express a separator
-    or a parent reference would aim the marker read -- and therefore the discard
-    decision -- at a path of the caller's choosing. None here means the route
-    refuses, which is the same answer it gives for an unknown id."""
-    assert core.upload_marker_path(bad) is None
+def test_a_PATH_THAT_COULD_ESCAPE_still_yields_a_name_INSIDE_the_marker_dir(hostile):
+    """Hashing is what makes the filename unable to express a path at all.
+
+    The mint-id keying needed a charset rule -- hex only, fixed length -- because
+    the caller-influenced id went into the filename verbatim. A digest has no
+    such exposure: every byte of the input maps to 64 hex characters, so a path
+    holding a separator, a parent reference, a newline or a NUL cannot reach the
+    name. These inputs cannot occur (the route builds `images/<stem><ext>` from
+    a validated filename), which is the point: the property must not depend on
+    that validation still being there.
+    """
+    got = core.upload_marker_path_for_object(hostile)
+    assert got.startswith(f"{core.UPLOAD_MARKER_DIR}/"), got
+    tail = got[len(core.UPLOAD_MARKER_DIR) + 1 :]
+    assert re.fullmatch(r"[0-9a-f]{64}\.json", tail), tail
+
+
+@pytest.mark.parametrize("bad", ["", None, 12345, b"images/x.png", ["images/x.png"]])
+def test_a_NON_PATH_yields_NO_marker_path(bad):
+    """None rather than a raise, and never a filename built from a non-string:
+    the route's answer to a path it cannot key is the same refusal it gives for
+    a path with no marker."""
+    assert core.upload_marker_path_for_object(bad) is None
 
 
 def test_a_marker_records_the_path_the_ceiling_and_an_ABSOLUTE_expiry():
@@ -124,7 +155,7 @@ def test_the_EXPIRY_is_judged_against_the_markers_OWN_recorded_instant():
 MARKER_FUNCTIONS = frozenset(
     {
         "new_mint_id",
-        "upload_marker_path",
+        "upload_marker_path_for_object",
         "upload_marker_document",
         "parse_upload_marker",
         "upload_marker_is_expired",
@@ -477,7 +508,7 @@ async def test_ARM3b_an_EXPIRED_marker_is_no_marker(monkeypatch):
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
     store.put(mint["put_url"], _png(65))
 
-    marker_path = core.upload_marker_path(mint["mint_id"])
+    marker_path = core.upload_marker_path_for_object("images/scan01.png")
     aged = core.upload_marker_document(
         path="images/scan01.png",
         mint_id=mint["mint_id"],
@@ -548,7 +579,7 @@ async def test_the_marker_lives_OUTSIDE_images_and_is_NEVER_listed_as_one(
     b = _store_broker(monkeypatch, store, ceiling=64)
 
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
-    marker_path = core.upload_marker_path(mint["mint_id"])
+    marker_path = core.upload_marker_path_for_object("images/scan01.png")
     assert marker_path in store.objects, sorted(store.objects)
     assert not marker_path.startswith("images/"), marker_path
 
@@ -640,7 +671,7 @@ async def test_a_SWEEP_FAILURE_does_not_cost_a_good_mint(monkeypatch):
     ), f"the sweep never ran, so this proves nothing: {calls}"
     assert out["already"] is False and out["mint_id"], out
     assert out["put_url"].endswith("images/scan01.png"), out
-    assert core.upload_marker_path(out["mint_id"]) in store.objects
+    assert core.upload_marker_path_for_object("images/scan01.png") in store.objects
 
 
 @pytest.mark.asyncio
@@ -657,7 +688,7 @@ async def test_the_SWEEP_really_removes_an_expired_marker_through_the_route(
     b = _store_broker(monkeypatch, store, ceiling=64)
 
     stale_id = core.new_mint_id()
-    stale_path = core.upload_marker_path(stale_id)
+    stale_path = core.upload_marker_path_for_object("images/abandoned.png")
     store.objects[stale_path] = json.dumps(
         core.upload_marker_document(
             path="images/abandoned.png",
@@ -669,7 +700,8 @@ async def test_the_SWEEP_really_removes_an_expired_marker_through_the_route(
 
     fresh = await b.upload_local_image(ARTIFACT, "scan01.png")
 
+    assert fresh["already"] is False, fresh
     assert stale_path in store.removed, store.removed
     assert stale_path not in store.objects
     # The live marker this very call minted is NOT swept.
-    assert core.upload_marker_path(fresh["mint_id"]) in store.objects
+    assert core.upload_marker_path_for_object("images/scan01.png") in store.objects

@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -1508,11 +1509,11 @@ UPLOAD_MARKER_SWEEP_LIMIT = 50
 # client whose PUT lands just before expiry can still finish.
 UPLOAD_URL_TTL_S = 300
 
-# Hex only, fixed length. A mint id becomes a FILENAME, so an id that could
-# contain `/` or `..` would let a caller aim the marker read -- and therefore
-# the discard decision -- at a path of their choosing. A charset that cannot
-# express a path separator or a parent reference makes that impossible here,
-# rather than leaving it to a check somewhere else that could be moved.
+# Hex only, fixed length. A mint id is compared against the one in a stored
+# marker document, and a fixed charset keeps that comparison a comparison: an
+# id that could contain `/` or `..` must never be usable to aim anything, here
+# or in any future caller, so the shape is refused at the edge rather than
+# trusted because today's lookup happens not to use it as a filename.
 MINT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -1521,18 +1522,51 @@ def new_mint_id() -> str:
     return uuid.uuid4().hex
 
 
-def upload_marker_path(mint_id: Any) -> Optional[str]:
-    """``.uploads/<mint_id>.json``, or None if that is not a valid mint id.
+def upload_marker_path_for_object(object_path: Any) -> Optional[str]:
+    """``.uploads/<sha256(object_path)>.json``, or None if that is not a path.
 
-    None rather than a raise, because a mint id arrives from the network and the
-    route's answer to a malformed one is the same refusal it gives for one that
-    is well-formed but unknown: no marker, nothing touched. Building a path only
-    from a validated id is what keeps every marker read inside
-    :data:`UPLOAD_MARKER_DIR`.
+    **The marker is keyed by the OBJECT PATH, and it used to be keyed by the
+    mint id.** That is not a naming preference; it is what makes "one path, one
+    marker" a property of the store rather than something a scan has to
+    establish. A review measured what the mint-id keying cost, over four rounds:
+    two mints for one path left two marker files, so the finish had to find the
+    others by LISTING ``.uploads/`` and consuming every marker for its path --
+    and that listing is paginated, so every bound on it was a cap that decided
+    correctness. A short read let a duplicate marker survive, which withheld the
+    committed image and then had the sweep delete it; a bound tight enough to
+    terminate against a server that ignores ``offset`` refused valid uploads
+    once a few staged removals sat in the directory. With the path as the key
+    the second marker cannot exist: a re-mint OVERWRITES the one file, and the
+    finish reads and removes exactly that file, found by name, with no listing
+    in the path at all.
+
+    **The filename confers nothing.** Authorisation is unchanged and still comes
+    from the document -- it must name this exact path AND this exact mint id and
+    be unexpired (:func:`marker_authorises_discard`) -- so the hash is a lookup
+    key, not a credential. That is what answers the obvious objection to putting
+    the path in the name: a caller who can compute the digest of a path learns
+    nothing and gains nothing, because knowing which file to read is not
+    permission to use it. Hashing also means no caller-supplied character
+    reaches the filename, so the old mint-id charset rule is not weakened by
+    this: a path can hold ``/`` or ``..`` and its digest cannot.
+
+    **What a lost mint answer now gets, said plainly:** a fresh mint for the
+    same path replaces the marker, so a finish presenting the EARLIER mint id is
+    refused -- the mint id in the document no longer matches. That is correct
+    rather than unfortunate: the superseded URL and the live one write the same
+    key, so the bytes a stale finish would publish are whichever PUT landed
+    last, and nothing in the request says which. The refusal touches nothing,
+    the path stays withheld because the marker is still there, and a retry with
+    ``done=false`` mints again. Under the mint-id keying either id could finish,
+    which is exactly how two markers for one path arose.
+
+    None rather than a raise, for the reason the mint-id version gave: a path
+    this cannot key is answered by the same refusal as a path with no marker.
     """
-    if not isinstance(mint_id, str) or not MINT_ID_RE.match(mint_id):
+    if not isinstance(object_path, str) or not object_path:
         return None
-    return f"{UPLOAD_MARKER_DIR}/{mint_id}.json"
+    digest = hashlib.sha256(object_path.encode("utf-8")).hexdigest()
+    return f"{UPLOAD_MARKER_DIR}/{digest}.json"
 
 
 def upload_marker_document(
@@ -1734,9 +1768,14 @@ def withheld_upload_paths(markers: Any) -> frozenset:
     it already exists" can no longer both be true for the same path.
 
     An unparseable marker withholds nothing: it names no path. A successful
-    finish removes EVERY marker for its path before committing, so a completed
+    finish removes THE marker for its path before committing, so a completed
     image is never withheld -- that is what makes this safe, and it is why the
-    finish must fail closed if any of those removals fails.
+    finish must fail closed if that removal fails. **"The" marker, singular, is
+    a property of the keying**: a marker's filename is the digest of its object
+    path, so a re-mint overwrites the one file rather than adding a second.
+    Before that, a finish had to find the duplicates by listing this directory,
+    and a listing it could not read in full left one open -- which withheld the
+    image it had just committed and then had the sweep delete it.
     """
     out = set()
     for item in markers or []:
@@ -1750,32 +1789,20 @@ def withheld_upload_paths(markers: Any) -> frozenset:
     return frozenset(out)
 
 
-def markers_for_path(markers: Any, *, path: str) -> List[str]:
-    """Marker paths recorded for the object at *path*, however many there are.
-
-    There can be more than one, which is the whole reason this exists. A review
-    measured two ordinary routes to it: a client whose first mint answer was
-    lost asks again and gets a second marker, and two browser tabs uploading the
-    same filename do the same. A finish that consumed only ITS OWN marker left
-    the other one open -- so the completed image was withheld immediately and
-    then deleted by the sweep, which is data loss reached through housekeeping.
-
-    An unparseable document is not returned: it names no path, so nothing can
-    say it belongs to this one.
-    """
-    out: List[str] = []
-    for item in markers or []:
-        if not isinstance(item, (tuple, list)) or len(item) != 2:
-            continue
-        marker_path, doc = item
-        if not isinstance(marker_path, str) or not marker_path:
-            continue
-        parsed = parse_upload_marker(doc)
-        if parsed is None:
-            continue
-        if parsed["path"] == path:
-            out.append(marker_path)
-    return out
+# `markers_for_path` USED TO BE HERE, and its removal is the point of the
+# path-keyed marker rather than a tidy-up. It answered "which marker files
+# record an upload of this object?", a question only a LISTING of `.uploads/`
+# can answer -- and the finish asked it, so the finish's correctness depended on
+# reading a paginated directory in full. Four review rounds went on that: a
+# short read left a duplicate marker, which withheld the committed image and had
+# the sweep delete it; a bound tight enough to terminate against a server that
+# ignores `offset` refused valid uploads once staged removals sat in the
+# directory. Keying the marker by its object path removes the question instead
+# of bounding the answer: there is one marker per path, its name is computable
+# from the path, and :func:`upload_marker_path_for_object` finds it without a
+# listing. The listing survives only in the two HOUSEKEEPING readers -- the
+# withholding, which is fail-open, and the sweep, which is best-effort -- where
+# reading less per call costs a later pass rather than a wrong answer.
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

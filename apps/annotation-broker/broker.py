@@ -2176,31 +2176,43 @@ class AnnotationBroker:
         then be unauthorised litter that nothing is allowed to clean up. Better
         to refuse the mint and let the client ask again.
         """
-        path = core.upload_marker_path(marker["mint_id"])
-        if path is None:  # unreachable via new_mint_id; a guard, not a branch
-            raise ValueError("refusing to write a marker for an invalid mint id")
-        await self._write_json_file(artifact_id, path, marker)
+        marker_path = core.upload_marker_path_for_object(marker["path"])
+        if marker_path is None:  # unreachable: the route built `path` itself
+            raise ValueError("refusing to write a marker for an invalid path")
+        # OVERWRITES any marker already recorded for this path, and that is the
+        # mechanism rather than a side effect: a re-mint of the same object --
+        # a client whose first answer was lost, a second browser tab -- replaces
+        # the one record instead of adding a second one that the finish would
+        # then have to find by listing. The new mint id is what the finish
+        # checks, so the superseded URL stops being dischargeable at the same
+        # moment it stops being the live one.
+        await self._write_json_file(artifact_id, marker_path, marker)
 
-    async def _read_upload_marker(self, artifact_id: str, mint_id: Any) -> Any:
-        """The stored marker document for *mint_id*, or None.
+    async def _read_upload_marker(self, artifact_id: str, object_path: Any) -> Any:
+        """The stored marker document for the object at *object_path*, or None.
 
-        None covers every way the marker can fail to be usable -- a malformed
-        mint id, no such marker, a transport hiccup reading it -- because the
+        Keyed by the OBJECT PATH, not by the mint id: the mint id is what the
+        document is checked AGAINST (`marker_authorises_discard`), not how the
+        document is found. That is what lets the finish read one file by name
+        instead of listing `.uploads/` to discover how many records exist.
+
+        None covers every way the marker can fail to be usable -- an unkeyable
+        path, no such marker, a transport hiccup reading it -- because the
         route's response to all of them is identical: refuse, touch nothing.
         """
-        path = core.upload_marker_path(mint_id)
-        if path is None:
+        marker_path = core.upload_marker_path_for_object(object_path)
+        if marker_path is None:
             return None
-        return await self._read_json_file(artifact_id, path, None)
+        return await self._read_json_file(artifact_id, marker_path, None)
 
-    async def _remove_upload_marker(self, artifact_id: str, mint_id: str) -> bool:
-        """Consume a marker. Never raises, for the reasons in the discard.
+    async def _remove_upload_marker(self, artifact_id: str, object_path: Any) -> bool:
+        """Consume the marker for *object_path*. Never raises; see the discard.
 
         The local is `marker_path`, not `path`, deliberately: `path` in this
         module means the IMAGE path, and the two removals must not be confusable
         -- by a reader or by a textual mutation aimed at one of them.
         """
-        marker_path = core.upload_marker_path(mint_id)
+        marker_path = core.upload_marker_path_for_object(object_path)
         if marker_path is None:
             return False
         return await self._remove_marker_file(artifact_id, marker_path)
@@ -2241,51 +2253,48 @@ class AnnotationBroker:
     async def _marker_pairs(self, artifact_id: str) -> tuple:
         """``(pairs, complete)`` where pairs is ``(marker_path, document)``.
 
-        `complete` is False when the listing could not be read in full. It is
-        carried rather than dropped because its two callers need OPPOSITE
-        things from it: the withholding may answer on a partial read and stay
-        fail-open, while the finish must refuse, since a marker it did not see
-        is a marker it cannot consume -- and an unconsumed duplicate marker has
-        the sweep delete a committed image.
+        **NO CORRECTNESS DECISION READS THIS ANY MORE, and that is the point of
+        the path-keyed marker.** Both remaining callers are housekeeping:
 
-        **Uncapped, and it used to be capped at the sweep's limit of 50.** A
-        review measured what that cost, twice over, because two correctness
-        decisions read this list:
+        * the WITHHOLDING, which is fail-open by design -- an
+          unreadable ``.uploads/`` must not present the dataset as having no
+          images -- so a short read leaves "an abandoned upload is listed until
+          the next mint sweeps it", and it logs that;
+        * the SWEEP, which is best-effort, because less housekeeping this pass
+          costs a later pass rather than a wrong answer.
 
-        * the finish consumed the markers for its path out of it, so a marker
-          past the 50th listing entry -- *including the finishing upload's own*
-          -- was never seen, never removed, and the fail-closed check never
-          noticed. A folder upload that mints 60 names before PUTting anything
-          then lost the finished image to the sweep;
-        * the withholding is computed from it, so with more than 50 markers in
-          flight an unfinished upload past the cap was a dataset image again --
-          the size bypass, reachable by minting 51 names.
+        The FINISH used to be the third caller, and it was the one that could
+        not tolerate a short read: a duplicate marker it did not see stayed
+        open, withheld the image it had just committed, and then had the sweep
+        delete it. Four review rounds tried to bound this read safely and the
+        bound was wrong in both directions -- a cap short enough to terminate
+        against a server that ignores ``offset`` refused valid uploads once
+        staged removals sat in the directory, and one loose enough not to refuse
+        could not terminate. The finish no longer reads a listing at all: a
+        marker is named from the digest of its object path, so a re-mint
+        overwrites the one record and the finish computes its name. See
+        :func:`broker_core.upload_marker_path_for_object`.
 
-        A cap on a READ that a correctness decision depends on is not a bound,
-        it is a silent wrong answer. **The cap now applies only to how much the
-        sweep DELETES per call**, which is the part a caller can inflate, and
-        the sweep is the one place where doing less work per call is merely
-        slower rather than wrong.
+        `complete` is still returned, and still a TUPLE, for the reason the
+        review gave: a caller that ignores completeness then gets a tuple where
+        it expected a list and fails loudly, rather than treating "all of them"
+        and "as many as I could get" as one value. Both callers above log the
+        partial read; neither refuses on it.
 
-        **The cost, stated rather than hidden**, since the review asked for it
-        in writing if the uncapped read were expensive: this is one listing plus
-        one document read per marker present, so a mint is O(markers present)
-        and the image-list rebuild is too. The image list is cached for
-        ``MANIFEST_CACHE_TTL_S``, and the sweep at the start of every mint keeps
-        the marker count near the number of uploads actually in flight, so the
-        steady state is small. The bad case is real and worth naming: a client
-        that mints N names before PUTting anything makes the Nth mint do N
-        reads. If that shows up in practice, the fix is to make the withholding
-        answerable from the LISTING alone -- a marker filename carrying the
-        object path as well as the mint id -- which would need its own review,
-        since the authoritative read must stay keyed by mint id.
+        **Uncapped, and it used to be capped at the sweep's limit of 50.** The
+        cap now applies only to how much the sweep DELETES per call, which is
+        the part a caller can inflate. That cap is sound exactly because the
+        sweep is the place where doing less per call is merely slower.
 
-        The documents are read rather than the paths being decoded from the
-        filenames. A marker's filename is its MINT ID and nothing else, which is
-        what keeps every marker read inside ``.uploads/`` -- encoding the object
-        path into the name as well would make the filename a second, parallel
-        record of it, and the one thing that must not be guessable from a
-        filename is which object a marker authorises touching.
+        **The cost, stated rather than hidden**: one listing plus one document
+        read per marker present, so a mint is O(markers present). The documents
+        are read because the path is in the DOCUMENT; the filename is a digest
+        and cannot be inverted. A cheaper withholding is now available and is
+        deliberately not taken here -- for each image name, test whether
+        ``.uploads/<sha256("images/<name>")>.json`` is in the listing, which
+        needs no document reads at all -- because it changes a second mechanism
+        in a round whose scope is the finish. It is a follow-up, not a residual:
+        the current read is correct, only O(markers) rather than O(1).
         """
         try:
             entries, complete = await self._list_files_all(
@@ -2524,12 +2533,33 @@ class AnnotationBroker:
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
+            # A WITHHELD PATH IS NOT TAKEN, and omitting this made a refusal's
+            # own instructions false. The refusals that leave the object staged
+            # -- the marker removal failing, and before it the incomplete
+            # listing -- all tell the caller to "retry with done=false and PUT
+            # again". Without the withheld set here that retry answered
+            # `already: True` for up to the marker's whole hour, because the
+            # object IS in the listing: a dead end, and the round-9 review
+            # blocked on exactly that shape on the sibling path.
+            #
+            # It is sound, not a convenience, and the induction is short: a
+            # marker exists for a path only because this check passed when that
+            # marker was minted, so an object at a withheld path is provably not
+            # a pre-existing image -- which is the same fact that licenses the
+            # discard. It also removes the last disagreement between the readers
+            # and this check: the image list hides a withheld path, and a
+            # re-mint no longer says that same path already exists.
+            #
+            # Fail-open, like the withholding itself: an unreadable `.uploads/`
+            # yields an empty set, so the answer degrades to "already", which is
+            # the refusing direction for a mint and merely unhelpful.
+            withheld = await self._withheld_upload_paths(artifact_id)
             # prune=False: this is a read, and pruning is for the writer that
             # owns the manifest. A stem whose file has gone is still "taken"
             # for the purposes of not clobbering it here.
             entries, _changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
-                core.image_names_from_listing(listing),
+                core.image_names_from_listing(listing, withheld_paths=withheld),
             )
             existing = entries.get(stem)
             if isinstance(existing, dict):
@@ -2633,7 +2663,7 @@ class AnnotationBroker:
         # available that separates "this request's object" from "somebody's
         # image". No marker means no permission to touch anything -- not the
         # object, not the manifest, not the stage.
-        marker = await self._read_upload_marker(artifact_id, mint_id)
+        marker = await self._read_upload_marker(artifact_id, path)
         if not core.marker_authorises_discard(
             marker, path=path, mint_id=mint_id, now=time.time()
         ):
@@ -2677,7 +2707,7 @@ class AnnotationBroker:
             # next, and the whole point of consuming it here is that one mint
             # authorises exactly one finish.
             await self._discard_staged_upload(artifact_id, path)
-            await self._remove_upload_marker(artifact_id, mint_id)
+            await self._remove_upload_marker(artifact_id, path)
             raise ValueError(refusal)
 
         # A presigned PUT reports success from S3, not from the artifact
@@ -2698,7 +2728,7 @@ class AnnotationBroker:
             # Safe for exactly the same reason the size discard is safe -- the
             # marker -- and unsafe without it, which is why this moved only now.
             await self._discard_staged_upload(artifact_id, path)
-            await self._remove_upload_marker(artifact_id, mint_id)
+            await self._remove_upload_marker(artifact_id, path)
             raise ValueError(
                 f"The bytes at '{path}' are not a {ext.lstrip('.').upper()} "
                 f"image. The upload did not land, or something other than the "
@@ -2706,82 +2736,49 @@ class AnnotationBroker:
                 f"done=False and PUT again, sending the body with no "
                 f"Content-Type header."
             )
-        # EVERY marker for this path is consumed, not just this request's, and
-        # the consumption FAILS CLOSED. Both halves were measured as defects.
+        # THE MARKER FOR THIS PATH IS CONSUMED, and the consumption FAILS
+        # CLOSED. Both of those were measured as defects before they were rules.
         #
-        # More than one marker for one path is ordinary, not exotic: a client
-        # whose first mint answer was lost on the wire asks again and is given a
-        # second marker, and two browser tabs uploading the same filename do the
-        # same. Consuming only `mint_id` left the other marker open -- so the
-        # image this call had just verified and committed was withheld from the
-        # listing immediately, and then DELETED by the expiry sweep, which is
-        # data loss arriving through housekeeping.
-        #
-        # And a removal that fails must stop the commit. It used to be
-        # best-effort: `_remove_upload_marker` never raises, so the commit went
-        # ahead and the leftover marker had the sweep delete the committed image
-        # later. Hypha carries out a staged removal of a committed file on the
-        # next commit, so that loss becomes permanent. Refusing here leaves the
-        # object staged and still withheld, which the next mint's sweep clears
-        # and the client can retry -- the cost of the safe direction is an
-        # error on an upload that was otherwise fine, and that is the right way
-        # round.
+        # A removal that fails must stop the commit. It used to be best-effort:
+        # `_remove_upload_marker` never raises, so the commit went ahead and the
+        # leftover marker had the sweep delete the committed image later. Hypha
+        # carries out a staged removal of a committed file on the next commit,
+        # so that loss becomes permanent. Refusing here leaves the object staged
+        # and still withheld, which the next mint's sweep clears and the client
+        # can retry -- the cost of the safe direction is an error on an upload
+        # that was otherwise fine, and that is the right way round.
         #
         # Consumed BEFORE the commit, so the commit publishes the image without
-        # them. Removing them afterwards would leave the removals staged and
-        # waiting on somebody else's commit, which is how `.uploads/` would end
-        # up in a published dataset.
-        # ITS OWN MARKER IS REMOVED BY MINT ID FIRST, with no listing involved.
-        # That is the one removal this call cannot afford to miss, and a review
-        # measured it being missed: when the consumption was only the by-path
-        # scan below, a marker past the listing's old 50-entry cap -- including
-        # this upload's own -- was never seen, so the fail-closed check passed
-        # on a list that did not contain it. A path built from the validated
-        # mint id cannot be truncated by anything.
-        # THE LISTING IS READ BEFORE ANYTHING IS REMOVED, so a refusal here
-        # leaves the upload exactly as it was. A review measured the other
-        # order: the own marker was removed first, then an incomplete listing
-        # refused -- and because the marker was gone, the object was no longer
-        # withheld, so the image list showed an UNCOMMITTED file, while the
-        # error told the caller to retry with done=false, which answered
-        # `already: True`. A dead end, and a message that was false.
-        pairs, complete = await self._marker_pairs(artifact_id)
-        if not complete:
-            # FAIL CLOSED, exactly as the own-marker removal above does. A
-            # marker this call did not SEE is a marker it cannot consume, and an
-            # unconsumed duplicate marker for this path withholds the image and
-            # then has the sweep delete it. A review measured the silent version:
-            # a store raising on offset>0 gave 7 of 30 markers, so the extras
-            # scan ran against a list that could not contain the one that
-            # mattered and the fail-closed check passed on it.
-            raise RuntimeError(
-                f"'{name}' was uploaded and checked, but the record of the "
-                "upload could not be read in full, so it was NOT published. "
-                "Publishing without being able to clear every record for this "
-                "file would have let housekeeping delete the image later. "
-                "Nothing was committed; retry with done=false and PUT again."
-            )
-        # ITS OWN MARKER IS REMOVED BY MINT ID, with no listing involved: a path
-        # built from the validated mint id cannot be truncated by anything, and
-        # a review measured the version that relied on the scan alone missing
-        # its own marker past the listing's old cap.
-        own = core.upload_marker_path(mint_id)
-        unremoved = []
+        # it. Removing it afterwards would leave the removal staged and waiting
+        # on somebody else's commit, which is how `.uploads/` would end up in a
+        # published dataset.
+        #
+        # ONE MARKER, FOUND BY NAME, WITH NO LISTING. This is where four review
+        # rounds went, so the reasoning is worth keeping. More than one marker
+        # for one path used to be ordinary -- a client whose mint answer was lost
+        # asks again, two browser tabs upload the same filename -- and each one
+        # left behind withheld the committed image and then had the expiry sweep
+        # delete it. Consuming them meant FINDING them, which meant listing
+        # `.uploads/`, which is paginated: a short read left a duplicate alive
+        # (data loss through housekeeping), and every bound tight enough to
+        # terminate against a server that ignores `offset` refused valid uploads
+        # once a few staged removals sat in the directory (a clause-2
+        # regression). A cap cannot decide this correctly in either direction,
+        # because the question itself was the mistake.
+        #
+        # So the marker is keyed by the OBJECT PATH -- `.uploads/<sha256(path)>`
+        # -- and a re-mint overwrites the one file instead of adding a second.
+        # The duplicate cannot exist, so the finish does not look for one: it
+        # computes the name from the path it is finishing and removes that file.
+        # Authorisation is unchanged and still comes from the DOCUMENT (this
+        # path, this mint id, unexpired), checked above, so the filename is a
+        # lookup key and confers nothing. Nothing here paginates, so nothing
+        # here can be short.
+        own = core.upload_marker_path_for_object(path)
         if own is None or not await self._remove_marker_file(artifact_id, own):
-            unremoved.append(own or f"<invalid mint id {mint_id!r}>")
-        # THEN every OTHER marker for this path: a retried mint or a second
-        # browser tab leaves one behind, and leaving it open would withhold this
-        # image and then have the sweep delete it.
-        leftover = [m for m in core.markers_for_path(pairs, path=path) if m != own]
-        for marker_path in leftover:
-            if not await self._remove_marker_file(artifact_id, marker_path):
-                unremoved.append(marker_path)
-        leftover = [own] + leftover
-        if unremoved:
             raise RuntimeError(
                 f"'{name}' was uploaded and checked, but the record of the "
-                f"upload could not be cleared ({len(unremoved)} of "
-                f"{len(leftover)} marker file(s)), so it was NOT published. "
+                "upload could not be cleared, so it was NOT published. "
                 "Publishing with that record still in place would have let "
                 "housekeeping delete the image later. Nothing was committed; "
                 "retry with done=false and PUT again."

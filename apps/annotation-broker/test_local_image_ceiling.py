@@ -243,6 +243,19 @@ def _png(nbytes: int) -> bytes:
     return core.PNG_SIGNATURE + b"\0" * (nbytes - len(core.PNG_SIGNATURE))
 
 
+def _marker_for(name: str) -> str:
+    """The marker file for an uploaded image *name*, via the SHIPPED keying.
+
+    Through `broker_core` rather than by formatting a digest here: a test that
+    recomputed the filename would still pass if the app and the test drifted
+    apart in the same direction, and the marker's name is the whole mechanism
+    now that the finish finds its record by computing it from the object path.
+    Takes the NAME, not the mint id -- a re-mint of one name overwrites one
+    file, which is why there is no longer a duplicate for the finish to find.
+    """
+    return core.upload_marker_path_for_object(f"images/{name}")
+
+
 @pytest.mark.asyncio
 async def test_a_REAL_oversized_body_is_refused_AND_does_not_become_an_image(
     monkeypatch,
@@ -273,7 +286,7 @@ async def test_a_REAL_oversized_body_is_refused_AND_does_not_become_an_image(
     manifest = await b._image_manifest(ARTIFACT)
     assert "scan01" not in manifest, f"the refused object is still an image: {manifest}"
     # The marker goes with the object: one mint authorises exactly one finish.
-    marker_path = core.upload_marker_path(mint["mint_id"])
+    marker_path = _marker_for("scan01.png")
     assert marker_path in store.removed, store.removed
     assert marker_path not in store.objects
 
@@ -365,7 +378,7 @@ async def test_a_REAL_body_AT_the_ceiling_becomes_a_LOCAL_manifest_entry(monkeyp
     # The MARKER is removed on success -- it is consumed, not discarded -- but
     # no image is. Asserting on `removed` wholesale would conflate the two, so
     # this names the object and the marker separately.
-    marker_path = core.upload_marker_path(mint["mint_id"])
+    marker_path = _marker_for("scan01.png")
     assert store.removed == [
         marker_path
     ], f"a good upload was discarded: {store.removed}"
@@ -504,7 +517,7 @@ async def test_the_MINTING_call_still_advertises_the_same_number(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_finishing_for_an_EXISTING_IMAGE_destroys_nothing(monkeypatch):
-    """The reviewer's own probe, as a test."""
+    """A review's own probe, as a test."""
     store = _Store()
     b = _store_broker(monkeypatch, store, ceiling=64)
     store.publish("images/big.png", _png(100))  # committed, over this ceiling
@@ -588,7 +601,7 @@ async def test_a_GENUINE_upload_still_discards_on_refusal(monkeypatch):
     assert "65" in str(exc.value), str(exc.value)
     assert store.removed == [
         "images/fresh.png",
-        core.upload_marker_path(mint["mint_id"]),
+        _marker_for("fresh.png"),
     ], store.removed
 
 
@@ -660,7 +673,7 @@ async def test_an_upload_whose_marker_EXPIRED_unfinished_loses_its_OBJECT(
 
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
     store.put(mint["put_url"], _png(10000))
-    marker_path = core.upload_marker_path(mint["mint_id"])
+    marker_path = _marker_for("scan01.png")
     stale = core.upload_marker_document(
         path="images/scan01.png",
         mint_id=mint["mint_id"],
@@ -749,7 +762,7 @@ def _age_marker(store, mint_id, *, path, ceiling=64):
 
     Not by patching the clock: a test that moves `time.time` measures the patch.
     """
-    marker_path = core.upload_marker_path(mint_id)
+    marker_path = core.upload_marker_path_for_object(path)
     stale = core.upload_marker_document(
         path=path,
         mint_id=mint_id,
@@ -818,13 +831,21 @@ async def test_the_MINT_SWEEPS_FIRST_so_the_same_name_can_be_retried(monkeypatch
 
 @pytest.mark.asyncio
 async def test_a_RETRIED_MINT_does_not_cost_the_finished_image(monkeypatch):
-    """Round 5's data-loss case (a), measured: two markers, one finish.
+    """Round 5's data-loss case (a), and round 10's fix for it.
 
     A client whose first mint answer was lost asks again; two browser tabs on
-    one filename do the same. Consuming only the finishing call's own marker
-    left the first one open, so the committed image was withheld at once and
-    deleted by the sweep an hour later -- and in Hypha a staged removal of a
-    committed file is carried out by the next commit, so the loss is permanent.
+    one filename do the same. When the marker was keyed by MINT ID that left
+    two files, and consuming only the finishing call's own left the other open
+    -- so the committed image was withheld at once and deleted by the sweep an
+    hour later, which in Hypha a later commit makes permanent. Finding the other
+    one meant listing a paginated directory, and four rounds went on bounding
+    that read safely.
+
+    Keyed by the OBJECT PATH there is no other one: the re-mint overwrites the
+    single file. This asserts that as a COUNT -- one marker for the name, not
+    two -- so it fails if the keying ever goes back to the mint id, and then
+    asserts the consequence that mattered, which is that the finished image
+    survives a sweep.
     """
     store = _Store()
     b = _store_broker(monkeypatch, store, ceiling=64)
@@ -833,6 +854,10 @@ async def test_a_RETRIED_MINT_does_not_cost_the_finished_image(monkeypatch):
     second = await b.upload_local_image(ARTIFACT, "scan01.png")
     assert second["already"] is False, second  # nothing PUT yet, so it is free
     assert second["mint_id"] != first["mint_id"]
+    # TWO MINTS, ONE MARKER FILE. The count is the fix; everything below is
+    # what the count buys.
+    markers = [k for k in store.objects if k.startswith(f"{core.UPLOAD_MARKER_DIR}/")]
+    assert markers == [_marker_for("scan01.png")], markers
 
     store.put(second["put_url"], _png(32))
     out = await b.upload_local_image(
@@ -840,18 +865,59 @@ async def test_a_RETRIED_MINT_does_not_cost_the_finished_image(monkeypatch):
     )
     assert out["committed"] is True
 
-    # Right after the successful finish: listed, not withheld by marker 1.
+    # Right after the successful finish: listed, and no marker left behind.
     manifest = await b._image_manifest(ARTIFACT)
     assert "scan01" in manifest, f"the committed image is withheld: {manifest}"
     assert (
-        core.upload_marker_path(first["mint_id"]) not in store.objects
-    ), "the first mint's marker outlived the finish"
+        _marker_for("scan01.png") not in store.objects
+    ), "a marker for the finished image outlived the finish"
 
     # And it survives a sweep after any expiry window.
     await b._sweep_expired_markers(ARTIFACT)
     assert "images/scan01.png" not in store.removed, store.removed
     manifest = await b._image_manifest(ARTIFACT)
     assert "scan01" in manifest, f"the sweep deleted a finished image: {manifest}"
+
+
+@pytest.mark.asyncio
+async def test_a_SUPERSEDED_mint_id_cannot_finish_AND_IS_NOT_A_DEAD_END(monkeypatch):
+    """The cost of the path keying, stated and bounded rather than discovered.
+
+    Under the mint-id keying either of two markers for one path could be
+    finished. Under the path keying a re-mint REPLACES the record, so a finish
+    presenting the earlier mint id is refused. That is the right answer -- both
+    URLs write the same key, so the bytes a stale finish would publish are
+    whichever PUT landed last and nothing in the request says which -- but it
+    would be a bad answer if it stranded the client, which is what the
+    round-9 dead end was. So: the refusal touches NOTHING, the object stays
+    withheld because the marker is still there, and the retry the error names
+    actually works.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    first = await b.upload_local_image(ARTIFACT, "scan01.png")
+    second = await b.upload_local_image(ARTIFACT, "scan01.png")
+    store.put(first["put_url"], _png(32))  # the first tab PUT its bytes
+
+    with pytest.raises(ValueError, match="cannot be completed"):
+        await b.upload_local_image(
+            ARTIFACT, "scan01.png", done=True, mint_id=first["mint_id"]
+        )
+
+    assert store.committed == 0, "a superseded mint committed"
+    assert store.removed == [], f"a refused finish removed something: {store.removed}"
+    assert _marker_for("scan01.png") in store.objects, "the refusal ate the marker"
+    manifest = await b._image_manifest(ARTIFACT)
+    assert (
+        "scan01" not in manifest
+    ), f"the uncommitted object is listed as an image: {manifest}"
+
+    # NOT a dead end: the live mint id still finishes, and so does a fresh one.
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=second["mint_id"]
+    )
+    assert out["committed"] is True, out
 
 
 @pytest.mark.asyncio
@@ -958,7 +1024,7 @@ async def test_finishing_one_upload_leaves_ANOTHER_name_s_marker_alone(monkeypat
     )
     assert out["committed"] is True
 
-    other_marker = core.upload_marker_path(other["mint_id"])
+    other_marker = _marker_for("other99.png")
     assert other_marker in store.objects, (
         "finishing one image consumed the marker of an upload still in flight "
         f"for another name: {store.removed}"
@@ -997,7 +1063,7 @@ async def test_a_FOLDER_UPLOAD_past_the_cap_keeps_its_finished_image(monkeypatch
         mints[name] = await b.upload_local_image(ARTIFACT, name)
 
     # The one whose MARKER FILENAME sorts last, which is where the cap bites.
-    last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
+    last = max(mints, key=_marker_for)
     store.put(mints[last]["put_url"], _png(32))
 
     out = await b.upload_local_image(
@@ -1005,7 +1071,7 @@ async def test_a_FOLDER_UPLOAD_past_the_cap_keeps_its_finished_image(monkeypatch
     )
     assert out["committed"] is True
 
-    own = core.upload_marker_path(mints[last]["mint_id"])
+    own = _marker_for(last)
     assert own not in store.objects, (
         f"the finishing upload's own marker survived the finish ({own}), so the "
         "sweep will delete the image it belongs to"
@@ -1041,7 +1107,7 @@ async def test_an_unfinished_upload_PAST_THE_CAP_is_still_withheld(monkeypatch):
         name = f"img{i:02d}.png"
         mints[name] = await b.upload_local_image(ARTIFACT, name)
 
-    last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
+    last = max(mints, key=_marker_for)
     store.put(mints[last]["put_url"], _png(10000))  # 156x the ceiling, no finish
 
     manifest = await b._image_manifest(ARTIFACT)
@@ -1102,7 +1168,7 @@ async def test_the_marker_read_FOLLOWS_the_servers_pagination(monkeypatch):
         name = f"img{i:02d}.png"
         mints[name] = await b.upload_local_image(ARTIFACT, name)
 
-    last = max(mints, key=lambda n: core.upload_marker_path(mints[n]["mint_id"]))
+    last = max(mints, key=_marker_for)
     store.put(mints[last]["put_url"], _png(10000))  # 156x the ceiling, no finish
 
     pairs, complete = await b._marker_pairs(ARTIFACT)
@@ -1183,42 +1249,118 @@ async def test_a_server_that_IGNORES_OFFSET_terminates_the_read(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_finish_REFUSES_when_the_marker_listing_is_PARTIAL(monkeypatch):
-    """The lead's arm for the round-8 residual, and the shape measured in review.
+async def test_a_finish_DOES_NOT_READ_the_marker_listing_AT_ALL(monkeypatch):
+    """Round 10's fix, asserted at its strongest: the scan is GONE, not bounded.
 
-    The paging read used to return a PARTIAL list silently when a page after the
-    first failed -- 7 of 30 markers in the reviewer's probe. For the finish that
-    is the data-loss direction: a duplicate marker it never saw survives the
-    commit, withholds the image, and the sweep deletes it later. So an
-    incomplete listing is now a refusal, exactly as the own-marker removal
-    already is.
+    Four rounds tried to make the finish's `.uploads/` scan safe. Every bound on
+    a paginated read was wrong in one direction or the other -- short enough to
+    terminate against a server that ignores `offset` meant refusing valid
+    uploads once staged removals sat in the directory; loose enough not to
+    refuse meant it might not terminate. A cap on a read a correctness decision
+    consumes is a silent wrong answer, and no constant fixes that.
+
+    So this does not test a better bound. It makes listing `.uploads/`
+    IMPOSSIBLE -- every call raises -- and asserts the finish still commits.
+    Nothing about page sizes, orderings, flags or counts can affect a read that
+    does not happen. The marker is still consumed: it is found by computing
+    `.uploads/<sha256(path)>.json` from the path being finished.
+
+    It fails if the finish reads that listing for any reason, which is exactly
+    the regression worth a test.
     """
     store = _Store()
     b = _store_broker(monkeypatch, store, ceiling=64)
+    # 60 markers and a tiny page size, so the OLD code paged here several times.
     for i in range(60):
         await b.upload_local_image(ARTIFACT, f"other{i:02d}.png")
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
     store.put(mint["put_url"], _png(32))
 
     real = store.list_files
+    marker_listings = []
 
-    async def breaks_after_the_first_page(
+    async def refuses_to_list_the_markers(
         _a, dir_path=None, stage=True, limit=None, offset=0
     ):
-        if int(offset or 0) > 0:
-            raise RuntimeError("the store refused a later page")
+        if dir_path == core.UPLOAD_MARKER_DIR:
+            marker_listings.append((dir_path, offset))
+            raise RuntimeError("the store will not list the marker directory")
         return await real(
             _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
         )
 
-    monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
+    monkeypatch.setattr(store, "list_files", refuses_to_list_the_markers)
 
-    with pytest.raises(RuntimeError, match="NOT published"):
-        await b.upload_local_image(
-            ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
-        )
+    out = await b.upload_local_image(
+        ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
+    )
 
-    assert store.committed == 0, "it committed on a listing it could not read in full"
+    assert out["committed"] is True, out
+    assert store.committed == 1, store.committed
+    assert marker_listings == [], (
+        "the finish listed the marker directory, so its correctness still "
+        f"depends on a paginated read: {marker_listings}"
+    )
+    # The marker was still consumed -- found by name, not by scanning.
+    assert _marker_for("scan01.png") in store.removed, store.removed
+    assert _marker_for("scan01.png") not in store.objects
+
+
+@pytest.mark.asyncio
+async def test_a_finish_COMMITS_with_MANY_flagged_markers_before_the_last_live_one(
+    monkeypatch,
+):
+    """Round 10's probe, as the test that made the previous head RED.
+
+    At F >= the no-progress bound, with the flagged markers placed just before
+    the last live one, the finish must commit. Under Hypha's ordering each page
+    that serves only already-seen names advances the offset by the number of
+    UNFLAGGED entries it served, so a run of flagged markers in the tail
+    produced one stall per flagged marker -- more stalls than any fixed bound
+    allows. Measured at 14 of 20 trials refused with 30 live and 50 flagged.
+
+    The names are chosen so the flagged markers sort immediately before the live
+    one being finished, which is the placement that made it worst. The finish
+    reads no listing now, so this passes structurally rather than by being under
+    a threshold -- and it is kept because it is the measurement that refused.
+    """
+    store = _RawOffsetStore()
+    store.page_size = 2  # tiny, so every flagged marker is its own stall
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    # Flag more markers than the no-progress bound tolerates, by a wide margin.
+    flagged_count = bk._NO_PROGRESS_PAGES * 3
+    assert flagged_count >= bk._NO_PROGRESS_PAGES, flagged_count
+
+    live = await b.upload_local_image(ARTIFACT, "zz-live.png")
+    store.put(live["put_url"], _png(32))
+    live_marker_name = _marker_for("zz-live.png").split("/")[-1]
+
+    # Mint names until enough markers sort BEFORE the live one, then flag them:
+    # a marker is `_remove`-flagged whenever another route commits while an
+    # upload is open, and annotation saves, set_role and materialise all commit.
+    flagged = []
+    i = 0
+    while len(flagged) < flagged_count:
+        nm = f"f{i:03d}.png"
+        await b.upload_local_image(ARTIFACT, nm)
+        marker_name = _marker_for(nm).split("/")[-1]
+        if marker_name < live_marker_name:
+            flagged.append(marker_name)
+        i += 1
+        assert i < 2000, "could not place enough markers before the live one"
+    for marker_name in flagged:
+        store.flagged.add(marker_name)
+
+    out = await b.upload_local_image(
+        ARTIFACT, "zz-live.png", done=True, mint_id=live["mint_id"]
+    )
+
+    assert out["committed"] is True, (
+        f"{len(flagged)} flagged markers before the live one refused a valid "
+        f"upload: {out}"
+    )
+    assert store.committed == 1, store.committed
 
 
 @pytest.mark.asyncio
@@ -1343,7 +1485,7 @@ async def test_a_finish_COMMITS_through_an_overlapping_page(monkeypatch):
     store.put(a_mint["put_url"], _png(32))
     # a.png's marker is COMMITTED and then flagged for removal, which is what
     # any other route's commit during an open upload produces.
-    store.flagged.add(core.upload_marker_path(a_mint["mint_id"]).split("/")[-1])
+    store.flagged.add(_marker_for("a.png").split("/")[-1])
 
     out = await b.upload_local_image(
         ARTIFACT, "a.png", done=True, mint_id=a_mint["mint_id"]
@@ -1361,7 +1503,7 @@ async def test_an_overlapping_page_is_NOT_reported_incomplete(monkeypatch):
     store.page_size = 2
     b = _store_broker(monkeypatch, store, ceiling=64)
     mints = [await b.upload_local_image(ARTIFACT, f"m{i}.png") for i in range(6)]
-    store.flagged.add(core.upload_marker_path(mints[0]["mint_id"]).split("/")[-1])
+    store.flagged.add(_marker_for("m0.png").split("/")[-1])
 
     entries, complete = await b._list_files_all(ARTIFACT, core.UPLOAD_MARKER_DIR)
 
@@ -1373,9 +1515,20 @@ async def test_an_overlapping_page_is_NOT_reported_incomplete(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_refusal_now_leaves_the_upload_UNCHANGED(monkeypatch):
-    """The dead end, closed. The listing is read before anything is removed, so
-    a refusal leaves the marker in place -- which keeps the object withheld and
-    makes the error's "retry" instruction true."""
+    """The dead end, closed, re-aimed at the ONE fail-closed path that is left.
+
+    Round 9 measured it on the incomplete-listing refusal: the own marker had
+    already been removed when the refusal fired, so the uncommitted object was
+    no longer withheld and appeared as an image, while the error told the caller
+    to retry with `done=false` -- which answered `already: True`. A dead end,
+    and a false message.
+
+    That refusal is gone with the listing. The remaining one is the marker
+    removal failing, and it has to keep the same property: nothing committed,
+    the marker still there so the object stays withheld, and the retry the
+    message prescribes actually available. The store here refuses to remove the
+    marker and nothing else.
+    """
     store = _Store()
     b = _store_broker(monkeypatch, store, ceiling=64)
     for i in range(60):
@@ -1383,31 +1536,35 @@ async def test_a_refusal_now_leaves_the_upload_UNCHANGED(monkeypatch):
     mint = await b.upload_local_image(ARTIFACT, "scan01.png")
     store.put(mint["put_url"], _png(32))
 
-    real = store.list_files
+    real_remove = store.remove_file
 
-    async def breaks_after_the_first_page(
-        _a, dir_path=None, stage=True, limit=None, offset=0
-    ):
-        if int(offset or 0) > 0:
-            raise RuntimeError("the store refused a later page")
-        return await real(
-            _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
-        )
+    async def refuses_to_remove_the_marker(artifact_id=None, file_path=None):
+        if isinstance(file_path, str) and file_path.startswith(
+            f"{core.UPLOAD_MARKER_DIR}/"
+        ):
+            raise RuntimeError("the store refused to remove the marker")
+        return await real_remove(artifact_id=artifact_id, file_path=file_path)
 
-    monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
+    monkeypatch.setattr(store, "remove_file", refuses_to_remove_the_marker)
 
     with pytest.raises(RuntimeError, match="NOT published"):
         await b.upload_local_image(
             ARTIFACT, "scan01.png", done=True, mint_id=mint["mint_id"]
         )
 
-    own = core.upload_marker_path(mint["mint_id"])
+    assert store.committed == 0, "it committed without clearing the record"
+    own = _marker_for("scan01.png")
     assert own in store.objects, "the refusal removed the marker anyway"
-    assert own not in store.removed
     manifest = await b._image_manifest(ARTIFACT)
     assert (
         "scan01" not in manifest
     ), f"the uncommitted object is listed as an image: {manifest}"
+    # And the retry the message prescribes is really available: the marker is
+    # still there, so the path is still withheld, so a re-mint is not told the
+    # name already exists.
+    monkeypatch.setattr(store, "remove_file", real_remove)
+    again = await b.upload_local_image(ARTIFACT, "scan01.png")
+    assert again["already"] is False, f"the retry the error names is blocked: {again}"
 
 
 @pytest.mark.asyncio
