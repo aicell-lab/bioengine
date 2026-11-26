@@ -896,12 +896,19 @@ class TestImportKeepsTheCredentialOutOfTheArtifact:
 
     async def test_the_token_lands_in_broker_metadata(self, tokened):
         await tokened.import_ngff_image("ws/ds", self.TOKENED, stem="s", context=None)
-        creds = tokened._state["meta"]["ngff_credentials"]
-        assert creds == {self.UNTOKENED: "secret-123"}
+        # The STORED record, not the handler's in-memory copy. The import
+        # applies the credential to a record it re-reads under the record lock,
+        # so the dict this fixture handed out is deliberately not the one that
+        # was written. Asserting on the stored record is also the stronger
+        # claim: a credential mutated in memory but never persisted would be
+        # gone at the next worker restart, and this test would not have noticed.
+        stored = bc.read_metadata("ws/ds", root=bk.STATE_ROOT)
+        assert stored["ngff_credentials"] == {self.UNTOKENED: "secret-123"}
 
     async def test_an_untokened_source_records_no_credential(self, importer):
         await importer.import_ngff_image("ws/ds", ROOT, stem="s", context=None)
-        assert "ngff_credentials" not in importer._state["meta"]
+        stored = bc.read_metadata("ws/ds", root=bk.STATE_ROOT)
+        assert "ngff_credentials" not in stored
 
 
 class TestGetImageUrl:

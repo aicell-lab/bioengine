@@ -788,8 +788,16 @@ class AnnotationBroker:
             )
 
         owner = manifest.get("owner") or {"id": caller["id"], "email": caller["email"]}
-        meta = core.new_metadata(artifact_id, owner=owner)
-        return core.write_metadata(meta, root=STATE_ROOT)
+        # Re-check under the record lock. The absence check above ran before
+        # the artifact read awaited, so a concurrent registration of the same
+        # dataset may have created the record in the meantime; an unconditional
+        # write would overwrite it. Both callers get the record that survived.
+        meta, _created = core.create_metadata_if_absent(
+            artifact_id,
+            lambda: core.new_metadata(artifact_id, owner=owner),
+            root=STATE_ROOT,
+        )
+        return meta
 
     @bioengine.method(context=True)
     async def list_my_datasets(self, context=None) -> Dict[str, Any]:
@@ -1351,10 +1359,16 @@ class AnnotationBroker:
             await _rm_dir(folder)
 
         await self._ensure_staged(artifact_id, _do)
-        meta["labels"] = [
-            l for l in meta.get("labels", []) or [] if l.get("name") != name
-        ]
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+
+        # Drop the one label against a freshly read record: `meta` was read
+        # before the staged removal above awaited, so writing it whole would
+        # discard anything else changed while that ran.
+        def _drop_label(record):
+            record["labels"] = [
+                l for l in record.get("labels", []) or [] if l.get("name") != name
+            ]
+
+        meta = core.update_metadata(artifact_id, _drop_label, root=STATE_ROOT)
         # Persist the deletion into the committed version as well: staged
         # removals alone leave the last committed snapshot holding the label
         # files. Reuses the ACL mirror cycle (commit + re-stage, tolerant of
@@ -2270,10 +2284,15 @@ class AnnotationBroker:
             self._image_manifest_cache.pop(artifact_id, None)
 
         if credential:
-            credentials = dict(meta.get("ngff_credentials") or {})
-            credentials[untokened] = credential
-            meta["ngff_credentials"] = credentials
-            core.write_metadata(meta, root=STATE_ROOT)
+            # One key of the credential map, against a freshly read record:
+            # the import above awaited repeatedly, and writing `meta` whole
+            # here has been the widest lost-update window in this file.
+            def _store_credential(record):
+                credentials = dict(record.get("ngff_credentials") or {})
+                credentials[untokened] = credential
+                record["ngff_credentials"] = credentials
+
+            core.update_metadata(artifact_id, _store_credential, root=STATE_ROOT)
 
         return {"stem": stem, **entry}
 
@@ -3215,8 +3234,16 @@ class AnnotationBroker:
         artifact_id = self._canonical_id(artifact_id)
         meta, _caller, _role = self._require_role(context, artifact_id, "manager")
         description = description if isinstance(description, str) else ""
-        core.add_label(meta, name, description)  # raises ValueError on a bad name
-        meta = core.write_metadata(meta, root=STATE_ROOT)
+        # add_label is applied to a record read inside the lock, and what comes
+        # back is what landed on disk. A bad name still raises ValueError, from
+        # inside the critical section, before anything is written. So this
+        # either persists the label or raises -- it cannot hand the caller a
+        # record describing a write that another writer overwrote.
+        meta = core.update_metadata(
+            artifact_id,
+            lambda record: core.add_label(record, name, description),
+            root=STATE_ROOT,
+        )
 
         async def _put_label_metadata():
             await self._write_json_file(
@@ -3301,8 +3328,29 @@ class AnnotationBroker:
                     dims_cache[stem] = dims
                     cache_grew = True
             if cache_grew:
-                meta["image_dims"] = dims_cache
-                core.write_metadata(meta, root=STATE_ROOT)
+                # MERGE the dims cache into a freshly read record rather than
+                # writing `meta`, which was read at the top of this method --
+                # before the manifest read and the header fetches above
+                # awaited. Writing it whole is what discarded a label created
+                # while this index was being built.
+                def _merge_dims(record):
+                    merged = dict(record.get("image_dims") or {})
+                    merged.update(dims_cache)
+                    record["image_dims"] = merged
+
+                try:
+                    core.update_metadata(
+                        artifact_id, _merge_dims, root=STATE_ROOT
+                    )
+                except FileNotFoundError:
+                    # The record was deleted while the index was being built.
+                    # This write is only a cache, so it is not worth failing a
+                    # read over -- but do not recreate the record either.
+                    logger.debug(
+                        "annotation-broker: dims cache for '%s' not stored; "
+                        "the record is gone",
+                        artifact_id,
+                    )
         for img in images:
             entry = manifest[img["stem"]]
             dims = (

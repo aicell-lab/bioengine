@@ -10,7 +10,8 @@ Covers:
     * path building (label folders, the per-user sanitizer, timestamped
       annotation filenames, embedding/image paths)
     * timestamp generation/formatting
-    * per-dataset metadata JSON: read / atomic write / new / delete
+    * per-dataset metadata JSON: read / atomic write / locked
+      read-modify-write / new / delete
     * "latest pair per (user, stem)" lookup over a flat filename listing
     * the Hypha ACL permissions mirror built from broker metadata
     * a generic async "retry after re-staging" wrapper
@@ -19,17 +20,28 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
+import logging
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+try:  # POSIX only; the degraded path below says what is lost without it.
+    import fcntl
+except ImportError:  # pragma: no cover - this app runs on Linux
+    fcntl = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -2409,6 +2421,10 @@ def collect_embeddings(filenames: List[str]) -> Dict[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 DATASETS_SUBDIR = "datasets"
+# Lock files live in their own directory, NOT beside the records: the datasets
+# directory is expected to hold one .json per dataset and nothing else, and
+# keeping it that way means no reader has to learn to skip a new suffix.
+LOCKS_SUBDIR = "locks"
 
 
 def default_state_root() -> Path:
@@ -2418,6 +2434,13 @@ def default_state_root() -> Path:
 def datasets_dir(root: Optional[Path] = None) -> Path:
     base = root if root is not None else default_state_root()
     d = Path(base) / DATASETS_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def locks_dir(root: Optional[Path] = None) -> Path:
+    base = root if root is not None else default_state_root()
+    d = Path(base) / LOCKS_SUBDIR
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -2563,12 +2586,113 @@ def read_metadata(
     return json.loads(p.read_text())
 
 
-def write_metadata(
+class _RecordLock:
+    """A reentrant in-process lock plus a nesting depth, so the file lock is
+    taken once per outermost critical section rather than once per nested
+    call."""
+
+    __slots__ = ("rlock", "depth")
+
+    def __init__(self) -> None:
+        self.rlock = threading.RLock()
+        self.depth = 0
+
+
+_RECORD_LOCKS: Dict[str, _RecordLock] = {}
+_RECORD_LOCKS_GUARD = threading.Lock()
+_FLOCK_WARNED = False
+
+# errnos that mean "this filesystem will not give me an advisory lock", as
+# opposed to a real I/O fault. NFSv3 without `local_lock`, and some PVC
+# backends, answer ENOLCK here.
+_NO_LOCK_ERRNOS = frozenset(
+    {errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS, errno.EACCES, errno.EPERM}
+)
+
+
+def _record_lock_for(key: str) -> _RecordLock:
+    with _RECORD_LOCKS_GUARD:
+        lk = _RECORD_LOCKS.get(key)
+        if lk is None:
+            lk = _RECORD_LOCKS[key] = _RecordLock()
+        return lk
+
+
+@contextlib.contextmanager
+def record_lock(artifact_id: str, root: Optional[Path] = None):
+    """Hold the exclusive lock for one dataset's metadata record.
+
+    Two layers, because one alone is not enough:
+
+    * a per-record **reentrant in-process lock**, which always works and
+      serialises the coroutines and threads of a single replica;
+    * an **advisory file lock** (``flock``) on a sibling ``.json.lock``, which
+      extends that across processes — two replicas sharing the PVC, or a
+      replica and a one-off script.
+
+    If the filesystem refuses the file lock (``ENOLCK`` and friends, which is
+    what NFSv3 without ``local_lock`` answers) this degrades to the in-process
+    lock and says so in the log once. That is a real loss of protection
+    *between* processes, not a silent pass — but it is strictly better than the
+    unlocked read-modify-write it replaces, which lost updates within a single
+    process too.
+
+    Reentrant on purpose: ``update_metadata`` holds this while calling a
+    caller-supplied mutate function, and that function may legitimately call
+    ``write_metadata``.
+    """
+    global _FLOCK_WARNED
+    p = metadata_path(artifact_id, root)
+    lk = _record_lock_for(str(p))
+    with lk.rlock:
+        if lk.depth > 0:  # already inside the outermost section on this thread
+            lk.depth += 1
+            try:
+                yield
+            finally:
+                lk.depth -= 1
+            return
+
+        fh = None
+        if fcntl is not None:
+            try:
+                lock_path = locks_dir(root) / (
+                    artifact_id_to_filename(artifact_id) + ".lock"
+                )
+                fh = open(lock_path, "a+")
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                if fh is not None:
+                    fh.close()
+                    fh = None
+                if exc.errno not in _NO_LOCK_ERRNOS:
+                    raise
+                if not _FLOCK_WARNED:
+                    _FLOCK_WARNED = True
+                    logger.warning(
+                        "annotation-broker: no advisory file lock on %s (%s); "
+                        "metadata updates are serialised within this process "
+                        "only, so a second process sharing this volume could "
+                        "still lose an update",
+                        locks_dir(root),
+                        errno.errorcode.get(exc.errno, exc.errno),
+                    )
+        lk.depth += 1
+        try:
+            yield
+        finally:
+            lk.depth -= 1
+            if fh is not None:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
+
+
+def _write_metadata_unlocked(
     metadata: Dict[str, Any], root: Optional[Path] = None
 ) -> Dict[str, Any]:
-    """Atomically write *metadata* (write to a ``.tmp`` file, then
-    ``os.replace``) — same pattern as ``training.write_status`` in the
-    micro-sam app. Stamps ``updated_at`` and returns the written dict."""
+    """The write itself. Callers must already hold ``record_lock``."""
     artifact_id = metadata["artifact_id"]
     metadata = dict(metadata)
     metadata["updated_at"] = now_iso()
@@ -2578,6 +2702,82 @@ def write_metadata(
     tmp.write_text(json.dumps(metadata, indent=2))
     os.replace(tmp, p)
     return metadata
+
+
+def write_metadata(
+    metadata: Dict[str, Any], root: Optional[Path] = None
+) -> Dict[str, Any]:
+    """Atomically write *metadata* (write to a ``.tmp`` file, then
+    ``os.replace``) — same pattern as ``training.write_status`` in the
+    micro-sam app. Stamps ``updated_at`` and returns the written dict.
+
+    Atomic per write, but it still writes the **whole record**: whatever the
+    caller read earlier is what lands. Use ``update_metadata`` for anything
+    that changes one field of an existing record, so a concurrent change to a
+    different field is not overwritten. This function is for creating a
+    record, or for replacing one wholesale on purpose.
+    """
+    with record_lock(metadata["artifact_id"], root):
+        return _write_metadata_unlocked(metadata, root)
+
+
+def update_metadata(
+    artifact_id: str,
+    mutate: Callable[[Dict[str, Any]], Any],
+    root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Re-read the stored record, apply *mutate*, write it back — all under one
+    lock, with no suspension point in between.
+
+    This exists because the obvious shape is wrong. A handler that reads the
+    record, awaits something slow (an artifact-manager call, an HTTP fetch),
+    then writes the record back, writes a snapshot taken *before* the await and
+    silently discards every change made during it. Moving the read to here
+    narrows the read-modify-write to a few microseconds of local file I/O and
+    puts a lock around it.
+
+    *mutate* is called with the freshly read record and may either edit it in
+    place or return the record to write. It MUST NOT be a coroutine function
+    and MUST NOT await: that would re-open the very window this closes.
+
+    Returns the record as written, which is the record on disk — never the
+    caller's pre-await copy. Raises ``FileNotFoundError`` if the record does
+    not exist, so a caller can never be handed a record for a write that did
+    not land.
+    """
+    if hasattr(mutate, "__code__") and mutate.__code__.co_flags & 0x80:
+        raise TypeError(
+            "update_metadata's mutate must be synchronous; an await inside the "
+            "critical section would re-open the lost-update window"
+        )
+    with record_lock(artifact_id, root):
+        current = read_metadata(artifact_id, root)
+        if current is None:
+            raise FileNotFoundError(
+                f"No broker metadata for artifact {artifact_id!r}"
+            )
+        returned = mutate(current)
+        record = returned if isinstance(returned, dict) else current
+        return _write_metadata_unlocked(record, root)
+
+
+def create_metadata_if_absent(
+    artifact_id: str,
+    factory: Callable[[], Dict[str, Any]],
+    root: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """Create a record only if there is none, under the record lock.
+
+    Returns ``(record, created)``. The existence check and the write are in the
+    same critical section, so two concurrent registrations of one dataset
+    cannot both decide the record is absent and have the second overwrite the
+    first.
+    """
+    with record_lock(artifact_id, root):
+        current = read_metadata(artifact_id, root)
+        if current is not None:
+            return current, False
+        return _write_metadata_unlocked(factory(), root), True
 
 
 def delete_metadata(artifact_id: str, root: Optional[Path] = None) -> bool:
