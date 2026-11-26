@@ -1808,6 +1808,29 @@ class EntryApp:
     #: is a higher cap, with the same silent truncation one threshold up.
     RUNS_LIST_PAGE = 1000
 
+    #: How many record uploads (and read-backs) the backfill has in flight at
+    #: once. A class attribute so a test can set it to 1 and get the old
+    #: serial order back, or to a large number to check the bound is what
+    #: limits concurrency rather than luck.
+    #:
+    #: Bounded rather than unbounded on purpose: `asyncio.gather` over 313
+    #: uploads would open 313 connections at once against a shared artifact
+    #: store, which trades a timeout for a different kind of outage.
+    #:
+    #: MEASURED at 8 on a fabricated 320-record store: the apply finished in
+    #: 248 s, well inside the 600 s ceiling, but 30 PUTs reported failure -- and
+    #: 23 of those records WERE in the artifact afterwards while 7 were not. The
+    #: store's verdict is therefore unreliable in both directions under that
+    #: load, so the bound is 4 and the read-back is the only judge.
+    RUNS_MIGRATE_CONCURRENCY = 4
+
+    #: Seconds to wait after the commit before the first read-back. The ruling
+    #: that shaped this asked for "a short settle"; the repair pass covers a
+    #: record that is late rather than absent, but a settle costs one second and
+    #: removes a class of repair work that was never needed. A class attribute so
+    #: a test can set it to 0.
+    RUNS_READBACK_SETTLE_S = 1.0
+
     # Class-level fallbacks for the cache, so a published method never raises
     # AttributeError on an instance whose __init__ did not run. That is not a
     # hypothetical: a half-constructed instance is how the suite exercises a
@@ -2826,6 +2849,16 @@ class EntryApp:
                 "the caller read the plan rather than passing apply=true."
             ),
         ),
+        verify_only: bool = Field(
+            False,
+            description=(
+                "Check whether the records are ALREADY in the shared record and "
+                "write nothing. For a caller whose apply was interrupted and who "
+                "needs to know whether it landed. Note it re-plans from the "
+                "worker's disk AS IT IS NOW, not from the interrupted run's plan, "
+                "so a run that has progressed since will read as mismatched."
+            ),
+        ),
         context=None,
     ) -> Dict[str, Any]:
         """Backfill this worker's on-disk runs into the shared record. ADMIN ONLY.
@@ -2936,39 +2969,174 @@ class EntryApp:
             "dry_run": not apply,
         }
 
-        if not apply:
+        plan["verify_only"] = bool(verify_only)
+        if verify_only:
+            # READ-ONLY third mode, and the reason it exists: after an apply is
+            # interrupted -- a proxy timeout, a lost connection -- the caller has
+            # no way to learn whether the records landed. The only answer
+            # available was to list and hash the artifact from OUTSIDE the app,
+            # which is exactly the work this operation exists to spare them, and
+            # which is what had to be done once already.
+            #
+            # It runs the SAME read-back the apply runs -- against the artifact,
+            # by id set and content hash -- and writes nothing: no stage, no
+            # upload, no commit. `confirm` is not required, because there is
+            # nothing to confirm.
+            written, failed, put_unknown = [], [], []
+            stage_error = commit_error = None
+        elif not apply:
             return plan
+        else:
+            if confirm != str(len(planned)):
+                raise ValueError(
+                    f"confirm must be {len(planned)!r} — the number of records this "
+                    f"run plans to write — and it was {confirm!r}. Run without "
+                    f"apply first and read the plan."
+                )
+            if unreadable:
+                raise RuntimeError(
+                    f"{len(unreadable)} run(s) could not be read, so a complete "
+                    f"backfill cannot be claimed; refusing rather than writing a "
+                    f"partial history"
+                )
 
-        if confirm != str(len(planned)):
-            raise ValueError(
-                f"confirm must be {len(planned)!r} — the number of records this "
-                f"run plans to write — and it was {confirm!r}. Run without "
-                f"apply first and read the plan."
-            )
-        if unreadable:
-            raise RuntimeError(
-                f"{len(unreadable)} run(s) could not be read, so a complete "
-                f"backfill cannot be claimed; refusing rather than writing a "
-                f"partial history"
-            )
+            # ONE STAGE, MANY UPLOADS, ONE COMMIT.
+            #
+            # This loop used to call `_persist_run_record` per record, and that
+            # helper wraps `edit(stage=True)` ... `commit()` around a SINGLE file.
+            # That is right for its other caller -- one run finishing on its own --
+            # and ruinous here: a 313-record backfill became 313 artifact commits,
+            # about 1565 round trips taken serially, which is what exceeded the
+            # proxy's 600 s ceiling and left this operation with no success path at
+            # production scale. The write itself was never the problem; the number
+            # of round trips was.
+            #
+            # `_persist_run_record` is deliberately NOT changed. The bulk shape
+            # belongs here, where the records are known to be independent of one
+            # another and a single stage/commit pair covers all of them.
+            written, failed, put_unknown = [], [], []
+            am = await self._runs_artifact_manager()
 
-        written, failed = [], []
-        for item in planned:
-            # The PLANNED record, not a freshly built one: the hash in the plan
-            # is of these bytes, so writing anything else would make the plan a
-            # statement about a document that was never uploaded.
-            ok = await self._persist_run_record(
-                item["id"], record=item["record"], log_failure=True
+            # NEITHER THE STAGE NOR THE COMMIT MAY RAISE OUT OF HERE.
+            #
+            # The stage flag is ARTIFACT-LEVEL, and another instance's commit clears
+            # it -- `_persist_run_record`'s docstring documents that race, and this
+            # replica's own `_runs_sync_loop` is a concurrent stage/commit writer
+            # every `RUNS_SYNC_INTERVAL_S`. Holding the flag open for the whole
+            # upload phase instead of one file makes that window much wider, so the
+            # race is likelier here, not rarer.
+            #
+            # An exception escaping this method is indistinguishable, from the
+            # caller's side, from "the write did not happen" -- which is the exact
+            # harm this operation exists to avoid, and a regression against the
+            # per-record path, which retried and still returned a report. So both
+            # are retried like that path, their failure is RECORDED, and the
+            # read-back below still runs so the caller gets a report either way.
+            async def _retrying(label: str, op) -> Optional[str]:
+                err = None
+                for attempt in (1, 2):
+                    try:
+                        await op()
+                        return None
+                    except Exception as exc:
+                        err = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+                        if attempt == 1:
+                            await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
+                logger.warning(
+                    f"model-finetune: backfill could not {label} the runs artifact: {err}"
+                )
+                return err
+
+            stage_error = await _retrying(
+                "stage",
+                lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
             )
-            (written if ok else failed).append(item["id"])
+            upload_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+            async def _upload_one(entry: Dict[str, Any]) -> tuple:
+                # The PLANNED record, not a freshly built one, and serialised the
+                # same way the plan hashed it: the plan's sha256 is of exactly
+                # these bytes, so sending anything else would make the plan a
+                # statement about a document that was never uploaded.
+                body = _json.dumps(entry["record"]).encode("utf-8")
+                async with upload_sem:
+                    try:
+                        url = await am.put_file(
+                            training.RUNS_ARTIFACT_ID, file_path=entry["path"]
+                        )
+                        resp = await self._http.put(url, content=body)
+                        resp.raise_for_status()
+                    except Exception as exc:
+                        logger.warning(
+                            f"model-finetune: backfill could not upload the record "
+                            f"for '{entry['id']}': {type(exc).__name__}: {exc}"
+                        )
+                        return entry["id"], False
+                    return entry["id"], True
+
+            if stage_error is None:
+                # gather preserves argument order, so `written`/`failed` are built
+                # deterministically rather than in completion order.
+                # A PUT'S OWN VERDICT IS *UNKNOWN*, NOT AUTHORITATIVE.
+                #
+                # Measured on a 320-record store at concurrency 8: 30 PUTs
+                # raised, and 23 of those records were in the artifact
+                # afterwards while 7 were not. So reading a raised PUT as "this
+                # record is missing" would condemn records that landed, and
+                # reading a returned PUT as "landed" is the very error the
+                # read-back exists to catch. Both outcomes are recorded for the
+                # report and NEITHER decides.
+                for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
+                    (written if ok else put_unknown).append(sid)
+            else:
+                # The artifact was never staged, so nothing could be uploaded. Every
+                # planned id is a failure, which is the truth and is reported rather
+                # than raised.
+                failed = [p["id"] for p in planned]
+
+            # Committed ONCE, and after every upload has been awaited. A commit
+            # taken while uploads were still in flight would publish a version the
+            # read-back below then compares against an incomplete set.
+            # WHAT THIS RETRY DOES AND DOES NOT COVER, because a review found the
+            # comment claiming more than the code delivers.
+            #
+            # It retries the commit ALONE, so it covers a TRANSIENT commit failure
+            # and nothing else. It cannot win the race named in
+            # `_persist_run_record`'s docstring: there, another writer's commit
+            # clears the ARTIFACT-LEVEL stage flag, and that flag stays cleared
+            # until somebody re-stages -- so a second `commit` fails for exactly
+            # the reason the first did. The per-record path survives that race
+            # because its retry repeats `edit(stage=True)` as well.
+            #
+            # Re-staging here would mean calling `edit(stage=True)` AFTER the
+            # uploads, and whether that preserves or discards a staged upload is
+            # NOT measured -- every other caller stages before uploading, so
+            # nothing in this file establishes it. Doing it on an assumption could
+            # throw away the whole upload phase to save a commit. So the narrow
+            # retry stays, and the behaviour under a cleared flag is: fail closed,
+            # record `commit_error`, and still report (there is an arm for it).
+            commit_error = None
+            if stage_error is None:
+                commit_error = await _retrying(
+                    "commit",
+                    lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+                )
         plan["applied"] = len(written)
-        plan["failed"] = failed
+        plan["failed"] = sorted(failed)
+        plan["stage_error"] = stage_error
+        plan["commit_error"] = commit_error
 
         # THE ARTIFACT IS READ BACK. `written` only means "our commit returned"
         # -- it is this replica's account of its own actions, and a backfill
         # that grades itself on that has not checked anything. What the clause
         # asks is whether the ARTIFACT holds the records, so the artifact is
         # asked, and the bytes it serves are hashed and compared to the plan.
+        if not verify_only and stage_error is None:
+            # Short settle before asking what landed. Not load-bearing -- the
+            # repair pass handles a record that is merely late -- but cheap, and
+            # it keeps the repair for records that are actually wrong.
+            await asyncio.sleep(max(0.0, float(self.RUNS_READBACK_SETTLE_S)))
+
         verified, verify_error = {}, None
         try:
             am = await self._runs_artifact_manager()
@@ -2986,19 +3154,32 @@ class EntryApp:
                     "the read-back listing could not be proven complete, so the "
                     "artifact's contents cannot be compared against the plan"
                 )
-            for fname in listing:
+            # Filtered BEFORE fetching, not inside the loop: a record that
+            # belongs to another deployment or to an older run is not part of
+            # this plan and is not evidence either way about it, so there is no
+            # reason to spend a round trip on it.
+            targets = [f for f in listing if f[: -len(".json")] in plan["hashes"]]
+            verify_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+            async def _fetch_one(fname: str) -> tuple:
                 sid = fname[: -len(".json")]
-                if sid not in plan["hashes"]:
-                    # Another deployment's or an older run's record. Not part of
-                    # this plan, so not evidence either way about it.
-                    continue
-                url = await am.get_file(
-                    artifact_id=training.RUNS_ARTIFACT_ID,
-                    file_path=f"{training.run_record_dir(store)}/{fname}",
-                )
-                resp = await self._http.get(url)
-                resp.raise_for_status()
-                verified[sid] = hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
+                async with verify_sem:
+                    url = await am.get_file(
+                        artifact_id=training.RUNS_ARTIFACT_ID,
+                        file_path=f"{training.run_record_dir(store)}/{fname}",
+                    )
+                    resp = await self._http.get(url)
+                    resp.raise_for_status()
+                    return sid, hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
+
+            # A raising fetch propagates out of gather and is caught by the
+            # handler below, which records it as `verify_error` -- the same
+            # behaviour the serial loop had. It must NOT be swallowed per
+            # record: a read-back that quietly skipped a record would leave its
+            # id absent from `verified`, and the mismatch list would then blame
+            # the record instead of the read.
+            for sid, digest in await asyncio.gather(*(_fetch_one(f) for f in targets)):
+                verified[sid] = digest
         except Exception as exc:
             verify_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
 
@@ -3007,17 +3188,161 @@ class EntryApp:
         plan["mismatched"] = sorted(
             sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
         )
+        plan["put_unknown"] = sorted(put_unknown)
+
+        # REPAIR PASS: re-upload ONLY what the read-back condemns.
+        #
+        # The read-back is the only judge of what landed, so it is also the only
+        # thing that can say what still needs writing. Retrying everything would
+        # re-upload hundreds of records that are already correct -- which is the
+        # cost this whole change exists to remove -- and retrying the PUTs that
+        # raised would retry the wrong set: measured at concurrency 8, 30 raised
+        # and only 7 of those were actually absent, while a PUT that returned
+        # cleanly can still have landed nothing.
+        #
+        # One pass, not a loop: if a record cannot be written twice under a
+        # bound of 4, that is a condition to report rather than to grind at.
+        plan["repaired"] = []
+        if (
+            not verify_only
+            and plan["mismatched"]
+            and stage_error is None
+            and commit_error is None
+            and verify_error is None
+        ):
+            bad = list(plan["mismatched"])
+            by_id = {e["id"]: e for e in planned}
+            retry = [by_id[sid] for sid in bad if sid in by_id]
+            logger.info(
+                f"model-finetune: backfill repairing {len(retry)} record(s) the "
+                f"read-back found missing or mismatched"
+            )
+            repair_error = await _retrying(
+                "re-stage for the repair pass",
+                lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
+            )
+            if repair_error is None:
+                await asyncio.gather(*(_upload_one(e) for e in retry))
+                repair_error = await _retrying(
+                    "commit the repair pass",
+                    lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+                )
+            plan["repair_error"] = repair_error
+
+            # RE-READ the repaired ids, because the repair's own PUT verdicts are
+            # no more authoritative than the first pass's were.
+            #
+            # PER ID, and an ABSENT record is "still missing" rather than a read
+            # failure. A review measured the difference: one record that stays
+            # missing 404s on its fetch, and a single `gather` then raised and
+            # discarded EVERY digest in the batch -- including those of records
+            # the repair had just landed correctly. With 2 transient and 1
+            # permanent failure the report read `repaired: []` and condemned all
+            # three, when the truth was two repaired and one unresolved. That is
+            # the same misreport this whole row exists to remove, so it cannot be
+            # allowed to live in the repair's own reporting.
+            #
+            # `repair_error` is reserved for a failed stage or commit, or a read
+            # that could not run at all. An individual record that is not there
+            # is not an error -- it is the answer.
+            if repair_error is None:
+                results = await asyncio.gather(
+                    *(_fetch_one(f"{sid}.json") for sid in bad),
+                    return_exceptions=True,
+                )
+                for sid, outcome in zip(bad, results):
+                    if isinstance(outcome, BaseException):
+                        # Left out of `verified`, so the comparison below reports
+                        # it as still mismatched -- which is exactly true.
+                        logger.info(
+                            f"model-finetune: record '{sid}' is still not "
+                            f"readable after the repair: "
+                            f"{type(outcome).__name__}: {outcome}"
+                        )
+                        continue
+                    got_sid, digest = outcome
+                    verified[got_sid] = digest
+            plan["verified"] = len(verified)
+            plan["mismatched"] = sorted(
+                sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
+            )
+            plan["repaired"] = sorted(set(bad) - set(plan["mismatched"]))
+
+        # THE PUSHED BOOKKEEPING FOLLOWS THE READ-BACK, so it belongs here --
+        # after the repair pass -- not next to the uploads. Keying it on what the
+        # ARTIFACT holds is the whole point: recording only the ids whose PUT
+        # returned leaves out the put_unknown ids that did land and the ids the
+        # repair fixed, and the next sync then re-pushes them one commit each.
+        #
+        # Placing it before the read-back is also simply wrong: `verified` does not
+        # exist yet there, which is how this was found -- 22 tests raised
+        # UnboundLocalError rather than a wrong answer, which is the good direction.
+        if not verify_only and stage_error is None and commit_error is None:
+            pushed = dict(self._runs_pushed)
+            by_id = {e["id"]: e["record"] for e in planned}
+            for sid, digest in verified.items():
+                if sid in by_id and digest == plan["hashes"].get(sid):
+                    pushed[sid] = _json.dumps(by_id[sid], sort_keys=True)
+            self._runs_pushed = pushed
         # COMPLETE IS THE CONJUNCTION, and every term is load-bearing: nothing
         # failed to write, the id set that landed is the id set that was
         # planned, the read-back itself succeeded, and every record the artifact
         # serves hashes to what the plan said it would. Dropping the last term
         # is what let a record land with the wrong content and still be called
         # complete.
-        plan["complete"] = (
-            not failed
-            and set(written) == set(plan["ids"])
+        # "NOT LANDED" AND "PRESENT, BUT NOT PUT THERE BY THIS RUN" ARE
+        # DIFFERENT, and a report that cannot distinguish them invites the wrong
+        # repair: a caller seeing only `complete: False` re-runs, and re-uploading
+        # 313 records to fix nothing is the cost of not saying so.
+        #
+        # Named for a WRITE error, not a commit error, because a review showed it
+        # fires on a failed STAGE too -- and truthfully so. With the stage
+        # refused nothing is uploaded, yet the artifact can still hold every
+        # planned record from an EARLIER run, which is exactly what an
+        # interrupted caller wants to know. The earlier name said "commit" and
+        # the comment claimed another writer's commit had published our uploads;
+        # neither is true in the stage case.
+        #
+        # `complete` stays False either way: this run did not establish that
+        # state and must not claim it.
+        plan["records_present_despite_write_error"] = bool(
+            (stage_error or commit_error)
             and verify_error is None
             and not plan["mismatched"]
+            and set(plan["ids"]) <= set(verified)
+        )
+        # `complete` MEANS SOMETHING DIFFERENT IN A READ than in a write, and
+        # saying so explicitly is the point. In verify_only nothing was written,
+        # so `set(written) == set(ids)` can never hold and the answer would have
+        # been False however complete the artifact was -- which is a verify that
+        # always says "no". For a read the question is only whether the artifact
+        # holds every planned record, by the same id set and content hash.
+        if verify_only:
+            plan["complete"] = (
+                verify_error is None
+                and not plan["mismatched"]
+                and set(plan["ids"]) <= set(verified)
+            )
+            return plan
+
+        # THE READ-BACK IS THE ONLY JUDGE, so `complete` no longer consults
+        # `written`. That term asserted "every PUT returned", and a PUT's verdict
+        # has been measured unreliable in both directions -- it condemned 23
+        # records that had landed and cleared none of the 7 that had not. What
+        # remains is what the artifact itself says, plus the write-side errors
+        # that mean this replica cannot vouch for the artifact's state at all.
+        plan["failed"] = sorted(plan["mismatched"])
+        plan["complete"] = (
+            not plan["mismatched"]
+            and verify_error is None
+            and plan.get("repair_error") is None
+            # A stage or commit that failed after its retry means the artifact
+            # may not hold what was uploaded, so the run is not complete even if
+            # every PUT returned. Reported as False rather than raised: the
+            # caller needs a verdict, and an exception here is indistinguishable
+            # from "the write never happened".
+            and stage_error is None
+            and commit_error is None
         )
         return plan
 

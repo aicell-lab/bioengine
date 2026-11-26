@@ -81,18 +81,54 @@ class FakeAM:
         #: error rather than a hang.
         self.max_asks = 50
         self.list_asks = []  # (dir_path, limit, offset) as ASKED, not as served
+        #: How many times the artifact was STAGED and COMMITTED. Counted
+        #: because the cost this fake cannot otherwise show is round trips:
+        #: the backfill used to stage and commit once PER RECORD.
+        self.edits = 0
+        self.commits = 0
+        #: Make the first N stage/commit calls RAISE. The artifact-level stage
+        #: flag is cleared by any other instance's commit, so both of these
+        #: fail in production; the backfill must report rather than raise.
+        self.fail_edits = 0
+        self.fail_commits = 0
+        #: Whether the artifact is staged. Defaults True so the existing arms
+        #: are undisturbed; it only bites with `sticky_unstage` below.
+        self.staged = True
+        #: Model the REAL race: another writer's commit clears the
+        #: artifact-level stage flag and it STAYS cleared until someone
+        #: re-stages. A commit-only retry therefore fails again for exactly
+        #: the reason the first attempt did -- which `fail_commits` (raise
+        #: once, then succeed) does NOT model.
+        self.sticky_unstage = False
+        #: Uploads in flight, and the high-water mark, so a test can assert
+        #: the concurrency BOUND rather than hoping.
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     def store(self, path, text):
         self.files[path] = text
 
     async def edit(self, artifact_id=None, stage=None, **kw):
-        pass
+        self.edits += 1
+        if self.fail_edits > 0:
+            self.fail_edits -= 1
+            raise RuntimeError("artifact is not in staging mode")
+        self.staged = True
 
     async def put_file(self, artifact_id=None, file_path=None, **kw):
         return f"https://upload.example/{file_path}"
 
     async def commit(self, artifact_id=None, **kw):
-        pass
+        self.commits += 1
+        if self.sticky_unstage:
+            # Another writer published and cleared the flag. It stays cleared.
+            self.staged = False
+        if not self.staged:
+            raise RuntimeError("artifact is not in staging mode")
+        if self.fail_commits > 0:
+            self.fail_commits -= 1
+            raise RuntimeError("transient commit failure")
+        self.staged = False
 
     async def list_files(
         self, artifact_id=None, dir_path=None, limit=1000, offset=0, **kw
@@ -164,8 +200,17 @@ class FakeHTTP:
         return url.split("://", 1)[1].split("/", 1)[1]
 
     async def put(self, url, content=None, **kw):
-        self.am.store(self._path(url), content.decode("utf-8"))
-        return self._Resp(200)
+        self.am.in_flight += 1
+        self.am.max_in_flight = max(self.am.max_in_flight, self.am.in_flight)
+        try:
+            # Yield so overlapping uploads are actually interleaved by the loop;
+            # without this every PUT completes before the next starts and the
+            # high-water mark would read 1 however concurrent the caller is.
+            await asyncio.sleep(0)
+            self.am.store(self._path(url), content.decode("utf-8"))
+            return self._Resp(200)
+        finally:
+            self.am.in_flight -= 1
 
     async def get(self, url, **kw):
         path = self._path(url)
@@ -181,6 +226,7 @@ def _wire(inst, am=None):
     inst._http = FakeHTTP(am)
     inst._runs_pushed = {}
     inst.RUNS_RETRY_DELAY_S = 0
+    inst.RUNS_READBACK_SETTLE_S = 0
 
     async def _get_am():
         return am
@@ -189,33 +235,63 @@ def _wire(inst, am=None):
     return am
 
 
-def _app(persisted=None, fail=(), tamper=(), am=None):
-    """An instance whose `_persist_run_record` is STUBBED.
+def _app(
+    persisted=None, fail=(), tamper=(), tamper_once=(), raise_after_store=(), am=None
+):
+    """An instance whose fake UPLOAD records what the artifact received.
 
-    The stub still deposits the record it was handed into the fake artifact, so
-    the read-back has something real to read; `tamper` makes it deposit
-    something else instead, which is how a record that lands with the WRONG
-    CONTENT is exercised. The real write path is covered separately, by
-    `test_the_PLANNED_HASH_is_a_hash_of_the_BYTES_ACTUALLY_UPLOADED`.
+    These levers used to hang off a stubbed `_persist_run_record`. The apply
+    path no longer calls that helper at all -- it stages once, uploads every
+    record, and commits once, because calling the helper per record meant one
+    artifact COMMIT per record and about 1565 serial round trips for a
+    313-record store. A stub there now intercepts nothing: `persisted` stayed
+    empty and `fail`/`tamper` reached no code, while `applied` and `complete`
+    still read correct, which is exactly the shape of a test that has stopped
+    testing.
+
+    So they moved onto the HTTP PUT the backfill actually performs. That
+    exercises the real `put_file` -> PUT -> `commit` sequence, and `persisted`
+    now means "the artifact received this record" rather than "this private
+    method was called" -- a stronger statement, and one that survives the next
+    refactor of the write path.
     """
     cls = _entry_cls()
     inst = object.__new__(cls)
     am = _wire(inst, am)
+    real_put = inst._http.put
+    _tampered = set()
 
-    async def _persist(session_id, status=None, *, log_failure=False, record=None):
-        if session_id in fail:
-            return False
+    def _id_from(url):
+        return url.rsplit("/", 1)[-1][: -len(".json")]
+
+    async def _put(url, content=None, **kw):
+        sid = _id_from(url)
+        if sid in raise_after_store:
+            # The measured production behaviour at concurrency 8: the record
+            # LANDS and the call raises anyway. 23 of 30 raised PUTs were like
+            # this. Reading such a verdict as "missing" condemns a good record.
+            await real_put(url, content=content, **kw)
+            if persisted is not None:
+                persisted.append(sid)
+            raise RuntimeError("RemoteError after the write landed")
+        if sid in fail:
+            # The real failure arrives as a raising PUT, which the upload path
+            # catches per record; returning a 500 would exercise
+            # `raise_for_status` instead. Both land in `failed`.
+            raise RuntimeError(f"upload refused for {sid}")
         if persisted is not None:
-            persisted.append(session_id)
-        body = (
-            json.dumps({"tampered": session_id})
-            if session_id in tamper
-            else json.dumps(record)
-        )
-        am.store(f"{training.run_record_dir('an-app')}/{session_id}.json", body)
-        return True
+            persisted.append(sid)
+        if sid in tamper:
+            content = json.dumps({"tampered": sid}).encode("utf-8")
+        elif sid in tamper_once and sid not in _tampered:
+            # Corrupt the FIRST attempt only, so the repair pass has something
+            # it can actually fix. `tamper` corrupts every attempt and can never
+            # be repaired, which makes it useless for testing the repair.
+            _tampered.add(sid)
+            content = json.dumps({"tampered": sid}).encode("utf-8")
+        return await real_put(url, content=content, **kw)
 
-    inst._persist_run_record = _persist
+    inst._http.put = _put
     return cls, inst
 
 
@@ -384,7 +460,11 @@ def test_a_record_that_lands_with_the_WRONG_CONTENT_is_NOT_complete(store):
     plan = _run(cls, inst, apply=True, confirm="2")
 
     assert plan["applied"] == 2, plan
-    assert plan["failed"] == [], plan
+    # `failed` now means "still not right in the ARTIFACT after the repair pass",
+    # not "a PUT reported failure" -- the read-back is the only judge. The
+    # tampered record is corrupt on every attempt, so the repair cannot fix it
+    # and it is still failed, which is the stronger statement.
+    assert plan["failed"] == plan["mismatched"], plan
     assert plan["mismatched"] == ["2026-01-01-000002-bbbbbbbb"], plan
     assert plan["complete"] is False, plan
 
@@ -396,7 +476,10 @@ def test_a_READ_BACK_THAT_FAILS_is_not_a_complete_migration(store):
     plan = _run(cls, inst, apply=True, confirm="1")
 
     assert plan["applied"] == 1, plan
-    assert plan["failed"] == [], plan
+    # With the read-back broken this replica cannot vouch for ANY record, so all
+    # of them are failed. Under the old meaning `failed` was empty here because
+    # the PUTs returned -- which said nothing about the artifact.
+    assert plan["failed"] == plan["ids"], plan
     assert plan["verify_error"] is not None, plan
     assert plan["complete"] is False, plan
 
@@ -521,3 +604,496 @@ def test_the_writer_USES_the_record_it_was_GIVEN(store):
     assert (
         json.loads(am.files[path]) == sentinel
     ), "the writer rebuilt the record instead of writing the one it was handed"
+
+
+# ── the round-trip cost, which is what the ceiling was about ───────────────
+
+
+def test_a_BACKFILL_STAGES_ONCE_AND_COMMITS_ONCE_however_many_records(store):
+    """THE property the fix buys. The timeout was a round-trip count, not a write.
+
+    The apply used to call `_persist_run_record` per record, and that helper wraps
+    `edit(stage=True)` ... `commit()` around ONE file -- so a 313-record backfill
+    performed 313 artifact commits and about 1565 round trips, taken serially. The
+    stage/commit count has to be independent of how many records there are.
+    """
+    for i in range(1, 13):
+        store(f"2026-01-01-0000{i:02d}-aaaaaaa{i % 10}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="12")
+
+    assert plan["applied"] == 12, plan
+    assert plan["complete"] is True, plan
+    assert am.edits == 1, f"staged {am.edits} times for 12 records"
+    assert am.commits == 1, f"committed {am.commits} times for 12 records"
+
+
+def test_the_upload_concurrency_is_BOUNDED_by_the_class_attribute(store):
+    """Bounded, not unbounded -- 313 simultaneous connections is a different outage.
+
+    Asserted on the high-water mark of uploads in flight, and on it being ABOVE one,
+    so this cannot pass because the uploads happened to serialise.
+    """
+    for i in range(1, 13):
+        store(f"2026-01-01-0000{i:02d}-bbbbbbb{i % 10}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    inst.RUNS_MIGRATE_CONCURRENCY = 3
+
+    _run(cls, inst, apply=True, confirm="12")
+
+    assert am.max_in_flight > 1, "the uploads never overlapped, so this asserts nothing"
+    assert am.max_in_flight <= 3, f"concurrency reached {am.max_in_flight}, bound was 3"
+
+
+def test_a_concurrency_of_ONE_still_completes(store):
+    """THE CONTROL on the bound: it is a ceiling, not a requirement to overlap.
+
+    A fix that only worked when requests overlapped would pass the test above and
+    break on a store that forced serialisation.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-ccccccc{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    inst.RUNS_MIGRATE_CONCURRENCY = 1
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert am.max_in_flight == 1, am.max_in_flight
+    assert am.commits == 1, am.commits
+
+
+# ── neither the stage nor the commit may raise out of the apply ────────────
+
+
+def test_a_commit_that_loses_the_race_ONCE_is_retried_and_still_completes(store):
+    """The stage flag is artifact-level and any other instance's commit clears it.
+
+    `_persist_run_record` retried for exactly this reason. The bulk path holds the
+    flag open for the WHOLE upload phase instead of one file, and this replica's own
+    sync loop is a concurrent stage/commit writer, so the window is WIDER here, not
+    narrower. One lost race must not cost the run.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-ddddddd{i}")
+    am = FakeAM()
+    am.fail_commits = 1
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert plan["commit_error"] is None, plan["commit_error"]
+    assert am.commits == 2, f"the commit was not retried (commits={am.commits})"
+
+
+def test_a_commit_that_KEEPS_failing_RETURNS_A_REPORT_rather_than_raising(store):
+    """THE regression this answers. An exception here is the row's own harm.
+
+    From the caller's side a raised error is indistinguishable from "the write did
+    not happen" -- which is exactly what this operation exists to let them tell
+    apart. The per-record path retried and still returned a report; the first
+    version of the bulk path let the error escape with no report at all.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-eeeeeee{i}")
+    am = FakeAM()
+    am.fail_commits = 99
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")  # must NOT raise
+
+    assert plan["complete"] is False, plan
+    assert plan["commit_error"], "the commit failure was not recorded"
+    # A TRANSIENT failure, which is what `fail_commits` models and the only thing a
+    # commit-only retry can cover. The stage-flag race is a different mode with its
+    # own arm below, and conflating them is what made the earlier comment overstate
+    # what this retry does.
+    assert "transient" in plan["commit_error"], plan["commit_error"]
+    # the read-back still ran, so the caller gets a verdict and not a silence
+    assert "verified" in plan and "mismatched" in plan, plan
+
+
+def test_a_STAGE_that_keeps_failing_also_returns_a_report(store):
+    """Same property one step earlier: nothing was uploaded, and that is reported."""
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-fffffff{i}")
+    am = FakeAM()
+    am.fail_edits = 99
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")  # must NOT raise
+
+    assert plan["complete"] is False, plan
+    assert plan["stage_error"], "the stage failure was not recorded"
+    assert plan["applied"] == 0, plan
+    assert plan["failed"] == plan["ids"], plan
+
+
+def test_the_backfill_RECORDS_WHAT_IT_PUSHED_so_the_sync_loop_does_not_redo_it(store):
+    """Otherwise the 313-commit cost is moved into the background loop, not removed.
+
+    The per-record path recorded every push in `_runs_pushed`. Without it the next
+    `_sync_run_records` sees every migrated record as unpushed and re-pushes all of
+    them, one commit each -- the exact cost this change exists to remove.
+    """
+    ids = []
+    for i in range(1, 5):
+        sid = f"2026-01-01-0000{i:02d}-aaabbbb{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert sorted(inst._runs_pushed) == sorted(ids), sorted(inst._runs_pushed)
+
+
+def test_nothing_is_recorded_as_pushed_when_the_commit_FAILED(store):
+    """THE CONTROL on the test above: the bookkeeping must not lie.
+
+    Recording a push whose commit never landed would make the sync loop skip the
+    very records that are missing from the artifact.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-cccdddd{i}")
+    am = FakeAM()
+    am.fail_commits = 99
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is False, plan
+    assert inst._runs_pushed == {}, inst._runs_pushed
+
+
+def test_a_STICKY_cleared_stage_flag_fails_CLOSED_and_says_the_records_are_there(store):
+    """The race the retry CANNOT win, modelled the way the flag actually behaves.
+
+    `fail_commits` raises once and then succeeds, which no cleared stage flag does:
+    the flag stays cleared until someone re-stages, so a commit-only retry fails
+    again for exactly the reason the first attempt did. A review pointed out that the
+    "loses the race once" arm above therefore only proves the retry handles a
+    TRANSIENT error -- this one pins the real case.
+
+    Required behaviour: fail closed, report rather than raise, and tell the caller the
+    records are nonetheless present -- because another writer's commit published this
+    replica's staged uploads. Without that last part a caller sees `complete: False`
+    and re-runs, re-uploading every record to fix nothing.
+    """
+    ids = []
+    for i in range(1, 7):
+        sid = f"2026-01-01-0000{i:02d}-5555555{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    am.sticky_unstage = True
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="6")  # must NOT raise
+
+    assert plan["complete"] is False, plan
+    assert plan["commit_error"], "the cleared flag was not recorded"
+    assert "staging" in plan["commit_error"], plan["commit_error"]
+    # the retry could not win it, and the count says so rather than the comment
+    assert am.commits == 2, f"commits={am.commits}"
+    assert am.edits == 1, f"the commit retry re-staged; edits={am.edits}"
+    # and the records ARE in the artifact, which the report must say
+    assert plan["verified"] == 6, plan
+    assert plan["mismatched"] == [], plan
+    assert plan["records_present_despite_write_error"] is True, plan
+
+
+def test_a_CLEAN_run_does_not_claim_records_present_despite_a_commit_error(store):
+    """THE CONTROL: the new field must not be true when nothing went wrong.
+
+    A field that is always true carries no information, and this one exists precisely
+    to distinguish two outcomes.
+    """
+    for i in range(1, 4):
+        store(f"2026-01-01-0000{i:02d}-6666666{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    assert plan["complete"] is True, plan
+    assert plan["records_present_despite_write_error"] is False, plan
+
+
+# ── verify_only: what an interrupted caller can ask the app ────────────────
+
+
+def test_VERIFY_ONLY_says_the_records_landed_after_a_successful_apply(store):
+    """The question an interrupted apply leaves behind, answered BY THE APP.
+
+    Without this the only way to learn whether a timed-out apply landed was to list
+    and hash the artifact from OUTSIDE -- which is the work this operation exists to
+    spare a caller, and which had to be done by hand once already.
+    """
+    for i in range(1, 7):
+        store(f"2026-01-01-0000{i:02d}-7777777{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    applied = _run(cls, inst, apply=True, confirm="6")
+    assert applied["complete"] is True, applied
+
+    out = _run(cls, inst, verify_only=True)
+
+    assert out["verify_only"] is True, out
+    assert out["complete"] is True, out
+    assert out["verified"] == 6, out
+    assert out["mismatched"] == [], out
+
+
+def test_VERIFY_ONLY_WRITES_NOTHING(store):
+    """It must be safe to ask. Asserted on the store's own counters, not on intent."""
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-8888888{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    _run(cls, inst, apply=True, confirm="4")
+    edits, commits, files = am.edits, am.commits, dict(am.files)
+
+    out = _run(cls, inst, verify_only=True)
+
+    assert out["applied"] == 0, out
+    assert am.edits == edits, f"verify_only staged ({am.edits} vs {edits})"
+    assert am.commits == commits, f"verify_only committed ({am.commits} vs {commits})"
+    assert am.files == files, "verify_only changed the stored records"
+
+
+def test_VERIFY_ONLY_reports_records_that_are_NOT_there(store):
+    """THE CONTROL on both tests above: it must be able to say no.
+
+    A verify that always answered "landed" would satisfy them and be worse than
+    having none, because the caller would stop looking.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-9999999{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    out = _run(cls, inst, verify_only=True)  # nothing was ever applied
+
+    assert out["complete"] is False, out
+    assert out["verified"] == 0, out
+    assert out["mismatched"] == out["ids"], out
+
+
+def test_VERIFY_ONLY_does_not_require_confirm(store):
+    """There is nothing to confirm, so demanding it would make the mode unusable.
+
+    `confirm` exists to prove the caller read a plan before WRITING. A read needs no
+    such proof, and an interrupted caller may not know the count any more.
+    """
+    store("2026-01-01-000001-aaaa0001")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+
+    out = _run(cls, inst, verify_only=True)  # no confirm passed; must not raise
+
+    assert out["verify_only"] is True, out
+
+
+def test_the_field_also_fires_on_a_failed_STAGE_which_is_why_it_is_named_for_a_WRITE(
+    store,
+):
+    """The rename, pinned. A review found the field firing on a stage error too.
+
+    With the stage refused nothing is uploaded, yet the artifact can still hold every
+    planned record from an EARLIER run -- which is precisely what an interrupted
+    caller wants to know. The content was always truthful; the NAME said "commit" and
+    the comment claimed another writer's commit had published our uploads, and neither
+    is true here.
+    """
+    for i in range(1, 5):
+        store(f"2026-01-01-0000{i:02d}-eeff001{i}")
+    am = FakeAM()
+    cls, inst = _app(am=am)
+    first = _run(cls, inst, apply=True, confirm="4")
+    assert first["complete"] is True, first
+
+    am.fail_edits = 2  # both attempts of the retry
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["stage_error"], plan
+    assert plan["commit_error"] is None, plan
+    assert plan["applied"] == 0, plan
+    # Nothing was uploaded, yet the records ARE in the artifact from the earlier
+    # run -- so nothing is "failed" in the new sense while the run is still not
+    # complete, because this replica's stage never landed. The two are
+    # independent, and that is the point of the field below.
+    assert plan["failed"] == [], plan
+    assert plan["verified"] == 4, plan
+    assert plan["records_present_despite_write_error"] is True, plan
+    assert plan["complete"] is False, plan
+
+
+# ── the read-back is the only judge, and it drives a repair ────────────────
+
+
+def test_a_PUT_that_RAISES_AFTER_THE_RECORD_LANDED_is_not_condemned(store):
+    """Measured production behaviour, and the reason a PUT verdict is UNKNOWN.
+
+    At concurrency 8, 30 PUTs raised on a 320-record store and 23 of those records
+    were in the artifact afterwards. Treating a raised PUT as "this record is
+    missing" would condemn all 23 and report an incomplete migration that was in
+    fact complete -- and the natural repair, re-running, would re-upload them all.
+    """
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-abcd000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, raise_after_store=(ids[1], ids[3]))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["put_unknown"] == sorted([ids[1], ids[3]]), plan["put_unknown"]
+    assert plan["mismatched"] == [], plan
+    assert plan["failed"] == [], plan
+    assert plan["complete"] is True, plan
+    assert plan["repaired"] == [], "nothing needed repairing, yet a repair ran"
+
+
+def test_a_record_that_lands_WRONG_ONCE_is_REPAIRED_and_the_run_completes(store):
+    """The repair pass, driven by the read-back rather than by a PUT verdict."""
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-beef000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(ids[2],))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["repaired"] == [ids[2]], plan["repaired"]
+    assert plan["mismatched"] == [], plan
+    assert plan["complete"] is True, plan
+
+
+def test_the_repair_RE_UPLOADS_ONLY_the_condemned_ids(store):
+    """Retrying everything would re-upload hundreds of correct records.
+
+    Asserted by COUNTING uploads: 5 in the first pass plus exactly 1 repair.
+    """
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-cafe000{i}"
+        store(sid)
+        ids.append(sid)
+    puts = []
+    am = FakeAM()
+    cls, inst = _app(puts, am=am, tamper_once=(ids[0],))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["complete"] is True, plan
+    assert len(puts) == 6, f"expected 5 + 1 repair, got {len(puts)}: {puts}"
+    assert puts.count(ids[0]) == 2, puts
+
+
+def test_a_record_that_lands_wrong_EVERY_time_is_NOT_called_complete(store):
+    """THE CONTROL on the repair: it must not paper over a record that stays wrong.
+
+    A repair pass that reported success regardless would satisfy the two tests above
+    and hide exactly the corruption the read-back exists to catch.
+    """
+    for i in range(1, 4):
+        store(f"2026-01-01-0000{i:02d}-dead000{i}")
+    am = FakeAM()
+    bad = "2026-01-01-000002-dead0002"
+    cls, inst = _app(am=am, tamper=(bad,))
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    assert plan["mismatched"] == [bad], plan
+    assert plan["failed"] == [bad], plan
+    assert plan["repaired"] == [], plan
+    assert plan["complete"] is False, plan
+
+
+def test_a_PERMANENT_failure_does_not_erase_the_REPAIRED_ids_from_the_report(store):
+    """The round-4 finding. One record that stays missing used to condemn the rest.
+
+    The repair's re-read gathered every condemned id in one call. A record that is
+    still absent 404s, the gather raised, and NO digest in the batch was recorded --
+    including those of records the repair had just landed. With two transient
+    failures and one permanent one the report read `repaired: []` and blamed all
+    three, when the truth was two repaired and one unresolved.
+
+    That is the same misreport this row exists to remove, so the repair's own
+    reporting must not reproduce it. A record that is not there is the ANSWER, not a
+    read error: `repair_error` is reserved for a stage, a commit, or a read that
+    could not run at all.
+    """
+    ids = []
+    for i in range(1, 7):
+        sid = f"2026-01-01-0000{i:02d}-f00d000{i}"
+        store(sid)
+        ids.append(sid)
+    transient, permanent = (ids[1], ids[3]), ids[5]
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=transient, fail=(permanent,))
+
+    plan = _run(cls, inst, apply=True, confirm="6")
+
+    assert plan["complete"] is False, plan
+    assert plan["mismatched"] == [permanent], plan["mismatched"]
+    assert plan["failed"] == [permanent], plan["failed"]
+    assert plan["repaired"] == sorted(transient), plan["repaired"]
+    assert plan.get("repair_error") is None, plan.get("repair_error")
+
+
+def test_a_repair_that_FULLY_converges_still_reports_no_unresolved_ids(store):
+    """THE CONTROL on the test above: the convergent case must not regress.
+
+    Handling an absent record per id could have been bought by swallowing every
+    fetch error, which would make a wholly failed read look like a clean one.
+    """
+    ids = []
+    for i in range(1, 5):
+        sid = f"2026-01-01-0000{i:02d}-f11d000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(ids[0], ids[2]))
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert plan["mismatched"] == [], plan
+    assert plan["repaired"] == sorted([ids[0], ids[2]]), plan["repaired"]
+
+
+def test_the_pushed_bookkeeping_follows_the_ARTIFACT_not_the_PUT_verdicts(store):
+    """A record that landed despite a raised PUT must not be re-pushed by the sync.
+
+    Recording only the ids whose PUT returned left out both the put_unknown ids that
+    did land and the ids the repair fixed, so the next sync re-pushed them one commit
+    each -- the same wrong authority this change removed everywhere else.
+    """
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-f22d000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, raise_after_store=(ids[1],), tamper_once=(ids[3],))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["complete"] is True, plan
+    assert ids[1] in plan["put_unknown"], plan["put_unknown"]
+    assert plan["repaired"] == [ids[3]], plan["repaired"]
+    # every id the ARTIFACT holds is recorded, including the raised one and the repaired one
+    assert sorted(inst._runs_pushed) == sorted(ids), sorted(inst._runs_pushed)
