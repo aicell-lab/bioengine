@@ -298,7 +298,9 @@ def test_the_module_takes_no_byte_range_lock_AT_ALL(monkeypatch, tmp_path):
     for node in _ast.walk(tree):
         if isinstance(node, _ast.Import):
             bad += [a.name for a in node.names if a.name.split(".")[0] == "fcntl"]
-        elif isinstance(node, _ast.ImportFrom) and (node.module or "").startswith("fcntl"):
+        elif isinstance(node, _ast.ImportFrom) and (node.module or "").startswith(
+            "fcntl"
+        ):
             bad.append(node.module)
         elif isinstance(node, _ast.Attribute) and isinstance(node.value, _ast.Name):
             if node.value.id == "fcntl":
