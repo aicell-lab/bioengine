@@ -32,6 +32,8 @@ counted separately rather than summed.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import broker_core as core
@@ -112,11 +114,15 @@ async def test_a_WARM_visit_costs_ZERO_artifact_reads_at_any_N(
     after = dict(b._tam.calls)
 
     assert len(entries) == n
-    assert after.get("read") == before.get("read"), (
-        f"a warm visit made {after.get('read', 0) - before.get('read', 0)} "
-        f"artifact read(s) at N={n}; it must make none"
+    # THE WHOLE dict, not the two keys I happened to think of. A review pointed
+    # out this asserted `read` and `read_json_file` and never `list_files` --
+    # the image-count leg is half the cost measured, and a warm regression in
+    # its listing would have passed. There is no call type a warm visit may
+    # make, so there is nothing to enumerate.
+    assert after == before, (
+        f"a warm visit at N={n} made calls the cold one had not: "
+        f"{ {k: after.get(k, 0) - before.get(k, 0) for k in set(after) | set(before) if after.get(k) != before.get(k)} }"
     )
-    assert after.get("read_json_file") == before.get("read_json_file")
 
 
 async def test_the_SINGLE_DATASET_case_does_not_get_WORSE(monkeypatch, tmp_path):
@@ -202,9 +208,34 @@ async def test_UNPUBLISHING_removes_the_card_even_while_it_is_CACHED(
     entries = await b.list_public_datasets()
 
     assert [e["artifact_id"] for e in entries] == ["bioimage-io/pub-001"], entries
-    # ...and the stale entry being still IN the cache is the point: it is
-    # harmless, because the cache does not decide who is public.
-    assert "bioimage-io/pub-000" in b._public_card_cache
+    # The entry is also EVICTED, which is a separate property added after a
+    # review pointed out the dict would otherwise grow with every id that was
+    # ever public. Eviction is tidiness; the assertion above is the safety.
+    assert "bioimage-io/pub-000" not in b._public_card_cache
+
+
+async def test_A_CACHE_ENTRY_FOR_A_DATASET_THAT_WAS_NEVER_PUBLIC_IS_NOT_SERVED(
+    monkeypatch, tmp_path
+):
+    """The construction property, asserted directly rather than as a side
+    effect of unpublishing.
+
+    A card is planted for an id `iter_public_metadata` has never returned. If
+    the cache were consulted as a list of what to show, that dataset would
+    appear in the gallery. It must be unreachable: the authority is walked and
+    the cache is only ever asked about ids it produced.
+    """
+    b = _broker(monkeypatch, tmp_path, 1)
+    b._public_card_cache["bioimage-io/never-public"] = (
+        time.time(),
+        {"name": "should not appear", "description": "x"},
+    )
+
+    entries = await b.list_public_datasets()
+
+    ids = [e["artifact_id"] for e in entries]
+    assert ids == ["bioimage-io/pub-000"], ids
+    assert all(e.get("name") != "should not appear" for e in entries)
 
 
 async def test_SET_PUBLIC_drops_that_card_and_only_that_card(monkeypatch, tmp_path):
@@ -297,3 +328,76 @@ async def test_the_COLD_FILL_IS_CONCURRENT_and_BOUNDED(monkeypatch, tmp_path):
         f"{state['peak']} reads were in flight; the bound is "
         f"{bk.PUBLIC_CARD_FILL_CONCURRENCY}"
     )
+
+
+# ── clause 1's other half: K visitors at once, not one visitor ─────────────
+
+
+async def test_K_CONCURRENT_COLD_VISITS_MAKE_N_READS_NOT_K_TIMES_N(
+    monkeypatch, tmp_path
+):
+    """Clause 1's second half, and the one a review had to find.
+
+    The row names TWO things the cost grew with: the number of published
+    datasets and **the number of visitors at once**. A TTL and a per-visit cache
+    lookup fix the first and do nothing for the second — on a cold cache,
+    nothing coordinated concurrent visitors and every one of them did the whole
+    fill. Measured by the reviewer before the fix: 5 concurrent visits at 10
+    datasets made 50 reads. The image-count leg in the same run made 10, because
+    `_image_manifest` already single-flights per artifact through
+    `_image_manifest_locks`; the card cache had no equivalent.
+
+    The semaphore is NOT what bounds this, and that is worth stating because it
+    looks as though it should be: it is created per call, so its bound is per
+    visit and K visitors can have 8K reads in flight. Single-flight is the thing
+    being tested here.
+    """
+    import asyncio
+
+    n, k = 10, 5
+    b = _broker(monkeypatch, tmp_path, n)
+
+    async def _slow_read(artifact_id=None, **_kw):
+        b._tam._tick("read")
+        # Yield enough times that every concurrent visitor has certainly
+        # entered the fill before the first read completes. Without this the
+        # test could pass by accident on a fast enough single-threaded loop.
+        for _ in range(8):
+            await asyncio.sleep(0)
+        return {"manifest": {"name": str(artifact_id), "description": "d"}}
+
+    monkeypatch.setattr(b._tam, "read", _slow_read)
+
+    results = await asyncio.gather(*(b.list_public_datasets() for _ in range(k)))
+
+    assert all(len(r) == n for r in results), [len(r) for r in results]
+    assert b._tam.calls["read"] == n, (
+        f"{b._tam.calls['read']} reads for {k} concurrent cold visits at N={n}; "
+        f"expected {n}, one per dataset shared between the visitors"
+    )
+    # ...and every visitor got the real card, not an empty one from losing a race.
+    for r in results:
+        assert all(e["name"] for e in r), r
+
+
+async def test_THE_WAITER_GETS_THE_WINNERS_ANSWER_not_a_second_read(
+    monkeypatch, tmp_path
+):
+    """The cache is re-checked INSIDE the lock. A single-flight that only
+    serialised the reads, without re-checking, would make N reads per visitor
+    one after another instead of all at once -- the same total, more slowly."""
+    import asyncio
+
+    b = _broker(monkeypatch, tmp_path, 1)
+
+    async def _slow_read(artifact_id=None, **_kw):
+        b._tam._tick("read")
+        for _ in range(8):
+            await asyncio.sleep(0)
+        return {"manifest": {"name": "once", "description": "d"}}
+
+    monkeypatch.setattr(b._tam, "read", _slow_read)
+
+    await asyncio.gather(*(b.list_public_datasets() for _ in range(4)))
+
+    assert b._tam.calls["read"] == 1, b._tam.calls

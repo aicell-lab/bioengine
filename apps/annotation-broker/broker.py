@@ -171,6 +171,10 @@ class AnnotationBroker:
         # `iter_public_metadata` is the only thing that decides that, and this
         # is consulted only for ids it has already returned.
         self._public_card_cache: Dict[str, tuple] = {}
+        # artifact_id -> lock, so K visitors arriving on a cold cache make ONE
+        # read per dataset between them rather than K. Same shape as
+        # `_image_manifest_locks`, and the reason is the same.
+        self._public_card_locks: Dict[str, asyncio.Lock] = {}
         self._image_manifest_locks: Dict[str, asyncio.Lock] = {}
 
     @bioengine.async_init
@@ -539,6 +543,13 @@ class AnnotationBroker:
         if lock is None:
             lock = asyncio.Lock()
             self._image_manifest_locks[artifact_id] = lock
+        return lock
+
+    def _public_card_lock(self, artifact_id: str) -> asyncio.Lock:
+        lock = self._public_card_locks.get(artifact_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._public_card_locks[artifact_id] = lock
         return lock
 
     async def _image_manifest(
@@ -1533,16 +1544,29 @@ class AnnotationBroker:
           reads at any N.
         * the CONCURRENCY removes the serialisation. A cold fill still costs N
           reads -- the data is in N artifacts and no cache can invent it -- but
-          they are no longer N round trips end to end.
+          they are no longer N round trips end to end. Note the semaphore is
+          created per CALL, so its bound of
+          ``PUBLIC_CARD_FILL_CONCURRENCY`` is per visit and K visitors can have
+          8K reads in flight. That is deliberate and is NOT what bounds the
+          total: the single-flight below is.
 
-        **A cold call is still proportional to N, deliberately, and the TTL is
-        what bounds the damage**: one cold fill per window is shared by every
-        visitor in it. The alternative -- copying each dataset's name into this
-        app's own state at publish time, so the gallery never reads an artifact
-        at all -- was not taken: it makes this app a second record of somebody
-        else's dataset name, with nothing to refresh it when they rename the
-        dataset, and a gallery showing a name the dataset no longer has is a
-        worse failure than a slow first visit.
+        **A cold call is still proportional to N, deliberately**, and what
+        bounds the damage is the TTL together with the PER-ARTIFACT
+        SINGLE-FLIGHT below: K visitors arriving on a cold cache make N reads
+        between them, not K x N. The earlier version of this paragraph claimed
+        the TTL alone did that -- "one cold fill per window is shared by every
+        visitor in it" -- and a review measured it false: 5 concurrent cold
+        visits at 10 datasets made 50 reads, because nothing coordinated them.
+        The row names "the number of visitors at once" as one of the two things
+        the cost grew with, so that was half of clause 1 unmet behind a true
+        sentence about a single visit.
+
+        The alternative -- copying each dataset's name into this app's own state
+        at publish time, so the gallery never reads an artifact at all -- was
+        not taken: it makes this app a second record of somebody else's dataset
+        name, with nothing to refresh it when they rename the dataset, and a
+        gallery showing a name the dataset no longer has is a worse failure than
+        a slow first visit.
 
         **The cache is NOT a second source of truth for whether a dataset is
         public.** ``iter_public_metadata`` decides that and nothing else does;
@@ -1559,33 +1583,68 @@ class AnnotationBroker:
         metas = core.iter_public_metadata(STATE_ROOT)
         now = time.time()
 
+        # Entries for ids that are no longer public are DROPPED here. Keeping
+        # them is harmless for correctness -- the cache decides nothing about
+        # who is public -- but the dict would otherwise grow with every id that
+        # was ever public and never shrink. The authority is walked anyway, so
+        # this costs one set difference.
+        live_ids = {m["artifact_id"] for m in metas}
+        for gone in [k for k in self._public_card_cache if k not in live_ids]:
+            self._public_card_cache.pop(gone, None)
+            self._public_card_locks.pop(gone, None)
+
         async def _card(meta: Dict[str, Any]) -> Dict[str, Any]:
             artifact_id = meta["artifact_id"]
-            cached = self._public_card_cache.get(artifact_id)
-            if cached is not None and core.is_cache_fresh(
-                cached[0], ttl_s=PUBLIC_CARD_CACHE_TTL_S, now=now
-            ):
-                name = cached[1].get("name")
-                description = cached[1].get("description")
-            else:
-                name = description = None
-                try:
-                    art = await self._am.read(artifact_id=artifact_id)
-                    manifest = (art or {}).get("manifest") or {}
-                    name = manifest.get("name")
-                    description = manifest.get("description")
-                    self._public_card_cache[artifact_id] = (
-                        time.time(),
-                        {"name": name, "description": description},
-                    )
-                except Exception:
-                    # Deliberately not logged per dataset: the id comes from the
-                    # broker's own state, but the read is a network call and a
-                    # transient failure must not turn the gallery into a log
-                    # amplifier. The sparse card is the whole response -- and
-                    # the failure is NOT cached, or one bad moment would hold a
-                    # blank card for the whole TTL.
-                    pass
+
+            def _fresh():
+                cached = self._public_card_cache.get(artifact_id)
+                if cached is not None and core.is_cache_fresh(
+                    cached[0], ttl_s=PUBLIC_CARD_CACHE_TTL_S, now=now
+                ):
+                    return cached[1]
+                return None
+
+            card = _fresh()
+            if card is None:
+                # SINGLE-FLIGHT PER ARTIFACT, and leaving it out was a measured
+                # defect rather than an optimisation left on the table. A review
+                # ran 5 concurrent cold visits at 10 datasets and got 50 reads:
+                # nothing coordinated the visitors, so every one of them did the
+                # whole fill. The docstring above used to claim "one cold fill
+                # per window is shared by every visitor in it", which was FALSE
+                # -- and the row names "the number of visitors at once" as one
+                # of the two things the cost grew with, so this was the half of
+                # clause 1 that was not met.
+                #
+                # The same shape as `_image_manifest_locks`, which is why the
+                # image-count leg in that same probe made 10 reads and not 50.
+                # The cache is re-checked INSIDE the lock: whoever waited wants
+                # the winner's answer, not a second read of the same artifact.
+                async with self._public_card_lock(artifact_id):
+                    card = _fresh()
+                    if card is None:
+                        try:
+                            art = await self._am.read(artifact_id=artifact_id)
+                            manifest = (art or {}).get("manifest") or {}
+                            card = {
+                                "name": manifest.get("name"),
+                                "description": manifest.get("description"),
+                            }
+                            self._public_card_cache[artifact_id] = (
+                                time.time(),
+                                card,
+                            )
+                        except Exception:
+                            # Deliberately not logged per dataset: the id comes
+                            # from the broker's own state, but the read is a
+                            # network call and a transient failure must not turn
+                            # the gallery into a log amplifier. The sparse card
+                            # is the whole response -- and the failure is NOT
+                            # cached, or one bad moment would hold a blank card
+                            # for the whole TTL.
+                            card = {}
+            name = card.get("name")
+            description = card.get("description")
             image_count = None
             try:
                 manifest_images = await self._image_manifest(artifact_id)
