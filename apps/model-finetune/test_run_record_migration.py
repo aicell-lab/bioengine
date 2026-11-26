@@ -226,6 +226,7 @@ def _wire(inst, am=None):
     inst._http = FakeHTTP(am)
     inst._runs_pushed = {}
     inst.RUNS_RETRY_DELAY_S = 0
+    inst.RUNS_READBACK_SETTLE_S = 0
 
     async def _get_am():
         return am
@@ -1019,3 +1020,80 @@ def test_a_record_that_lands_wrong_EVERY_time_is_NOT_called_complete(store):
     assert plan["failed"] == [bad], plan
     assert plan["repaired"] == [], plan
     assert plan["complete"] is False, plan
+
+
+def test_a_PERMANENT_failure_does_not_erase_the_REPAIRED_ids_from_the_report(store):
+    """The round-4 finding. One record that stays missing used to condemn the rest.
+
+    The repair's re-read gathered every condemned id in one call. A record that is
+    still absent 404s, the gather raised, and NO digest in the batch was recorded --
+    including those of records the repair had just landed. With two transient
+    failures and one permanent one the report read `repaired: []` and blamed all
+    three, when the truth was two repaired and one unresolved.
+
+    That is the same misreport this row exists to remove, so the repair's own
+    reporting must not reproduce it. A record that is not there is the ANSWER, not a
+    read error: `repair_error` is reserved for a stage, a commit, or a read that
+    could not run at all.
+    """
+    ids = []
+    for i in range(1, 7):
+        sid = f"2026-01-01-0000{i:02d}-f00d000{i}"
+        store(sid)
+        ids.append(sid)
+    transient, permanent = (ids[1], ids[3]), ids[5]
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=transient, fail=(permanent,))
+
+    plan = _run(cls, inst, apply=True, confirm="6")
+
+    assert plan["complete"] is False, plan
+    assert plan["mismatched"] == [permanent], plan["mismatched"]
+    assert plan["failed"] == [permanent], plan["failed"]
+    assert plan["repaired"] == sorted(transient), plan["repaired"]
+    assert plan.get("repair_error") is None, plan.get("repair_error")
+
+
+def test_a_repair_that_FULLY_converges_still_reports_no_unresolved_ids(store):
+    """THE CONTROL on the test above: the convergent case must not regress.
+
+    Handling an absent record per id could have been bought by swallowing every
+    fetch error, which would make a wholly failed read look like a clean one.
+    """
+    ids = []
+    for i in range(1, 5):
+        sid = f"2026-01-01-0000{i:02d}-f11d000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(ids[0], ids[2]))
+
+    plan = _run(cls, inst, apply=True, confirm="4")
+
+    assert plan["complete"] is True, plan
+    assert plan["mismatched"] == [], plan
+    assert plan["repaired"] == sorted([ids[0], ids[2]]), plan["repaired"]
+
+
+def test_the_pushed_bookkeeping_follows_the_ARTIFACT_not_the_PUT_verdicts(store):
+    """A record that landed despite a raised PUT must not be re-pushed by the sync.
+
+    Recording only the ids whose PUT returned left out both the put_unknown ids that
+    did land and the ids the repair fixed, so the next sync re-pushed them one commit
+    each -- the same wrong authority this change removed everywhere else.
+    """
+    ids = []
+    for i in range(1, 6):
+        sid = f"2026-01-01-0000{i:02d}-f22d000{i}"
+        store(sid)
+        ids.append(sid)
+    am = FakeAM()
+    cls, inst = _app(am=am, raise_after_store=(ids[1],), tamper_once=(ids[3],))
+
+    plan = _run(cls, inst, apply=True, confirm="5")
+
+    assert plan["complete"] is True, plan
+    assert ids[1] in plan["put_unknown"], plan["put_unknown"]
+    assert plan["repaired"] == [ids[3]], plan["repaired"]
+    # every id the ARTIFACT holds is recorded, including the raised one and the repaired one
+    assert sorted(inst._runs_pushed) == sorted(ids), sorted(inst._runs_pushed)

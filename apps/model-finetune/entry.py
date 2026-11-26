@@ -1824,6 +1824,13 @@ class EntryApp:
     #: load, so the bound is 4 and the read-back is the only judge.
     RUNS_MIGRATE_CONCURRENCY = 4
 
+    #: Seconds to wait after the commit before the first read-back. The ruling
+    #: that shaped this asked for "a short settle"; the repair pass covers a
+    #: record that is late rather than absent, but a settle costs one second and
+    #: removes a class of repair work that was never needed. A class attribute so
+    #: a test can set it to 0.
+    RUNS_READBACK_SETTLE_S = 1.0
+
     # Class-level fallbacks for the cache, so a published method never raises
     # AttributeError on an instance whose __init__ did not run. That is not a
     # hypothetical: a half-constructed instance is how the suite exercises a
@@ -2847,7 +2854,9 @@ class EntryApp:
             description=(
                 "Check whether the records are ALREADY in the shared record and "
                 "write nothing. For a caller whose apply was interrupted and who "
-                "needs to know whether it landed."
+                "needs to know whether it landed. Note it re-plans from the "
+                "worker's disk AS IT IS NOW, not from the interrupted run's plan, "
+                "so a run that has progressed since will read as mismatched."
             ),
         ),
         context=None,
@@ -3117,28 +3126,17 @@ class EntryApp:
         plan["stage_error"] = stage_error
         plan["commit_error"] = commit_error
 
-        if stage_error is None and commit_error is None and written:
-            # The per-record path recorded every push here, and the bulk path
-            # must too: without it the next `_sync_run_records` sees every
-            # migrated record as unpushed and re-pushes all of them, ONE COMMIT
-            # EACH -- which is the cost this change removed, moved into the
-            # background loop instead of eliminated.
-            #
-            # REPLACED, not mutated, for the same reason the per-record path
-            # replaces it: `_runs_pushed` has a class-level fallback, and
-            # writing into that would share one replica's bookkeeping with
-            # every other.
-            pushed = dict(self._runs_pushed)
-            by_id = {p["id"]: p["record"] for p in planned}
-            for sid in written:
-                pushed[sid] = _json.dumps(by_id[sid], sort_keys=True)
-            self._runs_pushed = pushed
-
         # THE ARTIFACT IS READ BACK. `written` only means "our commit returned"
         # -- it is this replica's account of its own actions, and a backfill
         # that grades itself on that has not checked anything. What the clause
         # asks is whether the ARTIFACT holds the records, so the artifact is
         # asked, and the bytes it serves are hashed and compared to the plan.
+        if not verify_only and stage_error is None:
+            # Short settle before asking what landed. Not load-bearing -- the
+            # repair pass handles a record that is merely late -- but cheap, and
+            # it keeps the repair for records that are actually wrong.
+            await asyncio.sleep(max(0.0, float(self.RUNS_READBACK_SETTLE_S)))
+
         verified, verify_error = {}, None
         try:
             am = await self._runs_artifact_manager()
@@ -3233,22 +3231,59 @@ class EntryApp:
 
             # RE-READ the repaired ids, because the repair's own PUT verdicts are
             # no more authoritative than the first pass's were.
+            #
+            # PER ID, and an ABSENT record is "still missing" rather than a read
+            # failure. A review measured the difference: one record that stays
+            # missing 404s on its fetch, and a single `gather` then raised and
+            # discarded EVERY digest in the batch -- including those of records
+            # the repair had just landed correctly. With 2 transient and 1
+            # permanent failure the report read `repaired: []` and condemned all
+            # three, when the truth was two repaired and one unresolved. That is
+            # the same misreport this whole row exists to remove, so it cannot be
+            # allowed to live in the repair's own reporting.
+            #
+            # `repair_error` is reserved for a failed stage or commit, or a read
+            # that could not run at all. An individual record that is not there
+            # is not an error -- it is the answer.
             if repair_error is None:
-                try:
-                    for sid, digest in await asyncio.gather(
-                        *(_fetch_one(f"{sid}.json") for sid in bad)
-                    ):
-                        verified[sid] = digest
-                except Exception as exc:
-                    plan["repair_error"] = "%s: %s" % (
-                        type(exc).__name__,
-                        str(exc)[:200],
-                    )
+                results = await asyncio.gather(
+                    *(_fetch_one(f"{sid}.json") for sid in bad),
+                    return_exceptions=True,
+                )
+                for sid, outcome in zip(bad, results):
+                    if isinstance(outcome, BaseException):
+                        # Left out of `verified`, so the comparison below reports
+                        # it as still mismatched -- which is exactly true.
+                        logger.info(
+                            f"model-finetune: record '{sid}' is still not "
+                            f"readable after the repair: "
+                            f"{type(outcome).__name__}: {outcome}"
+                        )
+                        continue
+                    got_sid, digest = outcome
+                    verified[got_sid] = digest
             plan["verified"] = len(verified)
             plan["mismatched"] = sorted(
                 sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
             )
             plan["repaired"] = sorted(set(bad) - set(plan["mismatched"]))
+
+        # THE PUSHED BOOKKEEPING FOLLOWS THE READ-BACK, so it belongs here --
+        # after the repair pass -- not next to the uploads. Keying it on what the
+        # ARTIFACT holds is the whole point: recording only the ids whose PUT
+        # returned leaves out the put_unknown ids that did land and the ids the
+        # repair fixed, and the next sync then re-pushes them one commit each.
+        #
+        # Placing it before the read-back is also simply wrong: `verified` does not
+        # exist yet there, which is how this was found -- 22 tests raised
+        # UnboundLocalError rather than a wrong answer, which is the good direction.
+        if not verify_only and stage_error is None and commit_error is None:
+            pushed = dict(self._runs_pushed)
+            by_id = {e["id"]: e["record"] for e in planned}
+            for sid, digest in verified.items():
+                if sid in by_id and digest == plan["hashes"].get(sid):
+                    pushed[sid] = _json.dumps(by_id[sid], sort_keys=True)
+            self._runs_pushed = pushed
         # COMPLETE IS THE CONJUNCTION, and every term is load-bearing: nothing
         # failed to write, the id set that landed is the id set that was
         # planned, the read-back itself succeeded, and every record the artifact
