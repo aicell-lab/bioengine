@@ -1088,7 +1088,7 @@ class AppsManager:
 
         if insufficient_resources:
             if self.ray_cluster.mode != "external-cluster":
-                detail = self._format_resource_refusal(
+                detail = AppsManager._format_resource_refusal(
                     application_id,
                     required_resources,
                     free_per_node,
@@ -1098,7 +1098,7 @@ class AppsManager:
                 raise ValueError(detail)
             else:
                 self.logger.warning(
-                    self._format_resource_refusal(
+                    AppsManager._format_resource_refusal(
                         application_id,
                         required_resources,
                         free_per_node,

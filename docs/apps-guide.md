@@ -387,6 +387,15 @@ deployments:
 
 ### Resource Configuration
 
+> **`memory_mb` is not the whole reservation.** Each deployed app also runs a ProxyDeployment,
+> which reserves a fixed `proxy_memory_in_gb` (default 0.5 GiB = 512 MiB) in addition to the sum
+> of your deployments' `memory_mb`. Scheduling is checked against that total, so `memory_mb=4096`
+> requires 4608 MiB free on a node and requesting exactly a node's advertised memory is refused.
+> The proxy's share is a fixed amount rather than a percentage: it is 25% of a 2048 MiB request
+> and 6.25% of an 8192 MiB one. An insufficient-resources error states the split and what was
+> free on each candidate node.
+
+
 #### GPU Usage
 ```python
 @serve.deployment(

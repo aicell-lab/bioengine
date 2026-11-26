@@ -18,6 +18,10 @@ it and then discarded. That is the single fact that tells a caller whether to sh
 or add a node, and both reporters asked for it by name.
 """
 
+import ast
+import inspect
+import logging
+from pathlib import Path
 import pytest
 
 from bioengine.apps.manager import AppsManager
@@ -31,9 +35,13 @@ REQUESTED_MB = 4096  # what the user wrote
 PROXY_GB = 0.5  # the default proxy reservation
 
 REQUIRED = {"num_cpus": 1, "num_gpus": 0.0, "memory": REPORTED_TOTAL, "VRAM_MB": 0}
+# node-b's free figure is deliberately a number that appears NOWHERE else in the message.
+# It was 512 MiB, which is also the proxy reservation -- so the assertion "512 MiB is in the
+# output" passed on the proxy line alone, and a formatter that dropped node-b entirely still
+# satisfied it. A reviewer caught that; 333 MiB cannot be produced by any other part.
 FREE = {
     "node-a": {"num_cpus": 3.0, "num_gpus": 0.0, "memory": 2 * GIB},
-    "node-b": {"num_cpus": 1.0, "num_gpus": 0.0, "memory": 512 * MIB},
+    "node-b": {"num_cpus": 1.0, "num_gpus": 0.0, "memory": 333 * MIB},
 }
 
 
@@ -101,7 +109,7 @@ def test_the_refusal_names_what_was_FREE_per_node() -> None:
             node in out
         ), f"{node} is missing, so the caller cannot see which node was short"
     assert "2048 MiB" in out, "node-a's free memory is not reported"
-    assert "512 MiB" in out, "node-b's free memory is not reported"
+    assert "333 MiB" in out, "node-b's free memory is not reported"
 
 
 def test_no_nodes_is_DISTINGUISHED_from_nodes_with_nothing_free() -> None:
@@ -131,3 +139,111 @@ def test_an_unknown_proxy_reservation_omits_the_breakdown_rather_than_guessing()
         "node-a" in out
     ), "the free figures should survive an unknown proxy reservation"
     assert str(REPORTED_TOTAL) in out
+
+
+# ───────────────────── the refusal a USER sees, not just the formatter ─────────────────────
+#
+# Everything above calls `_format_resource_refusal` directly. A reviewer showed that leaves the
+# WIRING unpinned: deleting `proxy_memory_in_gb=proxy_memory_in_gb` from the `_check_resources`
+# call in `deploy_app`, or restoring the old `raise ValueError` text, changed no test in this
+# file. Both mutants reinstate the defect this row exists to fix, so the arms below drive the
+# real `_check_resources` and read the exception a caller would actually get.
+
+
+class _Ready:
+    """`_check_resources` awaits `ray_cluster.is_ready.wait()` before reading the nodes."""
+
+    async def wait(self):
+        return True
+
+
+class _Cluster:
+    def __init__(self, nodes, mode):
+        self.mode = mode
+        self.status = {"nodes": nodes}
+        self.is_ready = _Ready()
+
+
+class _Mgr:
+    """The smallest object `_check_resources` will run against.
+
+    Deliberately NOT a real AppsManager: these arms must fail if the code starts depending on
+    instance state that a caller cannot supply, and they must not drag a Ray cluster in.
+    """
+
+    def __init__(self, nodes, mode="single-machine"):
+        self.logger = logging.getLogger("test-refusal")
+        self._deployed_applications = {}
+        self.ray_cluster = _Cluster(nodes, mode)
+
+
+def _tiny_node():
+    # 1 GiB free: smaller than the 4608 MiB the request totals, so the refusal must fire.
+    return {
+        "total_cpu": 8,
+        "used_cpu": 0,
+        "total_gpu": 0,
+        "used_gpu": 0,
+        "total_memory": 1 * GIB,
+        "used_memory": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_RAISED_refusal_carries_the_split_and_the_free_figures() -> None:
+    """The real path, end to end: `_check_resources` -> ValueError -> what the user reads."""
+    mgr = _Mgr(nodes={"n1": _tiny_node()})
+    with pytest.raises(ValueError) as caught:
+        await AppsManager._check_resources(
+            mgr, "mito-em-quant", dict(REQUIRED), proxy_memory_in_gb=PROXY_GB
+        )
+    msg = str(caught.value)
+    assert "4096 MiB" in msg, "the raised error does not say what the user asked for"
+    assert "512 MiB" in msg, "the raised error does not name the proxy's contribution"
+    assert (
+        "fixed" in msg.lower()
+    ), "the raised error still invites the percentage misreading"
+    assert "n1" in msg, "the raised error does not name the node that was short"
+    assert "1024 MiB" in msg, "the raised error does not say how much was actually free"
+
+
+@pytest.mark.asyncio
+async def test_without_the_proxy_value_the_RAISED_refusal_omits_the_split() -> None:
+    """The other half: the breakdown is reported only when it can be computed.
+
+    This is what makes the arm above load-bearing rather than decorative -- it shows the split
+    comes from the forwarded argument and not from something the formatter invents.
+    """
+    mgr = _Mgr(nodes={"n1": _tiny_node()})
+    with pytest.raises(ValueError) as caught:
+        await AppsManager._check_resources(mgr, "mito-em-quant", dict(REQUIRED))
+    msg = str(caught.value)
+    assert "ProxyDeployment reserves" not in msg
+    assert "n1" in msg, "the free figures should survive an unknown proxy reservation"
+
+
+def test_deploy_app_FORWARDS_the_resolved_proxy_reservation() -> None:
+    """Structural, because the mutant it guards is a deletion.
+
+    Dropping `proxy_memory_in_gb=` from the `_check_resources` call in `deploy_app` sends every
+    production refusal down the None arm, silently losing the breakdown -- which is clause 1's
+    original defect, reinstated. No behavioural arm short of a full deploy sees it, so this reads
+    the call site out of the AST: find the `_check_resources` call and require that keyword.
+    """
+    src = Path(inspect.getsourcefile(AppsManager)).read_text()
+    tree = ast.parse(src)
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_check_resources"
+    ]
+    assert calls, "no _check_resources call site found; this guard is testing nothing"
+    forwarding = [
+        c for c in calls if any(k.arg == "proxy_memory_in_gb" for k in c.keywords)
+    ]
+    assert forwarding, (
+        "no _check_resources call forwards proxy_memory_in_gb, so every production refusal "
+        "takes the unknown-reservation path and loses the breakdown"
+    )
