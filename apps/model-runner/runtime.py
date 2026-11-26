@@ -180,11 +180,43 @@ def _block_size_ns(descr, sample):
     return ns
 
 
+def _axes_are_objects(descr):
+    # False for a bioimage.io spec 0.4 descriptor, True for 0.5.
+    #
+    # Every predicate below reads ``ipt.id`` and treats ``ipt.axes`` as a
+    # sequence of axis OBJECTS carrying ``.type``, ``.id`` and ``.size``. A 0.4
+    # input is shaped differently: it carries ``name`` instead of ``id``, its
+    # ``axes`` is a STRING such as "bcyx", and the extents live in a separate
+    # ``shape`` field. Reading a 0.4 input through the 0.5 shape does not fail
+    # cleanly -- ``ipt.id`` raises AttributeError, and iterating the string
+    # yields CHARACTERS, each of which has no ``.type``, so a loop that skips
+    # non-space axes skips all four and returns its vacuous answer.
+    #
+    # So decline instead of guessing. Callers treat False as "cannot reason
+    # about this", which is the answer that keeps a 0.4 model on the same
+    # unblocked path it took before any of these predicates existed.
+    for ipt in descr.inputs:
+        if getattr(ipt, "id", None) is None:
+            return False
+        axes = getattr(ipt, "axes", None)
+        if axes is None or isinstance(axes, str):
+            return False
+        for axis in axes:
+            if not hasattr(axis, "type"):
+                return False
+    return True
+
+
 def _fits_whole(descr, sample):
     # True when every space extent is already a size the model accepts and is
     # no larger than the block ``_block_size_ns`` targets, so there is nothing
     # to tile. A size kind we cannot reason about counts as not fitting, which
     # keeps the blocked path.
+    #
+    # The guard is FIRST because the loop below dereferences ``ipt.id`` on its
+    # own first line, so a 0.4 descriptor raises there before any decision.
+    if not _axes_are_objects(descr):
+        return False
     for ipt in descr.inputs:
         member = sample.members.get(ipt.id)
         if member is None:
@@ -223,6 +255,15 @@ def _all_space_axes_fixed(descr):
     # models that already worked. A fixed extent cannot absorb a halo at all --
     # the padded tensor is simply the wrong size and the model refuses -- which
     # is why the two kinds are treated differently.
+    #
+    # The guard matters MORE here than in ``_fits_whole``, because this loop
+    # does not raise on a 0.4 descriptor: it iterates the string "bcyx" as
+    # characters, finds no ``.type`` on any of them, skips every one and returns
+    # True -- claiming every space axis is fixed for a model whose axes it never
+    # read. That routes a 0.4 model into the fixed-extent branch and into
+    # ``_fixed_extent_too_small``, which then raises on ``ipt.id``.
+    if not _axes_are_objects(descr):
+        return False
     for ipt in descr.inputs:
         for axis in getattr(ipt, "axes", None) or []:
             if getattr(axis, "type", None) != "space":
@@ -253,6 +294,15 @@ def _fixed_extent_too_small(descr, sample):
     # Smaller cannot be rescued the same way: there is no way to tile up to a
     # size the input does not have, and padding would make the tensor the wrong
     # size for the model. That case is a refusal.
+    #
+    # Guarded too, though ``_all_space_axes_fixed`` already gates the only call
+    # site. Two independent guards because this function dereferences ``ipt.id``
+    # on its first line: if a later change calls it from anywhere else, the
+    # failure would be an AttributeError inside a helper whose whole job is to
+    # produce a friendly message. There is no actionable sentence to offer about
+    # axes this code cannot read, so the answer is None.
+    if not _axes_are_objects(descr):
+        return None
     for ipt in descr.inputs:
         member = sample.members.get(ipt.id)
         if member is None:
