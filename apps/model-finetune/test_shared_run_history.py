@@ -95,6 +95,29 @@ def record(sid, owner, **fields):
     }
 
 
+def listed(context, shared=None, **kw):
+    """List exactly as the published entry point does.
+
+    The two sources are composed by `merge_run_sources` -- the same function
+    the entry point calls -- rather than by rules written again here. That
+    matters more than it looks: the collision rule, the dataset union and
+    which ids count as shared are the subject of most of the assertions below,
+    and a helper that re-implemented them could agree with itself while
+    disagreeing with what a caller actually gets.
+
+    `list_sessions` itself takes `records` as the WHOLE listing input, so
+    calling it directly with only the shared half would hide this instance's
+    own runs -- which is the one thing every test here needs present.
+    """
+    local_records, dataset_ids, skipped = training.scan_runs_for_listing()
+    records, shared_ids, _ = training.merge_run_sources(
+        local_records, dataset_ids, shared
+    )
+    return training.list_sessions(
+        context, records=records, shared_ids=shared_ids, skipped=skipped, **kw
+    )
+
+
 # ── a run from another instance is listed, and filtered the same way ────────
 
 
@@ -102,7 +125,7 @@ def test_a_run_from_ANOTHER_instance_is_listed_to_its_owner(local):
     """Two instances, one history: a run started elsewhere is listed here."""
     local("mine-here", ME)
     shared = {"mine-elsewhere": record("mine-elsewhere", ME)}
-    out = training.list_sessions(MINE, records=shared)
+    out = listed(MINE, shared)
     assert set(out) == {"mine-here", "mine-elsewhere"}, (
         "a run this caller started on another instance is missing, which is "
         "the split history this record is meant to end"
@@ -116,14 +139,14 @@ def test_and_NOT_to_a_different_caller(local):
     this and say nothing.
     """
     shared = {"mine-elsewhere": record("mine-elsewhere", ME)}
-    assert training.list_sessions(MINE, records=shared) != {}
-    assert training.list_sessions(THEIRS, records=shared) == {}
+    assert listed(MINE, shared) != {}
+    assert listed(THEIRS, shared) == {}
 
 
 def test_an_OWNERLESS_shared_record_goes_only_to_an_administrator(local):
     shared = {"ancient": record("ancient", None)}
-    assert training.list_sessions(THEIRS, records=shared) == {}
-    assert set(training.list_sessions(ADMIN, records=shared)) == {"ancient"}
+    assert listed(THEIRS, shared) == {}
+    assert set(listed(ADMIN, shared)) == {"ancient"}
 
 
 def test_a_record_with_a_NULL_owner_is_ownerless_not_a_match(local):
@@ -134,8 +157,8 @@ def test_a_record_with_a_NULL_owner_is_ownerless_not_a_match(local):
     shared = {"null-owner": record("null-owner", None)}
     shared["null-owner"]["status"]["owner"] = None
     anon = ctx("anonymouz-dot-basement-35411643")
-    assert training.list_sessions(anon, records=shared) == {}
-    assert set(training.list_sessions(ADMIN, records=shared)) == {"null-owner"}
+    assert listed(anon, shared) == {}
+    assert set(listed(ADMIN, shared)) == {"null-owner"}
 
 
 # ── the shared copy must not become a second route to a local run ───────────
@@ -155,11 +178,11 @@ def test_a_LOCAL_run_this_caller_cannot_see_is_NOT_resurfaced_by_the_record(loca
     local("theirs", OTHER)
     # The shared copy of the SAME session, with its owner lost.
     shared = {"theirs": record("theirs", None)}
-    assert training.list_sessions(ADMIN, records=shared) == {}, (
+    assert listed(ADMIN, shared) == {}, (
         "an administrator was shown a run through the shared record that the "
         "local rule attributes to somebody else"
     )
-    assert set(training.list_sessions(THEIRS, records=shared)) == {"theirs"}
+    assert set(listed(THEIRS, shared)) == {"theirs"}
 
 
 def test_the_LOCAL_status_wins_over_a_stale_record(local):
@@ -172,7 +195,7 @@ def test_the_LOCAL_status_wins_over_a_stale_record(local):
     # local status -- it would pass for the wrong reason, or fail for one.
     local("mine", ME, status="TRAINING", updated_at=time.time())
     shared = {"mine": record("mine", ME, status="COMPLETED")}
-    out = training.list_sessions(MINE, records=shared)
+    out = listed(MINE, shared)
     assert out["mine"]["status"] == "TRAINING", out["mine"]
 
 
@@ -224,10 +247,10 @@ def test_a_run_LISTED_BOTH_WAYS_comes_back_IDENTICAL(local):
     local("mine", ME, status="COMPLETED", updated_at=time.time(), start_time=1.0)
     rec = _record_from_local("mine")
 
-    from_local = training.list_sessions(MINE)["mine"]
+    from_local = listed(MINE)["mine"]
     # Same run, now reachable only through the shared copy.
     (training.sessions_root() / "mine" / "status.json").unlink()
-    from_shared = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    from_shared = listed(MINE, {"mine": rec})["mine"]
 
     assert from_shared == from_local, (
         "a shared run is reported differently from the same run read locally; "
@@ -270,7 +293,7 @@ def test_the_CONFIG_ALLOW_LIST_holds_on_the_SHARED_path_too(local):
     rec["config"]["train_images"] = "/home/bioengine/apps/x/imgs"
     rec["config"]["pool_token"] = "A-TOKEN-THAT-MUST-NEVER-TRAVEL"
     (training.sessions_root() / "mine" / "status.json").unlink()
-    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    out = listed(MINE, {"mine": rec})["mine"]
     assert set(out["config"]) <= set(training.RUN_CONFIG_FIELDS), out["config"]
     assert "A-TOKEN-THAT-MUST-NEVER-TRAVEL" not in json.dumps(out)
 
@@ -283,7 +306,7 @@ def test_a_STALE_shared_run_is_SWEPT_like_a_local_one(local):
     assert rec["status"]["status"] == "TRAINING", "the stored document is unswept"
 
     (training.sessions_root() / "mine" / "status.json").unlink()
-    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    out = listed(MINE, {"mine": rec})["mine"]
     assert out["status"] == "STOPPED", out
     assert "stale window" in out.get("message", ""), out
 
@@ -292,7 +315,7 @@ def test_a_shared_run_carries_the_FIELDS_THE_PAGE_READS(local):
     local("mine", ME, status="COMPLETED", updated_at=time.time(), start_time=1.0)
     rec = _record_from_local("mine")
     (training.sessions_root() / "mine" / "status.json").unlink()
-    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    out = listed(MINE, {"mine": rec})["mine"]
     for field in ("session_id", "config", "elapsed_s", "checkpoint_available"):
         assert field in out, f"{field} is missing from a shared run"
     assert out["session_id"] == "mine"
@@ -306,7 +329,7 @@ def test_a_shared_run_is_NOT_claimed_to_be_SERVABLE_here(local):
     rec = _record_from_local("mine")
     rec["status"]["checkpoint_available"] = True
     (training.sessions_root() / "mine" / "status.json").unlink()
-    out = training.list_sessions(MINE, records={"mine": rec})["mine"]
+    out = listed(MINE, {"mine": rec})["mine"]
     assert out["checkpoint_available"] is False, out
 
 
@@ -329,8 +352,8 @@ def test_a_record_with_no_usable_status_is_shown_to_NOBODY(local, bad):
     it to an administrator. That is the wrong direction for a record this
     instance cannot interpret, so it is dropped and counted."""
     shared = {"junk": bad}
-    assert training.list_sessions(ADMIN, records=shared) == {}
-    assert training.list_sessions(MINE, records=shared) == {}
+    assert listed(ADMIN, shared) == {}
+    assert listed(MINE, shared) == {}
 
 
 def test_a_record_key_that_is_not_a_session_id_is_dropped(local, monkeypatch):
@@ -341,7 +364,7 @@ def test_a_record_key_that_is_not_a_session_id_is_dropped(local, monkeypatch):
         training, "SESSION_ID_PATTERN", re.compile(r"\A\d{4}-\d{2}-\d{2}-\d{6}-\w+\Z")
     )
     shared = {"../escape": record("../escape", ADMIN_ID)}
-    assert training.list_sessions(ADMIN, records=shared) == {}
+    assert listed(ADMIN, shared) == {}
 
 
 # ── the owner is carried and never published ────────────────────────────────
@@ -350,7 +373,7 @@ def test_a_record_key_that_is_not_a_session_id_is_dropped(local, monkeypatch):
 def test_the_OWNER_is_in_the_record_and_NOT_in_the_answer(local):
     shared = {"mine-elsewhere": record("mine-elsewhere", ME)}
     assert shared["mine-elsewhere"]["status"]["owner"] == ME
-    out = training.list_sessions(MINE, records=shared)
+    out = listed(MINE, shared)
     for field in training.PRIVATE_STATUS_FIELDS:
         assert field not in out["mine-elsewhere"], f"{field} reached the caller"
     assert ME not in json.dumps(out), "the owner identity reached the caller"
@@ -362,9 +385,9 @@ def test_redacting_the_answer_does_not_MUTATE_the_record(local):
     edited it in place would make the second listing see a record with no
     owner -- and the ownerless rule would then hand it to an administrator."""
     shared = {"mine-elsewhere": record("mine-elsewhere", ME)}
-    training.list_sessions(MINE, records=shared)
+    listed(MINE, shared)
     assert shared["mine-elsewhere"]["status"]["owner"] == ME
-    assert training.list_sessions(ADMIN, records=shared) == {}
+    assert listed(ADMIN, shared) == {}
 
 
 # ── no records at all is a degraded answer, not an error ────────────────────
@@ -372,6 +395,66 @@ def test_redacting_the_answer_does_not_MUTATE_the_record(local):
 
 def test_no_records_still_lists_the_local_runs(local):
     local("mine", ME)
-    assert set(training.list_sessions(MINE)) == {"mine"}
-    assert set(training.list_sessions(MINE, records=None)) == {"mine"}
-    assert set(training.list_sessions(MINE, records={})) == {"mine"}
+    assert set(listed(MINE)) == {"mine"}
+    assert set(listed(MINE, None)) == {"mine"}
+    assert set(listed(MINE, {})) == {"mine"}
+
+
+# ── the datasets to resolve come from BOTH sources ──────────────────────────
+
+
+def test_a_DATASET_MANAGER_sees_a_colleagues_run_from_ANOTHER_instance(local):
+    """A manager's reach must not stop at the instance boundary.
+
+    A run comes back to a manager of the dataset it was trained on, so that a
+    colleague can pick up where another left off. That test is applied to a
+    set of datasets which the entry point resolves ONCE per call -- and it can
+    only resolve the ones it is told about. If that set is built from this
+    instance's own disk alone, a manager is recognised for the runs they could
+    already see and not for the ones the shared record exists to surface: the
+    exact runs the feature is for.
+
+    THE DISCRIMINATING STEP IS THE RESOLUTION, not the final assertion. The
+    permission set below is derived FROM `merge_run_sources`'s dataset ids,
+    the way the entry point derives it, rather than handed in ready-made.
+    Passing `writable_datasets={DATASET}` directly would pass whether or not
+    the union is built, because it supplies the answer the union is supposed
+    to produce.
+    """
+    DATASET = "ws/shared-dataset"
+    MANAGED_BY_ME = {DATASET}
+
+    local("mine-here", ME)
+    shared = {
+        "theirs-elsewhere": record(
+            "theirs-elsewhere", OTHER, **{training.DATASET_FIELD: DATASET}
+        )
+    }
+
+    local_records, local_datasets, skipped = training.scan_runs_for_listing()
+    records, shared_ids, dataset_ids = training.merge_run_sources(
+        local_records, local_datasets, shared
+    )
+
+    assert DATASET in dataset_ids, (
+        "the shared run's dataset never reached the set the entry point "
+        f"resolves, so no manager of it can be recognised: {dataset_ids}"
+    )
+
+    writable = frozenset(d for d in dataset_ids if d in MANAGED_BY_ME)
+    out = training.list_sessions(
+        MINE,
+        records=records,
+        shared_ids=shared_ids,
+        skipped=skipped,
+        writable_datasets=writable,
+    )
+    assert "theirs-elsewhere" in out, (
+        "a manager of the dataset cannot see a colleague's run from another "
+        f"instance: {sorted(out)}"
+    )
+    # The control: without the grant the same caller must NOT see it, so the
+    # assertion above is the dataset rule and not some other route in.
+    assert "theirs-elsewhere" not in training.list_sessions(
+        MINE, records=records, shared_ids=shared_ids, skipped=skipped
+    )

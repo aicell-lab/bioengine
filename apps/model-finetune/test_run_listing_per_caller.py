@@ -439,10 +439,18 @@ async def test_the_entry_method_PASSES_the_context_through(runs, monkeypatch):
 
     seen = {}
 
-    def spy(context, *, writable_datasets=frozenset(), records=None, skipped=None):
+    def spy(
+        context,
+        *,
+        writable_datasets=frozenset(),
+        records=None,
+        shared_ids=frozenset(),
+        skipped=None,
+    ):
         seen["context"] = context
         seen["writable_datasets"] = writable_datasets
         seen["records"] = records
+        seen["shared_ids"] = shared_ids
         return {"sentinel": {}}
 
     class _AM:

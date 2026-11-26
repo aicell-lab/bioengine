@@ -2447,12 +2447,40 @@ class EntryApp:
         # read inside `get_status` -- 3 per run, so 783 for the 261 runs on the
         # production store.
         records, dataset_ids, skipped = training.scan_runs_for_listing()
+
+        # The shared half. None and {} are DIFFERENT answers here: {} is "the
+        # shared history is empty", None is "it could not be read", and only
+        # the second is a reason to say so while still answering from local
+        # disk. Collapsing them with `or {}` computes the distinction and then
+        # throws it away, which leaves a silently short history -- the failure
+        # this log exists to make visible.
+        shared = await self._read_run_records()
+        if shared is None:
+            print(
+                "[model-finetune] the shared run history could not be read; "
+                "answering from this instance's disk only, so the listing is "
+                "INCOMPLETE",
+                flush=True,
+            )
+            shared = {}
+
+        # The collision rule and the dataset union live in `merge_run_sources`,
+        # not here, so that what a caller gets and what a test composes are the
+        # same code.
+        records, shared_ids, dataset_ids = training.merge_run_sources(
+            records, dataset_ids, shared
+        )
+
         writable = await self._caller_managed_datasets(dataset_ids, context)
         # `skipped` is passed on, not dropped: `list_sessions` logs the stray
         # directory names it was handed, and those names are caller-controlled,
         # so the log is their only trace.
         return training.list_sessions(
-            context, writable_datasets=writable, records=records, skipped=skipped
+            context,
+            writable_datasets=writable,
+            records=records,
+            shared_ids=shared_ids,
+            skipped=skipped,
         )
 
     async def _caller_managed_datasets(self, dataset_ids, context) -> frozenset:

@@ -1822,21 +1822,81 @@ def scan_runs_for_listing() -> Tuple[Dict[str, Dict[str, Any]], List[str], List[
     return records, list(datasets), skipped
 
 
+def merge_run_sources(
+    local_records: Dict[str, Dict[str, Any]],
+    local_dataset_ids: List[str],
+    shared_records: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], frozenset, List[str]]:
+    """The two run sources as ONE listing input: ``(records, shared_ids, dataset_ids)``.
+
+    This is the only place the collision between the two sources is decided.
+    It is a named function so that the published entry point and the tests run
+    the SAME code: a test that composed the two sources itself could agree with
+    itself while disagreeing with what a caller actually gets.
+
+    LOCAL WINS, and it wins by ID rather than by visibility. A run this
+    instance holds is taken from the local record even when the caller cannot
+    see it. Resolving by visibility instead would make the shared copy a second
+    route to a run the local rule just refused -- a bypass rather than a
+    fallback. Local is also the better record: it has the checkpoint and the
+    full config, and its status was read on this call, while a shared record is
+    only as new as the last sync.
+
+    *dataset_ids* comes back as the UNION. A shared run names a dataset too,
+    and omitting it would leave a dataset's manager unrecognised for exactly
+    the runs they did not start themselves -- which is the case co-manager
+    access exists for.
+
+    A shared record that is not a mapping contributes no dataset and is still
+    passed through: `list_sessions` is where a record is judged unusable, so
+    that the count of dropped records is made in one place and logged once.
+    """
+    records = dict(local_records)
+    dataset_ids = list(local_dataset_ids)
+    shared_ids = []
+    for session_id, record in (shared_records or {}).items():
+        if session_id in records:
+            continue
+        records[session_id] = record
+        shared_ids.append(session_id)
+        status = record.get("status") if isinstance(record, dict) else None
+        dataset = status.get(DATASET_FIELD) if isinstance(status, dict) else None
+        if isinstance(dataset, str) and dataset and dataset not in dataset_ids:
+            dataset_ids.append(dataset)
+    return records, frozenset(shared_ids), dataset_ids
+
+
 def list_sessions(
     context: Any,
     *,
     writable_datasets: Any = frozenset(),
     records: Optional[Dict[str, Dict[str, Any]]] = None,
+    shared_ids: Any = frozenset(),
     skipped: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """The runs this caller may see, keyed by session id, owner redacted.
 
-    *records* is the shared run history -- every run as persisted to the app's
-    own runs artifact, keyed by session id. It is a keyword with a default so
-    the local-only listing keeps working when the shared copy cannot be read:
-    a run history that answers from this worker's disk is incomplete, and one
-    that raises is useless. Passing nothing is therefore the degraded mode, not
-    an error, and the caller logs it.
+    *records* is EVERY run to be listed, keyed by session id, already read by
+    the caller so that this function does not read them again. Passing None
+    means "read this worker's disk yourself", which is what every direct caller
+    and every test that does not care about the shared history does.
+
+    *shared_ids* names which of *records* came from ANOTHER instance rather
+    than from this worker's disk, and it is the whole of the difference between
+    the two sources. A local entry is a status this worker produced and is used
+    as it is; a shared entry is the stored record as another instance persisted
+    it, is unwrapped through `status_from_record`, and reports
+    ``checkpoint_available=False`` because the weights are on that instance's
+    disk and this one cannot serve them.
+
+    ONE PARAMETER, ONE MEANING. These two are deliberately not a single
+    "records" argument carrying a mixture: the caller knows which source each
+    id came from and this function cannot tell by looking, so making it guess
+    -- by shape, or by trying the unwrap and falling back -- would turn a
+    malformed local status into a silently shared one. The caller also decides
+    the collision: an id in BOTH sources belongs to the local record and is not
+    in *shared_ids*, because the local copy has the checkpoint, the full config
+    and a status re-read on this call rather than one as old as the last sync.
 
     *context* is REQUIRED and has no default, deliberately. There is no
     unfiltered listing to call by mistake: the previous `list_sessions()`
@@ -1871,6 +1931,8 @@ def list_sessions(
     attacker-controlled.
     """
     out: Dict[str, Dict[str, Any]] = {}
+    shared = frozenset(shared_ids or ())
+    unusable = 0
     if records is not None:
         # Already read by `scan_runs_for_listing`; re-reading them here is the
         # cost this parameter exists to avoid. The names IT skipped have to be
@@ -1885,11 +1947,34 @@ def list_sessions(
         skipped = list(skipped or []) + found_skipped
     for name in names:
         try:
-            status = (
-                records[name]
-                if records is not None
-                else get_status(name, include_private=True)
-            )
+            if records is None:
+                status = get_status(name, include_private=True)
+            elif name in shared:
+                # A SHARED-ONLY run: `records[name]` is the stored record as
+                # persisted by the instance that trained it, not a status this
+                # worker produced, so it is unwrapped HERE rather than by the
+                # caller. That keeps one shaping site for both sources -- see
+                # `shape_status` -- and it is why the caller passes the raw
+                # record through instead of shaping it on the way in.
+                #
+                # THE ID IS VALIDATED BEFORE IT IS USED AS ONE. These keys come
+                # from the shared artifact rather than from this worker's own
+                # directory listing, so they are not already known to be
+                # session ids; a key that is not one is counted and dropped.
+                if not SESSION_ID_PATTERN.match(name):
+                    unusable += 1
+                    continue
+                status = status_from_record(records[name])
+                if status is None:
+                    # A record whose status is missing or not a mapping says
+                    # nothing about who may see it, and the gate below would
+                    # read a missing owner as "ownerless" and show it to an
+                    # administrator. Counted and dropped instead: fail closed,
+                    # and say how many.
+                    unusable += 1
+                    continue
+            else:
+                status = records[name]
         except InvalidSessionId:
             # The name passed but a deeper layer refused it -- today that means
             # a directory whose NAME is a valid session id but which is a
@@ -1919,6 +2004,12 @@ def list_sessions(
         print(
             f"[model-finetune] skipped {len(skipped)} session directory(ies) that "
             f"are not a session on this worker: {skipped[:5]}",
+            flush=True,
+        )
+    if unusable:
+        print(
+            f"[model-finetune] dropped {unusable} shared run record(s) that carry "
+            "no usable status or no usable id; they are not listed to anybody",
             flush=True,
         )
 
