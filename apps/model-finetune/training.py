@@ -991,13 +991,17 @@ DATASET_FIELD = "dataset_artifact_id"
 # This is the same narrowing `caller_is_workspace_admin` makes for workspace
 # grants, for the same reason, and a mutant that reads the wildcard turns the
 # public-dataset test red.
+#
+# Annotators hold "r+" and are deliberately NOT co-managers: a run's
+# collaborators are its dataset's MANAGERS, and the page draws the same line
+# (`role === 'owner' || role === 'manager'`). "r+" lets someone add annotations
+# to a dataset; it is not authority over models trained from it. Requiring
+# exactly "*" is what enforces that, so there is no second constant listing the
+# permissions that do NOT confer management -- an enumeration of the rejected
+# values would be a second place for the rule to live, and the wrong one to
+# trust, since a new Hypha permission string absent from it would read as a
+# manager.
 DATASET_MANAGER_PERMISSION = "*"
-
-# Annotators hold "r+" and are deliberately NOT co-managers. The ruling says a
-# run's collaborators are its dataset's MANAGERS, and the page draws the same
-# line (`role === 'owner' || role === 'manager'`). "r+" lets someone add
-# annotations to a dataset; it is not authority over models trained from it.
-DATASET_NON_MANAGER_PERMISSIONS = frozenset({"r", "r+", "rw"})
 
 
 def caller_manages_dataset(permissions: Any, context: Any) -> bool:
@@ -1327,32 +1331,6 @@ def non_terminal_runs() -> Dict[str, Dict[str, Any]]:
         if status.get("status") not in _TERMINAL:
             out[name] = operator_view(status)
     return out
-
-
-def dataset_ids_on_disk() -> List[str]:
-    """Every distinct ``dataset_artifact_id`` recorded across the runs on disk.
-
-    Exists so the async entry point can resolve the caller's manageable
-    datasets in a number of artifact-manager round trips proportional to the
-    number of DATASETS, not the number of runs. Resolving per run would be one
-    RPC per run -- 261 of them on the production store -- on every listing.
-
-    Tolerant like the listing: a status that cannot be read contributes nothing
-    rather than raising. A run with no dataset contributes nothing, which today
-    is all of them.
-
-    Order is preserved and duplicates dropped, so the result is stable enough to
-    assert on in a test.
-    """
-    found: Dict[str, None] = {}
-    for name in run_names_on_disk()[0]:
-        try:
-            dataset = read_status(name).get(DATASET_FIELD)
-        except Exception:
-            continue
-        if isinstance(dataset, str) and dataset:
-            found.setdefault(dataset, None)
-    return list(found)
 
 
 def require_caller_may_resume_run(

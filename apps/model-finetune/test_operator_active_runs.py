@@ -20,6 +20,7 @@ of the ordinary listing. That would hand every owned run to every administrator
 and undo a privacy decision made deliberately.
 """
 
+import asyncio
 import json
 import re
 import time
@@ -414,3 +415,74 @@ def test_an_UNUSABLE_timestamp_does_not_break_the_whole_listing(operator_root):
     assert bad is not None, "the queued record with the bad timestamp vanished"
     assert bad["stale"] is True, f"an unusable timestamp should read as stale: {bad}"
     assert bad["stale_for_s"] is None, bad
+
+
+# ── the QUEUED heartbeat must survive a contended record lock ────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_QUEUED_HEARTBEAT_SURVIVES_a_held_lock_and_refreshes_after(
+    operator_root, monkeypatch
+):
+    """The heartbeat that covers the whole queue wait must not die of the lock.
+
+    This heartbeat is the reason a healthy QUEUED run does not read as stale,
+    and it is the one call site that kept using the RAISING `write_status`
+    after the record lock arrived. It runs as a detached task, so one
+    `RunRecordLockTimeout` ends it silently, nothing restarts it, and
+    `updated_at` stops advancing -- so the run it exists to protect is reported
+    "probably dead" an hour into a perfectly ordinary wait behind another
+    training. Measured before the fix: the task ended with
+    `RunRecordLockTimeout` and the queued record then read
+    `{'status': 'QUEUED', 'stale': True}`.
+
+    Both halves are asserted, because surviving is not enough: a heartbeat that
+    swallowed everything and never wrote again would pass the first assertion
+    and fail the run the same way. So the lock is held for one tick, released,
+    and the NEXT tick must land.
+    """
+    monkeypatch.setattr(training, "RECORD_LOCK_WAIT_S", 0.05)
+    monkeypatch.setattr(training, "RECORD_LOCK_STALE_S", 600.0)  # never reaped
+    sid = "2026-11-25-100000-0000beef"
+    d = operator_root / sid
+    d.mkdir(parents=True)
+    (d / "status.json").write_text(json.dumps({"status": "QUEUED", "updated_at": 1.0}))
+
+    # A fresh mutex nobody will release, so the first write times out.
+    mutex = d / training.RECORD_LOCK_NAME
+    mutex.write_text("a holder that is not coming back")
+
+    cls = _entry()
+    inst = cls.__new__(cls)
+    task = asyncio.ensure_future(
+        getattr(cls, "_preparing_heartbeat")(inst, sid, interval=0.05)
+    )
+    try:
+        for _ in range(40):  # ~2 s of ticks, far more than two intervals
+            await asyncio.sleep(0.05)
+            if task.done():
+                break
+        assert not task.done(), (
+            "the heartbeat task ended under a held lock: "
+            f"{task.exception() if task.done() else None!r}"
+        )
+        rec = json.loads((d / "status.json").read_text())
+        assert rec["updated_at"] == 1.0, f"it wrote THROUGH the held lock: {rec}"
+
+        # Release the lock; the next tick must refresh the record.
+        mutex.unlink()
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            rec = json.loads((d / "status.json").read_text())
+            if rec.get("updated_at") != 1.0:
+                break
+        assert (
+            rec.get("updated_at") != 1.0
+        ), f"the heartbeat never wrote again once the lock was free: {rec}"
+        assert rec["status"] == "QUEUED", rec
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass

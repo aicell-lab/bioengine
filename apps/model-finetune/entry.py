@@ -1346,6 +1346,19 @@ class EntryApp:
         Exits as soon as the status moves beyond those two, so a wedged
         TRAINING run is still swept; the worker's own heartbeat covers that
         phase.
+
+        **BEST-EFFORT, like every other heartbeat**, and the raising
+        `write_status` here was a defect rather than a choice. The record lock
+        makes that function raise when the mutex cannot be taken or the record
+        will not parse, which is right for a terminal write and wrong for a
+        heartbeat -- so `write_status_best_effort` exists for exactly these call
+        sites. This one runs as a detached task, so an exception ends it
+        silently and nothing restarts it: `updated_at` stops advancing and the
+        run it was protecting is reported stale, which is the failure this
+        function exists to prevent, arrived at from the other side. Measured
+        with the mutex held and the wait shortened: the task ended with
+        `RunRecordLockTimeout` and the healthy QUEUED run then read
+        `stale: True`. The QUEUED span can be hours, so the window is wide.
         """
         import training
 
@@ -1356,7 +1369,7 @@ class EntryApp:
                 "QUEUED",
             ):
                 return
-            training.write_status(session_id)
+            training.write_status_best_effort(session_id)
 
     async def _run_training(
         self,

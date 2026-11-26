@@ -288,25 +288,6 @@ def test_the_owner_may_still_mutate_their_own_run(runs):
     assert training.caller_may_mutate(sid, ctx(OWNER, anonymous=False)) is True
 
 
-# ── the dataset scan that feeds the async resolver ───────────────────────────
-
-
-def test_dataset_ids_on_disk_returns_each_dataset_once(runs):
-    runs("a", OWNER, dataset=DATASET)
-    runs("b", COMANAGER, dataset=DATASET)
-    runs("c", OWNER, dataset=OTHER_DATASET)
-    runs("d", OWNER)
-    assert sorted(training.dataset_ids_on_disk()) == sorted({DATASET, OTHER_DATASET})
-
-
-def test_dataset_ids_on_disk_is_empty_when_no_run_names_one(runs):
-    """Today's production store, where nothing recorded a dataset. The resolver
-    short-circuits on this and makes no artifact calls at all."""
-    runs("a", OWNER)
-    runs("b", COMANAGER)
-    assert training.dataset_ids_on_disk() == []
-
-
 # ── the listing must not re-read what it has already read ────────────────────
 
 
