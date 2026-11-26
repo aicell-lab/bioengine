@@ -15,8 +15,14 @@ CREATES weights:
   it. A shared notebook session is built for several people to try one run's
   model, and gating inference would break that.
 * **Owner or administrator** -- `export_model` hands out the weights,
-  `contribute` publishes them into the shared pool, resuming creates a new
-  model derived from them, and stopping acts on somebody else's run.
+  `contribute` publishes them into the shared pool, and stopping acts on
+  somebody else's run.
+* **Owner, the dataset's managers, or administrator** -- resuming creates a new
+  model derived from the weights, and a run's collaborators are its dataset's
+  managers, so a colleague can carry the work on. This is the one restricted
+  rule that is WIDER than owner-or-admin, and listing it under the line above
+  is how it went stale once already: it shipped that way through four review
+  rounds after the code had moved.
 
 The tests below read `entry.py` itself rather than a list maintained by hand, so
 a method added later that takes a run identifier and decides neither way fails
@@ -59,8 +65,14 @@ EXPORT_GATE = "require_caller_may_use_export"
 GATE_PREFIX = "require_caller_"
 
 # The parameter names by which a call is keyed to somebody's run. `export_id` is
-# included because an export handle is minted by `export_model`, which is itself
-# owner-or-admin, so holding the handle is already a granted capability.
+# included because an export handle is a run key like any other: it is minted by
+# `export_model` and the methods that take it are gated in their own right.
+#
+# It used to say holding the handle "is already a granted capability", which was
+# the round-1 view and is contradicted by CREATOR_OR_ADMIN twenty lines below:
+# an export_id is bound to the identity that created it, so a holder who is not
+# that identity is refused. A comment asserting the opposite of a set defined
+# further down the same file is worse than no comment.
 RUN_KEY_PARAMS = frozenset({"session_id", "resume_session_id", "export_id"})
 
 OPEN_TO_ANY_HOLDER = frozenset(
@@ -529,3 +541,189 @@ def test_the_README_TABLE_ROW_itself_names_the_weights():
         assert (
             "progress of an export already started" not in low
         ), "the table row has reverted to describing the handle as progress"
+
+
+# ── the resume rule, pinned to the CODE's own admission legs ───────────────
+
+#: Each leg `caller_may_resume_run` actually calls, and the thing every
+#: documented statement of the rule must say because of it.
+#:
+#: WHY THIS SHAPE, and it is the whole point of this file's existence. The
+#: defect it replaces was a wording pin that REQUIRED `"will be restricted"`, so
+#: when the restriction shipped the test held the README promising a future
+#: change that had already happened. A pin on a phrase alone repeats that. A pin
+#: that reads the code's legs and requires the documentation to name each one
+#: cannot: narrowing the prose fails because a leg's phrase goes missing, and
+#: narrowing the code fails because the leg set no longer matches.
+#: FOR EVERY LEG, THE PHRASE EACH DOCUMENTED STATEMENT MUST CARRY BECAUSE OF IT.
+#:
+#: Nested per statement, and there is NO escape hatch — which is the fourth
+#: shape this table has taken and the first one that cannot be satisfied by
+#: filling in nothing. The history is worth keeping, because each version
+#: claimed an enforcement it did not have:
+#:
+#:   1. phrases required of the whole README  -> a whole-file grep; narrowing
+#:      two of the three statements left it green.
+#:   2. phrases per statement, legs checked by INTERSECTION -> a leg added
+#:      under a new name was filtered out before the comparison, while the
+#:      failure message said "a leg was added".
+#:   3. phrases per leg with a `PER_SITE` sentinel for the admin leg, whose
+#:      wording differs -> the VALUES were never read, and once they were, the
+#:      sentinel became the hole: a review added a leg to the code, marked it
+#:      PER_SITE, changed no documentation, and all 29 tests passed.
+#:
+#: So: every leg names, for every statement, the text that statement must
+#: contain. Adding a leg to the code forces three entries here, and filling
+#: them with text the README does not contain fails the statement check. There
+#: is nothing to write that enforces nothing.
+RESUME_ADMISSION_LEGS = {
+    # the run's owner AND the dataset's owners/managers, in one helper
+    "_owner_or_comanager": {
+        "the capability table row": ("the run's owner", "owns or manages the dataset"),
+        "the prose beside the table": ("owns or manages the dataset",),
+        "the authoritative paragraph": ("its owner", "owns or manages the dataset"),
+    },
+    # worded `rw`/admin on `bioimage-io` in the table and the prose, and "an
+    # administrator" in the authoritative paragraph. That difference is why the
+    # table is nested rather than per-leg -- it is NOT a reason to exempt a leg.
+    "caller_is_workspace_admin": {
+        "the capability table row": ("`rw`/admin on `bioimage-io`",),
+        "the prose beside the table": ("`rw`/admin on `bioimage-io`",),
+        "the authoritative paragraph": ("an administrator",),
+    },
+}
+
+#: Names `caller_may_resume_run` calls that are NOT admission legs. Everything
+#: else it calls must be a known leg, so a leg added under ANY new name fails.
+RESUME_NON_ADMISSION_CALLS = frozenset(
+    {
+        "read_status",  # how it FINDS the run, not who may use it
+        "frozenset",  # the `writable_datasets` default, in the signature
+    }
+)
+
+#: Where each statement of the rule lives. The locator must match exactly ONE
+#: README line, so a statement that moves or is duplicated fails rather than
+#: being read loosely.
+RESUME_DOC_LOCATORS = {
+    "the capability table row": "| `start_training(resume_session_id=…)` |",
+    "the prose beside the table": "**Resuming is deliberately wider**",
+    "the authoritative paragraph": "**Resuming sits between the two**",
+}
+
+
+def _called_names(func_node) -> frozenset:
+    found = set()
+    for sub in ast.walk(func_node):
+        if isinstance(sub, ast.Call):
+            fn = sub.func
+            name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+            if isinstance(name, str):
+                found.add(name)
+    return frozenset(found)
+
+
+def _function(source: str, name: str):
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is not defined in the source read")
+
+
+def _readme_lines() -> list:
+    return (
+        (pathlib.Path(__file__).resolve().parent / "README.md").read_text().splitlines()
+    )
+
+
+def _statement(locator: str) -> str:
+    hits = [line for line in _readme_lines() if locator in line]
+    assert len(hits) == 1, (
+        f"{len(hits)} README line(s) contain {locator!r}; expected exactly 1. "
+        "The statement moved or was duplicated, and either way this test is no "
+        "longer reading what it thinks it is."
+    )
+    return hits[0]
+
+
+def test_THE_CODES_RESUME_LEGS_ARE_THE_ONES_THIS_TEST_KNOWS():
+    """The half that catches a NARROWED or WIDENED code.
+
+    Every name `caller_may_resume_run` calls must be either a known admission
+    leg or on the explicit non-admission list. Dropping a leg fails; adding one
+    under any name fails too.
+    """
+    training_src = (pathlib.Path(__file__).resolve().parent / "training.py").read_text()
+    called = _called_names(_function(training_src, "caller_may_resume_run"))
+    admissions = called - RESUME_NON_ADMISSION_CALLS
+
+    assert admissions == set(RESUME_ADMISSION_LEGS), (
+        f"caller_may_resume_run's admission calls are {sorted(admissions)}; this "
+        f"test knows {sorted(RESUME_ADMISSION_LEGS)}. A leg was added, removed "
+        "or renamed -- update RESUME_ADMISSION_LEGS and every documented "
+        "statement in RESUME_DOC_STATEMENTS together, which is the pairing this "
+        "test exists to force. If the new name is not an admission leg, say so "
+        "by adding it to RESUME_NON_ADMISSION_CALLS."
+    )
+
+
+@pytest.mark.parametrize("which", sorted(RESUME_DOC_LOCATORS))
+def test_EVERY_DOCUMENTED_STATEMENT_OF_THE_RESUME_RULE_IS_WIDE(which):
+    """The half that catches a NARROWED DOCUMENT, once per statement.
+
+    Parametrised so a failure names WHICH of the three places went narrow. A
+    review narrowed the authoritative paragraph and the prose while an earlier
+    version grepped the whole file, and the table row kept supplying the phrase.
+    """
+    line = _statement(RESUME_DOC_LOCATORS[which])
+    missing = [
+        phrase
+        for per_statement in RESUME_ADMISSION_LEGS.values()
+        for phrase in per_statement[which]
+        if phrase not in line
+    ]
+    assert not missing, f"{which} does not name: {missing}\nline: {line}"
+
+
+def test_EVERY_LEG_NAMES_A_PHRASE_FOR_EVERY_STATEMENT():
+    """THE HATCH IS GONE, and this is the test that keeps it gone.
+
+    Version 3 of the table let a leg declare itself `PER_SITE` and name no
+    phrases, which a review showed was exactly "a way to enforce nothing": it
+    added a leg to the code, marked it PER_SITE, changed no documentation, and
+    everything passed. Every leg must now name at least one non-empty phrase
+    for every statement, so there is no value that satisfies the table without
+    also constraining the README.
+    """
+    for leg, per_statement in RESUME_ADMISSION_LEGS.items():
+        assert set(per_statement) == set(RESUME_DOC_LOCATORS), (
+            f"{leg} names {sorted(per_statement)}; the statements are "
+            f"{sorted(RESUME_DOC_LOCATORS)}"
+        )
+        for which, phrases in per_statement.items():
+            assert phrases and all(p.strip() for p in phrases), (
+                f"{leg} names no usable phrase for {which!r}, so nothing about "
+                "it is enforced there"
+            )
+
+
+def test_NO_COMMENT_IN_THIS_FILE_CONTRADICTS_A_SET_DEFINED_BELOW_IT():
+    """The second half of this row: two comments stated the round-1-refuted view
+    while the sets twenty lines below said the opposite.
+
+    Asserted as absence of the refuted claims rather than presence of the right
+    ones, because a comment can be correct in any number of wordings and there
+    is exactly one wrong one for each.
+    """
+    src = pathlib.Path(__file__).resolve().read_text()
+    body, _, _ = src.partition("def test_NO_COMMENT_IN_THIS_FILE_CONTRADICTS")
+    retired = [
+        # `CREATOR_OR_ADMIN` says an export handle is bound to its creator.
+        "handle is already a granted capability",
+        # the module docstring listed resuming under owner-or-admin
+        "model derived from them, and stopping acts",
+    ]
+    present = [phrase for phrase in retired if phrase in body]
+    assert (
+        not present
+    ), f"these comments state a rule the code does not follow: {present}"
