@@ -558,7 +558,10 @@ class AnnotationBroker:
         # The stored manifest is NOT filtered: a successful finish removes its
         # marker before committing, so a completed image is never withheld, and
         # filtering a stored entry could hide an image that is genuinely there.
-        withheld = await self._withheld_upload_paths(artifact_id)
+        # Fail-open by design: a short set here costs a transient extra
+        # name in the list, and the next read recomputes it. `complete` is
+        # discarded DELIBERATELY and named so, rather than silently dropped.
+        withheld, _complete = await self._withheld_upload_paths(artifact_id)
         entries, _ = core.merge_image_manifest(
             core.parse_image_manifest(doc),
             core.image_names_from_listing(listing),
@@ -1574,12 +1577,44 @@ class AnnotationBroker:
             # deleted the object and left the entry behind. It governs the
             # pruning half as well: a withheld path counts as present, so this
             # call cannot drop a stored entry on account of an open upload.
+            #
+            # AND IT FAILS CLOSED ON A SHORT READ. The withheld set is computed
+            # fail-open, which is right for a reader and wrong here: this write
+            # is COMMITTED and the stored manifest is never filtered again, so a
+            # transient `.uploads/` error would become a permanent record of an
+            # unchecked upload as a dataset image. Measured: with the marker
+            # listing raising during the sync, the stem was stored, listed, and
+            # committed. Skipping is the honest response rather than refusing,
+            # because this call is documented as idempotent and safe to skip --
+            # a missed sync costs the manifest's extra metadata for those stems,
+            # never their visibility, since reads union the manifest with the
+            # listing anyway.
+            withheld, complete = await self._withheld_upload_paths(artifact_id)
+            if not complete:
+                logger.warning(
+                    f"skipping the manifest write for {artifact_id}: the upload "
+                    "markers could not be read in full, and writing on a short "
+                    "set would record an unfinished upload as an image "
+                    "permanently. Nothing was changed; run this again once the "
+                    "store is healthy."
+                )
+                entries = core.parse_image_manifest(doc)
+                return {
+                    "changed": False,
+                    "images": len(entries),
+                    "remote": sum(
+                        1
+                        for e in entries.values()
+                        if e.get("state") == core.IMAGE_STATE_REMOTE
+                    ),
+                    "skipped": "the upload markers could not be read in full",
+                }
             entries, changed = core.merge_image_manifest(
                 core.parse_image_manifest(doc),
                 core.image_names_from_listing(listing),
                 dims=dict(meta.get("image_dims") or {}),
                 prune=True,
-                withheld_paths=await self._withheld_upload_paths(artifact_id),
+                withheld_paths=withheld,
             )
             if changed:
 
@@ -1937,24 +1972,41 @@ class AnnotationBroker:
                 artifact_id, core.IMAGE_MANIFEST_PATH, None
             )
             listing = await self._list_files_safe(artifact_id, "images")
-            # THE WITHHELD SET IS PASSED HERE TOO. This writes the stored
-            # manifest and commits, so without it an unfinished upload that
-            # happened to be in flight was swept into the manifest as a
-            # permanent image by somebody else's remote import -- the same
-            # measured hole as `sync_image_manifest`, reached from a second
-            # route. It also keeps the `already an image` check below honest:
-            # a withheld stem is not an image of this dataset yet.
-            entries, _ = core.merge_image_manifest(
-                core.parse_image_manifest(doc),
+            # THE CHECK AND THE WRITE USE DIFFERENT SETS, deliberately, and
+            # separating them is what makes this writer safe without a
+            # fail-closed branch of its own.
+            #
+            # The CHECK wants the widest view -- the stored manifest UNION the
+            # listing, minus withheld names -- because its job is to refuse a
+            # stem that is already an image, and a stem present only as a file
+            # would otherwise be overwritten. A short withheld set makes that
+            # check STRICTER (more names look taken), which is the refusing
+            # direction, so it is safe on a partial read.
+            #
+            # The WRITE takes only the stored manifest plus the remote entry
+            # this call came to add. It no longer folds listing-derived local
+            # names into the committed manifest at all -- so it cannot record
+            # an unfinished upload as an image however the marker read went,
+            # which is the hole a review measured here and at the sync. What
+            # that gives up is incidental manifest healing: a local file absent
+            # from the stored manifest stays absent from it. That costs the
+            # extra metadata for those stems and never their visibility, since
+            # reads union the manifest with the listing anyway, and healing is
+            # exactly what `sync_image_manifest` exists to do.
+            withheld, _complete = await self._withheld_upload_paths(artifact_id)
+            stored = core.parse_image_manifest(doc)
+            visible, _ = core.merge_image_manifest(
+                stored,
                 core.image_names_from_listing(listing),
                 dims=dict(meta.get("image_dims") or {}),
-                withheld_paths=await self._withheld_upload_paths(artifact_id),
+                withheld_paths=withheld,
             )
-            if stem in entries:
+            if stem in visible:
                 raise ValueError(
                     f"'{stem}' is already an image of this dataset. Pass a "
                     f"different name."
                 )
+            entries = dict(stored)
             entries[stem] = entry
 
             async def _write():
@@ -1968,7 +2020,13 @@ class AnnotationBroker:
             # Staged-only writes reappear as absent after a restage, the same
             # trap sync_image_manifest, delete_label and delete_annotation hit.
             await self._commit_tolerating_pending_uploads(artifact_id)
-            self._image_manifest_cache[artifact_id] = (time.time(), entries)
+            # POPPED, not written. `entries` is now the STORED manifest plus
+            # this import -- deliberately narrower than what a reader sees,
+            # since the write no longer folds in listing-derived names. Seeding
+            # the cache with it would drop every local file from the image list
+            # until the entry expired. The next read rebuilds the union, which
+            # is the only thing that can produce the reader's view.
+            self._image_manifest_cache.pop(artifact_id, None)
 
         if credential:
             credentials = dict(meta.get("ngff_credentials") or {})
@@ -2334,8 +2392,8 @@ class AnnotationBroker:
             pairs.append((marker_path, doc))
         return pairs, complete
 
-    async def _withheld_upload_paths(self, artifact_id: str) -> frozenset:
-        """Object paths that must not be treated as dataset images yet.
+    async def _withheld_upload_paths(self, artifact_id: str) -> tuple:
+        """``(paths, complete)`` -- object paths not yet treatable as images.
 
         Every marker that parses withholds its path, expired or not. An object
         that has merely been PUT would otherwise be a dataset image with no size
@@ -2348,29 +2406,41 @@ class AnnotationBroker:
         withholding now lasts until the object is actually gone, and the sweep
         runs at the start of every mint to make sure that happens.
 
-        **Fails OPEN, and that is a choice with a reason.** If the markers
-        cannot be listed or read, this returns an empty set and nothing is
-        withheld. The alternative, withholding everything on an error, would
-        make an unreadable ``.uploads/`` present the dataset as having no images
-        at all -- a total outage of the image list, triggered by housekeeping
-        state, on every read path including the annotate page's first call. What
-        the fail-open leaves is "an abandoned upload is listed until the next
-        mint sweeps it", not "the ceiling is unenforced".
+        **`complete` is carried rather than resolved here, and it is a TUPLE**,
+        for the reason the paging read is a tuple: a caller that ignores
+        completeness gets a tuple where it expected a set and fails loudly. It
+        used to return a bare set that was computed fail-open, which meant an
+        unreadable ``.uploads/`` read as "nothing is withheld" at every caller
+        alike -- and a review measured that the callers are NOT alike:
+
+        * a READ may answer on a short set. The effect is transient, the next
+          read recomputes it, and the alternative -- withholding everything on
+          an error -- makes an unreadable ``.uploads/`` present the dataset as
+          having no images at all, a total outage of the image list triggered by
+          housekeeping state, on the annotate page's first call;
+        * a WRITE may not. The manifest write is COMMITTED and the stored
+          manifest is never filtered afterwards, so a short set there turns a
+          transient storage error into a permanent record of an unchecked
+          upload as a dataset image. That is the shape ruled on for the finish
+          in an earlier round -- a partial read must not feed a decision with a
+          lasting effect -- and the writers are on the finish's side of it;
+        * the MINT may answer on a short set because short is the REFUSING
+          direction there: fewer withheld names means more names look taken, so
+          it answers ``already`` rather than minting.
+
+        A short read is logged here once, so every caller's decision is visible
+        in one place rather than repeated at four.
         """
         pairs, complete = await self._marker_pairs(artifact_id)
         if not complete:
-            # Still fail-open, as documented above -- but SAID, because a
-            # partial read means the withheld set may be short and an
-            # abandoned upload may be listed until the next mint sweeps it.
             logger.warning(
                 f"the marker listing for {artifact_id} was INCOMPLETE "
-                f"({len(pairs)} marker(s) read); the withheld set may be short, "
-                "so an unfinished upload could be listed until the next mint "
-                "sweeps it"
+                f"({len(pairs)} marker(s) read); the withheld set may be short. "
+                "Readers answer anyway; the manifest WRITERS must not."
             )
         if not pairs:
-            return frozenset()
-        return core.withheld_upload_paths(pairs)
+            return frozenset(), complete
+        return core.withheld_upload_paths(pairs), complete
 
     async def _sweep_expired_markers(self, artifact_id: str) -> int:
         """Housekeeping: drop expired markers AND the objects they vouch for.
@@ -2572,7 +2642,10 @@ class AnnotationBroker:
             # Fail-open, like the withholding itself: an unreadable `.uploads/`
             # yields an empty set, so the answer degrades to "already", which is
             # the refusing direction for a mint and merely unhelpful.
-            withheld = await self._withheld_upload_paths(artifact_id)
+            # Short is the REFUSING direction here: fewer withheld names
+            # means more names look taken, so an incomplete read answers
+            # `already` rather than minting a URL it should not.
+            withheld, _complete = await self._withheld_upload_paths(artifact_id)
             # prune=False: this is a read, and pruning is for the writer that
             # owns the manifest. A stem whose file has gone is still "taken"
             # for the purposes of not clobbering it here.

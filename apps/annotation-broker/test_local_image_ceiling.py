@@ -1434,10 +1434,14 @@ async def test_the_WITHHOLDING_still_answers_on_a_partial_read(monkeypatch):
 
     monkeypatch.setattr(store, "list_files", breaks_after_the_first_page)
 
-    withheld = await b._withheld_upload_paths(ARTIFACT)
+    withheld, complete = await b._withheld_upload_paths(ARTIFACT)
     manifest = await b._image_manifest(ARTIFACT)
 
     assert len(withheld) == store.page_size, len(withheld)
+    # The flag is what lets the WRITERS refuse on the same read the readers
+    # answer on. Asserted here so "fail-open" stays a decision each caller
+    # makes rather than a property of this function.
+    assert complete is False, "a partial read was reported as complete"
     assert (
         "already" in manifest
     ), f"a partial marker read hid an image that was already committed: {manifest}"
@@ -1811,3 +1815,214 @@ def test_EVERY_manifest_merge_in_the_broker_passes_the_withheld_set():
             f"broker.py:{call.lineno} passes an empty frozenset, which "
             "satisfies the signature while withholding nothing"
         )
+
+
+# ── round 12: a SHORT marker read must not become a PERMANENT manifest write ─
+#
+# The withheld set is computed fail-open, which is right for a reader -- the
+# effect is transient and the next read recomputes it -- and wrong for the two
+# manifest writers, whose result is committed and never filtered again. So a
+# transient `.uploads/` error turned into a permanent record of an unchecked
+# upload as a dataset image. The writers now decide for themselves.
+
+
+def _break_marker_listing(monkeypatch, store):
+    """Make every `.uploads/` listing RAISE, leaving `images/` readable.
+
+    A non-transport error on purpose: the point is that the app cannot read the
+    markers, not that the store is unreachable.
+    """
+    real = store.list_files
+
+    async def refuses_the_markers(_a, dir_path=None, stage=True, limit=None, offset=0):
+        if dir_path == core.UPLOAD_MARKER_DIR:
+            raise RuntimeError("the store will not list the marker directory")
+        return await real(
+            _a, dir_path=dir_path, stage=stage, limit=limit, offset=offset
+        )
+
+    monkeypatch.setattr(store, "list_files", refuses_the_markers)
+
+
+@pytest.mark.asyncio
+async def test_SYNC_SKIPS_the_write_when_the_markers_cannot_be_read(monkeypatch):
+    """The measured bypass: a short withheld set made the sync store the stem.
+
+    With the marker listing raising, the fail-open set is empty, so nothing is
+    withheld and the unfinished upload reconciles straight into the stored
+    manifest and is committed. Permanent, because the stored manifest is never
+    filtered afterwards.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "big.png")
+    store.put(mint["put_url"], _png(10000))  # never finished
+    committed_before = store.committed
+
+    _break_marker_listing(monkeypatch, store)
+    out = await b.sync_image_manifest(ARTIFACT, context=None)
+
+    assert out["changed"] is False, out
+    assert out.get("skipped"), f"the skip was not reported to the caller: {out}"
+    assert "big" not in _stored_manifest(store), (
+        "a short marker read let the sync store an unfinished upload: "
+        f"{_stored_manifest(store)}"
+    )
+    assert store.committed == committed_before, "it committed on a short read"
+
+
+@pytest.mark.asyncio
+async def test_SYNC_still_writes_when_the_markers_CAN_be_read(monkeypatch):
+    """The control. A sync that skipped unconditionally would pass the test
+    above and do nothing for anyone."""
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    mint = await b.upload_local_image(ARTIFACT, "ok.png")
+    store.put(mint["put_url"], _png(32))
+    await b.upload_local_image(ARTIFACT, "ok.png", done=True, mint_id=mint["mint_id"])
+
+    out = await b.sync_image_manifest(ARTIFACT, context=None)
+
+    assert out.get("skipped") is None, f"it skipped a healthy read: {out}"
+    assert "ok" in _stored_manifest(store), _stored_manifest(store)
+
+
+@pytest.mark.asyncio
+async def test_the_REMOTE_IMPORT_never_adds_a_listing_name_short_read_or_not(
+    monkeypatch,
+):
+    """The second writer, and it needs no fail-closed branch of its own.
+
+    The import now writes the STORED manifest plus the entry it came to add,
+    and never folds listing-derived names in, so it cannot record an unfinished
+    upload however the marker read went. Both directions are exercised: with
+    the markers readable and with the listing raising, and in both the import's
+    own stem lands while the unfinished upload does not.
+    """
+    for break_it in (False, True):
+        store = _Store()
+        b = _store_broker(monkeypatch, store, ceiling=64)
+
+        async def _probe(root, multiscale_path, origin):
+            return {
+                "width": 64,
+                "height": 48,
+                "dtype": "uint8",
+                "channels": ["C0"],
+                "levels": 1,
+                "content_hint": None,
+                "dataset_paths": ["0"],
+                "axis_roles": {"x": 1, "y": 0},
+                "level0_shape": [48, 64],
+                "axes": ["y", "x"],
+            }
+
+        monkeypatch.setattr(b, "_probe_ngff_source", _probe)
+        mint = await b.upload_local_image(ARTIFACT, "big.png")
+        store.put(mint["put_url"], _png(10000))  # never finished
+        if break_it:
+            _break_marker_listing(monkeypatch, store)
+
+        await b.import_ngff_image(
+            ARTIFACT, "https://example.invalid/s.zarr", stem="remote1", context=None
+        )
+
+        stored = _stored_manifest(store)
+        assert (
+            "remote1" in stored
+        ), f"(break={break_it}) the import recorded nothing: {stored}"
+        assert (
+            "big" not in stored
+        ), f"(break={break_it}) the import stored an unfinished upload: {stored}"
+
+
+@pytest.mark.asyncio
+async def test_the_REMOTE_IMPORT_still_refuses_a_stem_that_is_only_a_FILE(monkeypatch):
+    """The cost of narrowing the WRITE, checked rather than assumed.
+
+    The import's no-overwrite check still reads the stored manifest UNION the
+    listing, so a stem that exists only as a file in `images/` -- never written
+    to the manifest -- is still refused. Narrowing what gets WRITTEN must not
+    narrow what gets CHECKED, and those are now two different sets.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    async def _probe(root, multiscale_path, origin):
+        return {
+            "width": 8,
+            "height": 8,
+            "dtype": "uint8",
+            "channels": ["C0"],
+            "levels": 1,
+            "content_hint": None,
+            "dataset_paths": ["0"],
+            "axis_roles": {"x": 1, "y": 0},
+            "level0_shape": [8, 8],
+            "axes": ["y", "x"],
+        }
+
+    monkeypatch.setattr(b, "_probe_ngff_source", _probe)
+    # A committed local image that the stored manifest does not mention.
+    store.published["images/orphan.png"] = _png(32)
+
+    with pytest.raises(ValueError, match="already an image"):
+        await b.import_ngff_image(
+            ARTIFACT, "https://example.invalid/s.zarr", stem="orphan", context=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_REMOTE_IMPORT_does_not_HIDE_the_local_images(monkeypatch):
+    """The cost of narrowing the write, on the OTHER side: the cache.
+
+    The import's `entries` is now the stored manifest plus its own entry, which
+    is deliberately NARROWER than a reader's view. Seeding the image-list cache
+    with it would drop every local file from the listing until the entry
+    expired — a disappearing-images bug introduced by a fix for a different
+    one. The cache is popped instead, so the next read rebuilds the union.
+
+    A mutation harness caught this: the arm that re-seeds the cache with the
+    write set was GREEN, because nothing asserted the reader's view after an
+    import. It is asserted here.
+    """
+    store = _Store()
+    b = _store_broker(monkeypatch, store, ceiling=64)
+
+    async def _probe(root, multiscale_path, origin):
+        return {
+            "width": 8,
+            "height": 8,
+            "dtype": "uint8",
+            "channels": ["C0"],
+            "levels": 1,
+            "content_hint": None,
+            "dataset_paths": ["0"],
+            "axis_roles": {"x": 1, "y": 0},
+            "level0_shape": [8, 8],
+            "axes": ["y", "x"],
+        }
+
+    monkeypatch.setattr(b, "_probe_ngff_source", _probe)
+
+    # A finished local upload, so it is a legitimate dataset image.
+    mint = await b.upload_local_image(ARTIFACT, "local1.png")
+    store.put(mint["put_url"], _png(32))
+    await b.upload_local_image(
+        ARTIFACT, "local1.png", done=True, mint_id=mint["mint_id"]
+    )
+    before = await b._image_manifest(ARTIFACT)
+    assert "local1" in before, before
+
+    await b.import_ngff_image(
+        ARTIFACT, "https://example.invalid/s.zarr", stem="remote1", context=None
+    )
+
+    after = await b._image_manifest(ARTIFACT)
+    assert "remote1" in after, f"the import's own entry is missing: {after}"
+    assert "local1" in after, (
+        "the import hid an existing local image from the dataset listing: "
+        f"{sorted(after)}"
+    )
