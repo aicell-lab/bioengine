@@ -520,3 +520,42 @@ def test_an_UNREADABLE_claim_does_not_spin_past_the_deadline(monkeypatch, tmp_pa
     # wait/poll is ~4 polls; allow generous slack but nothing like a spin.
     assert len(attempts) <= 40, f"{len(attempts)} attempts for a 0.2s/0.05s budget"
     assert calls == [], "it synced without a claim"
+
+
+def test_a_FAILING_rmdir_on_a_stale_claim_does_not_spin(monkeypatch, tmp_path):
+    """The stale-BREAK path, which the first spin fix did not route.
+
+    `rmdir` failing is not "someone else got there first" — that case succeeds, or raises
+    ENOENT, and both are fine. It is also EPERM in a sticky directory whose claim another
+    uid created, ENOTEMPTY from an NFS silly-rename file left inside it, ESTALE, EACCES.
+    Each of those recurs on the next pass, so retrying with no deadline and no sleep span
+    the loop exactly as the stat path did.
+
+    Counted, not timed, for the same reason as the stat arm: the spinning version does
+    eventually raise once something checks the deadline, so "it raises" is not the test.
+    """
+    app_dir, calls, held = _sync_env(monkeypatch, tmp_path)
+    app_dir.mkdir(parents=True, exist_ok=True)
+    claim = app_dir / ".claim"
+    claim.mkdir()
+    old = time.time() - (replica_init._CLAIM_STALE_S + 600)
+    os.utime(claim, (old, old))
+
+    attempts = []
+    real_rmdir = Path.rmdir
+
+    def refusing_rmdir(self):
+        if self.name == ".claim":
+            attempts.append(1)
+            if len(attempts) > 500:
+                raise AssertionError(f"STALE PATH SPUN {len(attempts)} times")
+            raise OSError(1, "Operation not permitted")
+        return real_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", refusing_rmdir)
+    monkeypatch.setattr(replica_init, "_CLAIM_WAIT_S", 0)
+    monkeypatch.setattr(replica_init, "_CLAIM_POLL_S", 0.01)
+    with pytest.raises(RuntimeError, match="claim"):
+        replica_init.setup_replica_environment()
+    assert len(attempts) <= 10, f"{len(attempts)} rmdir attempts past a 0s deadline"
+    assert calls == [], "it synced without a claim"

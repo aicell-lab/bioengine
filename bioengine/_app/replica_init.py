@@ -295,6 +295,16 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
     the normal path and concurrent writers into one tree the normal case.
 
     Failure is LOUD — this raises rather than proceeding unclaimed.
+
+    One race is accepted rather than closed: two replicas can both judge the same claim
+    abandoned, and the second's ``rmdir`` can delete the *fresh* claim the first has just
+    created, leaving two holders. It needs both to arrive inside the same few
+    milliseconds after a claim has sat untouched past the staleness bound, and the
+    consequence is the one the claim already tolerates on a first materialisation — two
+    concurrent incremental syncs into one tree, which the snapshot makes convergent.
+    Closing it properly wants a claim whose identity can be checked before deletion (a
+    token file written into it, re-read after the rmdir), which is a larger change than
+    this fix should carry.
     """
     claim = app_dir / ".claim"
     deadline = time.monotonic() + _CLAIM_WAIT_S
@@ -334,8 +344,16 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
             )
             try:
                 claim.rmdir()
-            except OSError:
-                pass  # someone else broke it first; the next mkdir decides
+            except OSError as exc:
+                # A failed rmdir is NOT "someone else broke it first" — that case
+                # succeeds or raises ENOENT, and both are fine. It is also EPERM in a
+                # sticky directory whose claim another uid created, ENOTEMPTY from an
+                # NFS silly-rename file left inside it, ESTALE, or EACCES — and every
+                # one of those recurs on the next pass. Retrying with no deadline check
+                # and no sleep is the same unbounded spin as the stat path, so this goes
+                # through the same step. Only a rmdir that SUCCEEDED earns an immediate
+                # retry, because then the next mkdir genuinely has a chance.
+                _wait_or_give_up(claim, deadline, age, exc)
             continue
 
         _wait_or_give_up(claim, deadline, age, None)
