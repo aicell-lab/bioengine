@@ -311,6 +311,86 @@ def no_leaked_working_directory() -> Generator[None, None, None]:
         )
 
 
+PIP_CACHE_ENV_VAR = "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"
+
+# Captured once, at import, which pytest does at collection -- before any test or fixture has had
+# a chance to export it. Both guards below compare against THIS, not against absence: a session
+# that legitimately sets the variable in its own environment must not be disturbed.
+_PIP_CACHE_AT_IMPORT = os.environ.get(PIP_CACHE_ENV_VAR)
+
+
+def _pip_cache_session_entry() -> str | None:
+    """The value the session started with."""
+    return _PIP_CACHE_AT_IMPORT
+
+
+@pytest.fixture(autouse=True)
+def restore_pip_cache_size_env() -> Generator[None, None, None]:
+    """Put ``RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB`` back after every test.
+
+    Constructing a ``RayCluster`` in ``single-machine`` or ``slurm`` mode exports this variable
+    into the pytest process, and nothing in the class removes it -- that is the worker applying
+    the cap, which is correct in production and a leak in a test. A construction that passes no
+    size at all exports the module default, so a test need not mention the variable to leak it:
+    ``tests/conftest.py``, ``test_ray_start_argv.py`` and ``test_head_memory_budget.py`` all do.
+
+    Every later test in the session then inherits a cap nobody set. Nothing fails today, which is
+    the problem -- the coupling is invisible, and the next test to depend on this variable would
+    be debugged against the wrong baseline.
+
+    NOT ``monkeypatch.delenv``: deleting a variable that is ABSENT records nothing to undo, so
+    monkeypatch has no teardown to run and whatever is exported afterwards simply stays. The
+    invariant is "unchanged", not "absent" -- a session that legitimately sets the variable must
+    not be disturbed.
+    """
+    entry = _pip_cache_session_entry()
+    found = os.environ.get(PIP_CACHE_ENV_VAR)
+    if found != entry:
+        # Something BEFORE this test left the variable changed and it is still changed now, so
+        # this test is about to run against a cap nobody set. Reported here, at the first test
+        # that inherits it, rather than at the end of the session: a session-end comparison is
+        # satisfied by anything that restores the value before then, which is exactly how a
+        # session-scoped fixture holding the value across every test went unnoticed.
+        if entry is None:
+            os.environ.pop(PIP_CACHE_ENV_VAR, None)
+        else:
+            os.environ[PIP_CACHE_ENV_VAR] = entry
+        pytest.fail(
+            f"{PIP_CACHE_ENV_VAR}={found!r} on entry to this test; the session started with "
+            f"{entry!r}. Something earlier left it set -- constructing a RayCluster in "
+            "single-machine or slurm mode exports it, including when no size is passed. It has "
+            "been reset for the tests that follow, so this is reported once, not N times."
+        )
+    yield
+    if entry is None:
+        os.environ.pop(PIP_CACHE_ENV_VAR, None)
+    else:
+        os.environ[PIP_CACHE_ENV_VAR] = entry
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_leaked_pip_cache_size() -> Generator[None, None, None]:
+    """Fail the session if the pip cache size was left changed.
+
+    The per-test fixture above covers a construction inside a test. This covers the paths it
+    cannot see -- a session- or module-scoped fixture that constructs a cluster, which sets the
+    variable once and outlives every function-scoped teardown.
+
+    It is declared beside ``no_leaked_working_directory`` because it is the same kind of defect:
+    silent until something later reads the value, and then charged to whichever test happened to
+    be running, which passes again on its own.
+    """
+    entry = os.environ.get(PIP_CACHE_ENV_VAR)
+    yield
+    final = os.environ.get(PIP_CACHE_ENV_VAR)
+    if final != entry:
+        pytest.fail(
+            f"a test or fixture left {PIP_CACHE_ENV_VAR}={final!r}; the session started with "
+            f"{entry!r}. Constructing a RayCluster in single-machine or slurm mode exports it, "
+            "including when no size is passed (the module default). Restore it where it changes."
+        )
+
+
 @pytest.fixture(scope="session")
 def data_dir(workspace_folder: Path) -> Path:
     """Create and return BioEngine Worker data directory."""
@@ -338,6 +418,7 @@ def workspace_dir() -> Generator[Path, None, None]:
 @pytest.fixture(scope="session")
 def ray_address(worker_mode: str) -> Generator[str, None, None]:
     """Start a Ray cluster a BioEngine Worker can connect to."""
+    pip_cache_before = os.environ.get(PIP_CACHE_ENV_VAR)
     if worker_mode == "external-cluster":
         with tempfile.TemporaryDirectory(prefix=f"bioengine_test_ray_") as temp_dir:
 
@@ -350,7 +431,21 @@ def ray_address(worker_mode: str) -> Generator[str, None, None]:
                 ray_temp_dir=temp_dir,
                 debug=True,
             )
-            asyncio.run(ray_cluster._start_cluster())
+            try:
+                asyncio.run(ray_cluster._start_cluster())
+            finally:
+                # Put the pip cache size back HERE, not at session teardown. Constructing the
+                # cluster above exported it; the Ray processes read it as they started and do
+                # not read it again. Holding it until teardown is the very symptom this guard
+                # exists for -- every test in between inherits a cap nobody set -- and the
+                # session-end comparison cannot see it, because by then it has been restored.
+                #
+                # In a `finally` so a failing _start_cluster() is reported as itself rather
+                # than as a leak.
+                if pip_cache_before is None:
+                    os.environ.pop(PIP_CACHE_ENV_VAR, None)
+                else:
+                    os.environ[PIP_CACHE_ENV_VAR] = pip_cache_before
             ray_cluster._set_head_node_address()
             ray_cluster.is_ready.set()
 
