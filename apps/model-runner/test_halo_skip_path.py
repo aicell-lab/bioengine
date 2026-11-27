@@ -849,7 +849,9 @@ def test_the_too_small_message_declines_a_spec_04_descriptor() -> None:
     assert too_small(_v04_descr(), _sample(512, 512)) is None
 
 
-def _branch_with_real_predicates(descr: Any, sample: Any, cellpose: bool = False) -> str:
+def _branch_with_real_predicates(
+    descr: Any, sample: Any, cellpose: bool = False
+) -> str:
     """Evaluate the REAL chain conditions with the REAL predicates loaded from the script.
 
     ``_selected_branch`` injects booleans, which pins the chain's SHAPE but cannot show what a
@@ -881,12 +883,17 @@ def test_a_spec_04_descriptor_reaches_the_final_else_through_the_REAL_chain() ->
     assert _branch_with_real_predicates(_v04_descr(), _sample(512, 512)) == "final-else"
 
 
-def test_a_real_05_descriptor_still_reaches_skip_padding_through_the_REAL_chain() -> None:
+def test_a_real_05_descriptor_still_reaches_skip_padding_through_the_REAL_chain() -> (
+    None
+):
     """The paired control: the guard must not quietly disable the skip path for 0.5.
 
     Without this, a guard that declined EVERYTHING would pass every 0.4 test above.
     """
-    assert _branch_with_real_predicates(_fixed_256_model(), _sample(256, 256)) == "skip-padding"
+    assert (
+        _branch_with_real_predicates(_fixed_256_model(), _sample(256, 256))
+        == "skip-padding"
+    )
 
 
 class _IdButStringAxes:
