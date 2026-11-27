@@ -203,16 +203,32 @@ async def test_gate_closed_means_no_registration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unreachable_hypha_schedules_a_rebuild_without_raising() -> None:
-    class _DeadServer:
+async def test_a_probe_timeout_does_not_schedule_a_rebuild() -> None:
+    """A timeout is the ABSENCE of an answer, not an answer that we are gone.
+
+    This case previously asserted the opposite — ``_connection_lost is True``
+    on ``asyncio.TimeoutError`` — and that assertion was the defect, not a
+    guard against it (#1061). A slow Hypha made the probe time out; the proxy
+    disconnected a registration that was perfectly live; re-registering took
+    23-44 s against the already-slow server; 60 s later the probe timed out
+    again. Measured on the live cluster, that loop held a public app
+    unreachable for 22 minutes while Ray Serve reported every deployment
+    HEALTHY.
+    """
+
+    class _SlowServer:
         async def get_service_info(self, _sid):
             raise asyncio.TimeoutError()
 
-    inst = _bare_proxy(server=_DeadServer(), websocket_service_id="ws")
+    inst = _bare_proxy(server=_SlowServer(), websocket_service_id="ws")
 
     await inst._maintenance_tick()
 
-    assert inst._connection_lost is True
+    assert inst._connection_lost is False
+    assert inst._registration_absent is False
+    # Counted, because this branch deliberately does nothing else.
+    assert inst._probe_timeouts == 1
+    assert inst._probe_timeouts_consecutive == 1
 
 
 @pytest.mark.asyncio
@@ -232,7 +248,15 @@ async def test_dropped_registration_on_a_live_socket_schedules_a_rebuild() -> No
 
     await inst._maintenance_tick()
 
-    assert inst._connection_lost is True
+    # A DEFINITIVE answer that we are gone still earns a remedy — this is the
+    # control for the timeout case above, and it has to stay green or "never
+    # rebuild" would pass as a fix. What changed with #1061 is only WHICH
+    # remedy: re-assert the services on the connection we still hold, instead
+    # of dropping the connection and rebuilding it. The socket is fine here —
+    # ``echo`` answers — so there is nothing to reconnect.
+    assert inst._registration_absent is True
+    assert inst._connection_lost is False
+    assert inst._probe_timeouts == 0
 
 
 def test_probe_asks_about_our_own_service() -> None:

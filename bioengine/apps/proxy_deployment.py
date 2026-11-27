@@ -62,6 +62,17 @@ _MAINTENANCE_TICK_S = 5
 # registration while our socket stays open, so nothing here ever notices.
 # Rare, so it is cheap to look for slowly.
 _REACHABILITY_PROBE_INTERVAL_S = 60
+# The probe's OWN bound, rather than hypha_rpc's 30 s default method_timeout,
+# which it used to inherit silently. Sized at one maintenance tick and not more:
+# _maintenance_tick flushes the usage ledger FIRST and runs behind the sibling
+# gate, so a blocking probe stalls both for its whole duration — at the
+# inherited 30 s that is six ticks of the "counts taken before a sibling dropped
+# out must still reach disk" guarantee. A healthy server answers this probe in
+# ~0.0 s (measured 2026-11-27 against the hypha-server production image with
+# hypha_rpc 0.21.40), so 5 s is effectively unbounded for the case we care about,
+# and a server slower than that is by definition the SLOW case below — which is
+# now handled without touching the connection, so classifying it early is safe.
+_PROBE_TIMEOUT_S = 5.0
 # Backoff between re-registration attempts, so a Hypha outage costs a retry per
 # interval rather than a reconnect storm. It is NOT what clears a stale client:
 # Hypha's check_client pings the existing client and reaps it on the spot if it
@@ -385,12 +396,23 @@ class ProxyDeployment:
         self._queued_requests = 0
 
         # Hypha connection upkeep — owned by the background maintenance task.
-        # ``_connection_lost`` is set when a reachability probe fails and
-        # requests a client rebuild; ``_registration_failure`` holds a permanent
+        # ``_connection_lost`` requests a full CLIENT rebuild (reconnect);
+        # ``_registration_absent`` requests only a re-assert of the services on
+        # the connection we already hold, which is the weaker and far commoner
+        # remedy — see _maintenance_tick for why conflating the two cost a
+        # 22-minute outage. ``_registration_failure`` holds a permanent
         # config/permission error for _liveness_watchdog to act on.
         self._maintenance_task: Optional[asyncio.Task] = None
         self._liveness_thread: Optional[threading.Thread] = None
         self._connection_lost = False
+        self._registration_absent = False
+        # Counted, not just logged: the probe's "is it gone" test matches a
+        # server-side message format, so if that format ever changes this
+        # degrades to "never re-registers after a real eviction" — an
+        # availability loss that is otherwise SILENT. Exposed through
+        # get_usage_stats so an operator can see it without the replica log.
+        self._probe_timeouts = 0
+        self._probe_timeouts_consecutive = 0
         self._registration_failure: Optional[BaseException] = None
         self._probe_due_at = 0.0
         self._next_register_at = 0.0
@@ -1296,14 +1318,32 @@ class ProxyDeployment:
                             were read.
         """
         await self._check_permissions(context, method_name="get_usage_stats")
+        # Reported whether or not durable storage exists, and reported here
+        # rather than only logged: an unanswered reachability probe is handled
+        # by doing NOTHING (see _maintenance_tick), so a Hypha too slow to
+        # answer leaves no trace an operator would otherwise look at. A rising
+        # total with a healthy-looking app is the signature to chase.
+        probe = {
+            "probe_timeouts": self._probe_timeouts,
+            "probe_timeouts_consecutive": self._probe_timeouts_consecutive,
+        }
         if self._usage_ledger is None:
-            return {"available": False, "reason": "no durable application storage"}
+            return {
+                "available": False,
+                "reason": "no durable application storage",
+                **probe,
+            }
         await self._flush_usage()
         loop = asyncio.get_event_loop()
         stats = await loop.run_in_executor(
             None, read_usage, self._usage_ledger.directory
         )
-        return {"available": True, "application_id": self.application_id, **stats}
+        return {
+            "available": True,
+            "application_id": self.application_id,
+            **probe,
+            **stats,
+        }
 
     async def _deregister_services(self) -> None:
         """Unregister all Hypha services and reset connection state.
@@ -1392,7 +1432,7 @@ class ProxyDeployment:
         )
         self._probe_due_at = time.time() + _RECONNECT_GRACE_S
 
-    async def _register_services(self) -> None:
+    async def _register_services(self, reuse_connection: bool = False) -> None:
         """
         Register WebSocket, WebRTC, and MCP services with the Hypha server.
 
@@ -1412,47 +1452,58 @@ class ProxyDeployment:
         # ``connect_to_server`` — otherwise Hypha pings it, finds it alive, and
         # refuses us with 'Client already exists and is active' for as long as
         # it keeps answering. See _reset_server_connection for details.
-        await self._reset_server_connection()
-        # Connect to Hypha server
-        try:
-            # Connect to the Hypha server
-            self.server = await connect_to_server(
-                {
-                    "server_url": self.server_url,
-                    "token": self.proxy_service_token,
-                    "workspace": self.workspace,
-                    "client_id": self.client_id,
-                }
-            )
-            connected_workspace = self.server["config"]["workspace"]
-            if connected_workspace != self.workspace:
-                raise _PermanentRegistrationError(
-                    f"Workspace mismatch: expected '{self.workspace}', got '{connected_workspace}'"
-                )
-            registered_client_id = self.server["config"]["client_id"]
-            if registered_client_id != self.client_id:
-                raise _PermanentRegistrationError(
-                    f"Client ID mismatch: expected '{self.client_id}', got '{registered_client_id}'"
-                )
+        # A reuse_connection=True caller has a LIVE connection whose services
+        # Hypha has forgotten; rebuilding it would reintroduce the very gap
+        # this path exists to avoid, so skip straight to re-registering. Note
+        # _reset_server_connection is also what clears _connection_lost, which
+        # is why the in-place caller clears _registration_absent itself.
+        if reuse_connection and self.server is None:
+            # Nothing to reuse — fall back to building the connection.
+            reuse_connection = False
+        if not reuse_connection:
+            await self._reset_server_connection()
+            # Connect to Hypha server
             try:
-                self.server.rpc._connection.on_disconnected(self._on_connection_lost)
-            except Exception as e:
-                # Losing the hook costs latency, not correctness — the
-                # reachability probe still finds a dead connection.
-                logger.warning(
-                    f"⚠️ Could not attach the Hypha disconnect hook for "
-                    f"'{self.application_id}': {e}"
+                # Connect to the Hypha server
+                self.server = await connect_to_server(
+                    {
+                        "server_url": self.server_url,
+                        "token": self.proxy_service_token,
+                        "workspace": self.workspace,
+                        "client_id": self.client_id,
+                    }
                 )
-            logger.info(
-                f"✅ Successfully connected to Hypha server as client "
-                f"'{self.client_id}' for '{self.application_id}'"
-            )
-        except Exception as e:
-            self.server = None
-            logger.error(
-                f"❌ Error connecting to Hypha server for '{self.application_id}': {e}"
-            )
-            raise
+                connected_workspace = self.server["config"]["workspace"]
+                if connected_workspace != self.workspace:
+                    raise _PermanentRegistrationError(
+                        f"Workspace mismatch: expected '{self.workspace}', got '{connected_workspace}'"
+                    )
+                registered_client_id = self.server["config"]["client_id"]
+                if registered_client_id != self.client_id:
+                    raise _PermanentRegistrationError(
+                        f"Client ID mismatch: expected '{self.client_id}', got '{registered_client_id}'"
+                    )
+                try:
+                    self.server.rpc._connection.on_disconnected(
+                        self._on_connection_lost
+                    )
+                except Exception as e:
+                    # Losing the hook costs latency, not correctness — the
+                    # reachability probe still finds a dead connection.
+                    logger.warning(
+                        f"⚠️ Could not attach the Hypha disconnect hook for "
+                        f"'{self.application_id}': {e}"
+                    )
+                logger.info(
+                    f"✅ Successfully connected to Hypha server as client "
+                    f"'{self.client_id}' for '{self.application_id}'"
+                )
+            except Exception as e:
+                self.server = None
+                logger.error(
+                    f"❌ Error connecting to Hypha server for '{self.application_id}': {e}"
+                )
+                raise
 
         try:
             # Create service functions from method schemas
@@ -1475,7 +1526,20 @@ class ProxyDeployment:
             # Add cumulative usage counts - survives the Ray session
             service_functions["get_usage_stats"] = self.get_usage_stats
 
-            # Register the main service
+            # Register the main service.
+            #
+            # ``overwrite`` is REQUIRED on the reuse path and must stay off the
+            # fresh one. Measured 2026-11-27 against the hypha-server
+            # production image: re-registering an id this client already holds,
+            # on the same live connection, is NOT an upsert — it raises
+            # ``Exception: Service already exists: <id>, please specify a
+            # different id (not <id>) or overwrite=True``. With it, the
+            # re-assert returns the same service id in 0.01 s and the service
+            # stays resolvable and callable. A fresh connection has no prior
+            # registration of its own to clobber, so it does not ask for the
+            # flag: the id is namespaced by client_id, which means the only
+            # thing ``overwrite`` can ever replace here is this client's own
+            # earlier registration.
             websocket_service_info = await self.server.register_service(
                 {
                     "id": self.application_id,
@@ -1484,7 +1548,8 @@ class ProxyDeployment:
                     "type": "bioengine-app",
                     "config": {"visibility": "public", "require_context": True},
                     **service_functions,
-                }
+                },
+                overwrite=reuse_connection,
             )
             self.websocket_service_id = (
                 f"{self.workspace}/{self.client_id}:{self.application_id}"
@@ -1590,6 +1655,38 @@ class ProxyDeployment:
         if isinstance(exc, ConnectionAbortedError):
             return True
         return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
+
+    @staticmethod
+    def _is_definitive_absence(exc: BaseException) -> bool:
+        """Whether Hypha has ANSWERED that our service is not registered.
+
+        This is the whole of the "slow vs gone" distinction, and it is the
+        difference between re-registering and tearing down a registration that
+        was never lost.
+
+        Measured 2026-11-27 against the hypha-server production image with
+        ``hypha_rpc`` 0.21.40: a service Hypha does not have — whether it never
+        existed or was unregistered out from under us — comes back in ~0.0 s as
+        ``hypha_rpc.rpc.RemoteException`` whose message ends
+        ``KeyError: 'Service not found: <id>@*'``. A server that is merely SLOW
+        instead gives ``asyncio.TimeoutError`` at the probe's bound, and says
+        nothing whatsoever about whether the registration still exists.
+
+        Only the first is evidence. Everything else — a timeout, a transport
+        error, an unrecognised server error — is the ABSENCE of an answer, and
+        absence of an answer must never be read as absence of the service: that
+        inversion is what turned a slow Hypha into a 22-minute outage, because
+        the remedy for eviction (disconnect and rebuild) applied to a healthy
+        registration destroys it.
+
+        So this deliberately fails CLOSED: an unrecognised error answers False
+        and nothing is torn down. The cost of that direction is an eviction we
+        do not notice until a later probe, which is why the caller counts
+        timeouts and exposes the count rather than only logging it. Matching a
+        server-side message format will rot across Hypha versions, and when it
+        does, it rots towards leaving a working service alone.
+        """
+        return "service not found" in str(exc).lower()
 
     async def _collect_renewed_token(self) -> None:
         """Adopt a replacement Hypha token the worker has left for us.
@@ -1755,6 +1852,45 @@ class ProxyDeployment:
                         )
             return
 
+        # Hypha answered that our services are gone while the CONNECTION is
+        # still good. Re-assert them on the connection we already hold: no
+        # disconnect, so there is no window in which the service is
+        # unregistered — where the old path cost 23-44 s of absence per cycle
+        # (#1061), this costs none. Kept as its own branch rather than folded
+        # into ``needs_registration`` above, because that branch calls
+        # ``_register_services()`` with no arguments, which is exactly the
+        # destructive rebuild being removed here.
+        if self._registration_absent:
+            now = time.time()
+            if now < self._next_register_at:
+                return
+            self._next_register_at = now + _REREGISTER_BACKOFF_S
+            # Same lock as the full rebuild: an in-flight rebuild and an
+            # in-place re-assert must not interleave on ``self.server``.
+            async with self._registration_lock:
+                try:
+                    await self._register_services(reuse_connection=True)
+                    # Cleared HERE and only here. ``_reset_server_connection``
+                    # is what clears ``_connection_lost``, and this path
+                    # deliberately does not call it — so without this line the
+                    # flag would stay set and every later tick would
+                    # re-register for the life of the replica.
+                    self._registration_absent = False
+                    self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
+                    self._next_register_at = 0.0
+                    self._report_service_registration(True)
+                    logger.info(
+                        f"✅ Re-asserted Hypha services for '{self.application_id}' "
+                        f"in place, without dropping the connection"
+                    )
+                except Exception as e:
+                    # Flag intentionally LEFT SET so the next tick retries.
+                    logger.warning(
+                        f"⚠️ In-place re-registration for '{self.application_id}' "
+                        f"failed; retrying in {_REREGISTER_BACKOFF_S}s: {e}"
+                    )
+            return
+
         if time.time() < self._probe_due_at:
             return
         try:
@@ -1762,8 +1898,12 @@ class ProxyDeployment:
             # socket answers: a freeze long enough for Hypha to evict the client
             # leaves the socket open from this side, so an echo keeps succeeding
             # against a server that has dropped the registration.
-            await self.server.get_service_info(self.websocket_service_id)
+            await asyncio.wait_for(
+                self.server.get_service_info(self.websocket_service_id),
+                timeout=_PROBE_TIMEOUT_S,
+            )
             self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
+            self._probe_timeouts_consecutive = 0
             # Re-assert rather than assume the record still says what we last
             # wrote: a successor's init-time claim replaces it with False, and
             # if that successor never registers nothing else would ever put it
@@ -1777,12 +1917,35 @@ class ProxyDeployment:
             if self.entry_deployment_ready:
                 self._report_service_registration(True)
         except Exception as e:
-            # Not a health-check failure: flag for rebuild on the next tick.
-            logger.warning(
-                f"⚠️ Hypha no longer serves '{self.websocket_service_id}'; rebuilding "
-                f"the client: {e}"
-            )
-            self._connection_lost = True
+            # Never a health-check failure either way — but WHICH remedy this
+            # earns depends entirely on whether Hypha ANSWERED. See
+            # _is_definitive_absence: only a definitive "Service not found" is
+            # evidence the registration is gone. A timeout is the absence of an
+            # answer, and the old code's single ``_connection_lost = True`` for
+            # both is what made a slow Hypha self-amplifying: the probe timed
+            # out, the proxy disconnected a registration that was fine, the
+            # rebuild took 23-44 s against the already-slow server, and 60 s
+            # later the probe timed out again (#1061).
+            if self._is_definitive_absence(e):
+                logger.warning(
+                    f"⚠️ Hypha reports '{self.websocket_service_id}' is not "
+                    f"registered; re-asserting it on the existing connection: {e}"
+                )
+                self._registration_absent = True
+            else:
+                self._probe_timeouts += 1
+                self._probe_timeouts_consecutive += 1
+                # Loud, and counted: this is the branch that does NOTHING, so
+                # without a running total a server that is permanently too slow
+                # to answer looks identical to a healthy one.
+                logger.warning(
+                    f"⚠️ Hypha did not answer the reachability probe for "
+                    f"'{self.websocket_service_id}' within {_PROBE_TIMEOUT_S}s "
+                    f"({self._probe_timeouts_consecutive} consecutive, "
+                    f"{self._probe_timeouts} total). NOT rebuilding: a slow "
+                    f"server is not a lost registration. {type(e).__name__}: {e}"
+                )
+                self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
 
     async def _maintenance_loop(self) -> None:
         # Started here rather than from the constructor, and deliberately:

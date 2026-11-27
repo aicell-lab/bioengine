@@ -30,6 +30,14 @@ class ProxyDouble(PROXY_CLS):
     _token_ttl_seconds = 0
     _token_issued_at = 0.0
 
+    # Same reasoning for the probe's "slow vs gone" state. ``_maintenance_tick``
+    # reads all three on every tick, so without these defaults every fixture
+    # that drives the tick for an unrelated reason fails with AttributeError
+    # rather than exercising the path it is about. The constructor sets them.
+    _registration_absent = False
+    _probe_timeouts = 0
+    _probe_timeouts_consecutive = 0
+
     def _start_background_workers(self) -> None:
         """Drop the Serve-only background startup.
 
