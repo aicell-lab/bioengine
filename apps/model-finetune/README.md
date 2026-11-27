@@ -121,8 +121,26 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
   per session, run with `onnxruntime-web`, decode each box locally using the
   `compute_embedding` features. `compute_embedding` and `get_onnx_model` are
   **micro-sam only** — cpsam has no encoder embedding or ONNX prompt decoder.
-- **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
-  an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
+- **`get_upload_url(file_type)`** Presigned S3 PUT URL for staging an input image
+  (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`). **The one-hour
+  figure covers BOTH the staged file and the URL** — the file is deleted about an
+  hour after this call returns, and the presigned signature expires on the same
+  clock. See "Staged files" below.
+
+**Staged files live about an hour, and the clock starts at `get_upload_url`.**
+Two things expire, both an hour after you asked for the URL: the **object**,
+which `ttl` schedules for deletion, and the **URL itself**, whose signature has a
+separate `expires_in` defaulting to the same hour. So it is an upload deadline
+*and* a file lifetime — and raising `ttl` alone widens neither in a way a caller
+can use, because the signature still dies on the hour.
+
+Two consequences. Staging a dataset by minting many URLs up front and uploading
+them in a long sequential loop spends the window on the loop — the first files
+staged are near the end of their life by the time the last lands, so mint each
+URL next to its own upload. And anything that stages and then **waits** — a run
+queued behind another one, a second evaluation pass after a long training — must
+re-stage before it uses those paths. A `404` on a staged path is most likely a
+deleted file; a never-uploaded path and a typo answer identically.
 
 **Embedding reuse (Leg B).** Encode once, reuse the embedding for both the
 in-browser interactive decoder and automatic segmentation without a second
@@ -183,7 +201,18 @@ launch instead of OOMing mid-train.
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
-  `.geojson` FeatureCollection of polygons (rasterized to instances).
+  `.geojson` FeatureCollection of polygons (rasterized to instances). Polygon
+  coordinates are **image pixels in `(x, y)` order, origin at the top-left pixel
+  and y increasing downward** — the raster convention, not y-up. One instance per
+  polygon **part**, numbered from 1 in document order: a `Polygon` is one
+  instance, and **each part of a `MultiPolygon` is its own**, so the count is per
+  part and not per feature. Only the outer ring of each part is drawn, so an
+  interior ring (a hole) **adds no instance**: it is filled with the outer id
+  rather than cut out, and a holed polygon is one instance, not two. A
+  FeatureCollection that carries polygons but rasterizes to nothing is rejected
+  rather than trained on; a **y-up** one is not, because it rasterizes mirrored
+  with every polygon still inside the image, so nothing raises and the run trains
+  on wrong masks. Flip y before uploading if your annotator writes y-up.
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).
@@ -215,12 +244,23 @@ launch instead of OOMing mid-train.
   source is reported per-pair as `{ok: false, error}` rather than failing the batch.
   With `stage=True` (default) the prepared arrays are re-staged into the app's temp
   store and the returned `train_images`/`train_labels` URL lists feed straight into
-  `start_training` (call it promptly — staged URLs are short-lived). `enable_clahe`
+  `start_training` (call it promptly — the re-staged files are deleted about an
+  hour after they were staged, so a dataset prepared and then left to wait has to
+  be prepared again: see "Staged files" above). `enable_clahe`
   applies contrast-limited adaptive histogram equalisation while staging (forces
   `stage` on) — reintroducing the old Cellpose app's CLAHE as an explicit opt-in for
   low-contrast fluorescence. Returns `{ok, train_pair_count, train_pair_ok,
   val_pair_count, pairs:[...], message, train_images?, train_labels?, ...}`.
 - **`get_training_status(session_id)`** → `{status, elapsed_s, n_epochs, n_epochs_completed, n_epochs_completed_basis, checkpoint_available, message, ...}`. `status` ∈ `PREPARING | TRAINING | COMPLETED | FAILED | STOPPED`. `n_epochs` is the requested count; `n_epochs_completed` is how many actually ran (updated live during training) — for micro-SAM this can be below `n_epochs` when early stopping fires, so a COMPLETED run with `n_epochs_completed < n_epochs` is expected, not a truncation. **`n_epochs_completed_basis` tells you which kind of number that is**, because the two backends produce different kinds under one name: `measured` (micro-SAM — read from torch_em's per-epoch `latest.pt`, an observation that can disagree with the request) versus `floor_if_completed` (cellpose — `train_seg` has no early stopping and only checkpoints after the full loop, so on COMPLETED the count *equals* `n_epochs` and is a guaranteed lower bound, **not** a measurement that the epochs ran; cellpose exposes no per-epoch counter). Do not read a `floor_if_completed` value as evidence of how long the run ran — it can only ever equal the request. A terminal status carries `terminated_by` (`child` | `supervisor` | `user_stop` | `entry`) recording who wrote it; the child's outcome overrides a bystander's premature terminal, while a user stop is never overwritten by a late completion. For runs that predate this field, retrospective recovery starts by matching an absent `end_time`. Recovering the *epoch count* from there is **micro-SAM only** — read the host-mount `train.log` for its "Finished training after N epochs" line; cellpose's `train_seg` emits no such line. Recovering only the *yes/no* — did the trainer outlive its terminal record — is backend-independent and needs no log parsing: a newest-checkpoint mtime (`latest.pt`/`best.pt`) later than the last `status.json` write means the run kept training past a bystander's premature terminal. Both signals read host-mount files, so neither is reachable through an RPC handle — which is why `n_epochs_completed` is surfaced in status going forward. A COMPLETED cellpose status also carries `metrics_requested` (the normalised selection, so you can tell what was actually computed from what you asked for) plus one field per selected metric. `"loss"` → `train_losses`/`test_losses`, per-epoch, with `test_losses` entries `null` for epochs where `train_seg` skipped validation (it validates only on its `validation_interval` cadence and reports `0.0` off-cadence; a real segmentation loss is never exactly `0.0`, so those are surfaced as `null` rather than as a loss of zero). `"pixel"` → `pixel_metrics` (`{n_val, n_true, n_pred, pixel_accuracy, precision, recall, f1, iou}`) — a foreground/background scorecard pooled over the validation split, **not** an instance metric: a high `iou` there says nothing about whether touching cells were separated. `"instance"` → `instance_metrics` (`{n_val, n_true, n_pred, thresholds, mean_ap, f1, tp, fp, fn}`, the last six keyed by IoU threshold `"0.5"`/`"0.75"`/`"0.9"`) — `mean_ap` is averaged over images, `f1` is micro-averaged from pooled `tp`/`fp`/`fn` so one sparse image cannot outweigh a crowded one. Both held-out metrics are best-effort: if the eval cannot run, the field carries `{error}` and the training run still reports COMPLETED, because a checkpoint that exists must not be reported as a failure over an unscored metric. Note that when no `val_images` are supplied and the train/val split cannot produce a held-out set, status carries `val_reused_train: true` — the validation metrics are then measured on training data and are not a generalisation estimate.
+- **Contention, in `get_training_status`.** `slot_busy` is true when all training
+  slots were held at the moment this one started, and `slot_busy_message` says
+  so in words. It answers "was my run sharing a worker?", which `status` cannot answer
+  during preparation — a contended run and an uncontended one both read `PREPARING` while
+  they resolve inputs, so a fault in that phase used to arrive as a bare transport error
+  with nothing attributing it. The field is the state AT SUBMISSION and is never written
+  back, so it stays true-as-written on a finished run; the live "is it waiting now?" is
+  `status` reaching `QUEUED`. A failure under contention carries the same note appended to
+  `message`, after the underlying error rather than instead of it.
 - **`list_training_sessions()`** → **the runs the CALLER may see**, keyed by `session_id` — not every run on the worker. A run is returned to the caller whose identity it was recorded under, and to anyone who owns or manages the dataset it was trained on (see `dataset_artifact_id` on `start_training`); a run carrying no owner only to a caller holding `rw` or admin on the `bioimage-io` workspace. An anonymous caller is a real identity here (Hypha mints a fresh one per connection), so it sees the runs it started on that connection and no others — which also means an anonymous caller's history does not survive a reconnect. **An empty result means "none that you own", not "none on this worker".**
   **Runs started before owners were recorded have no owner, and are listed only for `bioimage-io` administrators.** That is every run created before version 0.30.38, the release that began recording it. They are not attributed retrospectively — there is no record of who started them, so any attribution would be a guess — and they are not deleted either; they simply do not appear in any ordinary caller's listing. If you trained a model before that version, an administrator can give you its `session_id`, which still grants read access and still lets you run inference with that run's model — but **not** resume training from it: resuming an ownerless run requires `rw`/admin on `bioimage-io`, because with no recorded owner there is nobody for the ownership check to match you against. From 0.30.38 onwards a run is recorded against the caller who started it and appears in that caller's own listing.
   **A run's `session_id` grants read access to that run.** The listing is per-caller, but `get_training_status(session_id)` is not: anyone holding a run's id can read that run's status and the configuration it was trained with. So sharing an id shares the run, and there is no way to withdraw that afterwards — treat an id like a link to the run, not like a name for it. Changing a run is different and is restricted: only the caller it was recorded under, or a holder of `rw`/admin on `bioimage-io`, can stop it, export it, or contribute it to a pool. **Resuming sits between the two**: continuing training from a run's checkpoint is open to its owner, to anyone who owns or manages the dataset it was trained on, and to an administrator — but not to a stranger holding the id. A run's collaborators are its dataset's managers, so a colleague can carry the work on; disposing of somebody else's run is not something sharing a dataset consents to. **An id also lets any caller run inference with that run's fine-tuned model** (`infer`, `compute_embedding`). That is deliberate: those calls return outputs computed with the weights, the caller never receives the checkpoint, and no new model derives from it — and shared sessions exist for several people to try one run's model. So sharing an id shares both viewing the run and running its model, and neither can be withdrawn afterwards.

@@ -272,6 +272,10 @@ async def _cancel_during_prepare(stop_requested_first: bool) -> str:
 
     class _Replica:
         _training_tasks: dict = {}
+        # `_run_training` reads this before it prepares, to record whether
+        # another run already held the training slot. The app sets it in
+        # __init__, so a stub that drives `_run_training` needs one too.
+        _training_sem = asyncio.Semaphore(1)
 
         async def _preparing_heartbeat(self, sid, interval=60.0):
             await asyncio.sleep(3600)

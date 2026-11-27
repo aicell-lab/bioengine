@@ -2372,9 +2372,35 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per Polygon/MultiPolygon feature, ids from 1 in document order;
-    coordinates are image-pixel (x, y). Ported from cellpose-finetuning's
-    ``_rasterize_geojson_to_tiff`` (the bioimage.io colab polygon convention).
+    One instance per polygon PART, ids from 1 in document order -- a ``Polygon``
+    is one instance and EACH PART of a ``MultiPolygon`` is its own, because the
+    id is incremented in the loop over parts below. Only ring 0 of each part is
+    drawn, so an INTERIOR RING ADDS NO ID: a holed polygon is one instance with
+    its hole filled, not two.
+
+    This wording has been wrong twice, in opposite directions. "per
+    Polygon/MultiPolygon feature" read as one id per feature and UNDERcounted a
+    MultiPolygon. "per ring" then OVERcounted a holed ``Polygon`` -- it predicts
+    ``[1, 2]`` where the code gives ``[1]`` -- and contradicted the sentence
+    beside it saying interior rings are ignored. "Part" is the word that matches
+    the loop below, and the arms in
+    ``test_geojson_axis_convention.py`` pin both halves.
+
+    COORDINATES ARE IMAGE PIXELS ``(x, y)`` WITH THE ORIGIN AT THE TOP-LEFT AND
+    ``y`` INCREASING DOWNWARD -- the raster convention. That is not a choice made
+    here: the coordinates below go to PIL's ``ImageDraw.polygon`` on a
+    ``(width, height)`` canvas unchanged, and that is what PIL does.
+
+    Saying the DIRECTION matters, and an earlier version of this docstring said
+    only "image-pixel (x, y)". A y-UP annotation set (origin bottom-left, as
+    several GIS and plotting tools emit) rasterises VERTICALLY MIRRORED and
+    trains on wrong masks without raising anything -- every polygon still lands
+    inside the image, so no bounds check fires and the mask is not empty. There
+    is no runtime signal to notice, which is why the convention is written here,
+    in both RPC schemas and in the README rather than only in this file.
+
+    Ported from cellpose-finetuning's ``_rasterize_geojson_to_tiff`` (the
+    bioimage.io colab polygon convention).
     """
     from PIL import Image as PILImage, ImageDraw
 

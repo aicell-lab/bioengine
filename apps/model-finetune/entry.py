@@ -60,6 +60,29 @@ _ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
 _MAX_CONCURRENT_TRAINING = max(
     1, int(os.getenv("MODEL_FINETUNE_MAX_CONCURRENT_TRAINING", "1") or "1")
 )
+
+# How much of a failure message is kept in a session's status document. Named
+# because the failure path has to fit two things inside it -- the underlying
+# error and the contention note -- and a bare literal at the truncation site
+# hides a limit that two strings have to share. `train_worker.py` and
+# `train_worker_cellpose.py` clip to the same 800 with their own literals; they
+# run as separate processes and write a single string, so they are left alone
+# rather than made to import this, but the number is the same by intent.
+_STATUS_MESSAGE_LIMIT = 800
+
+# THE CONTENTION WORDING, DEFINED ONCE. It is read in three places -- the
+# `slot_busy_message` field, the note appended to a failure message, and the
+# tests -- and it drifted the moment there were two copies: a review caught the
+# field saying "every training slot" while both notes still said "the training
+# slot", which is true only at the default cap of 1. Deriving the note from the
+# message makes the two unable to disagree, and the tests assert against these
+# names rather than against a repeated sentence.
+_SLOT_BUSY_MESSAGE = (
+    "all training slots were held when this run started, so it prepared its "
+    "data alongside a run already in progress"
+)
+_SLOT_BUSY_NOTE = f" [{_SLOT_BUSY_MESSAGE}; that may or may not be related]"
+
 RuntimeApp = None
 CellposeRuntime = None
 if "microsam" in _ENABLED_BACKENDS:
@@ -451,6 +474,74 @@ class _RecognisedRedeposit(Exception):
             f"weights already deposited as '{existing.get('contribution_id')}'"
         )
         self.existing = existing
+
+
+# Exactly what `get_upload_url` and `_put_temp_embedding` write: a `temp/`
+# segment holding a uuid4, then an extension.
+#
+# THE UUID IS THE DISCRIMINATOR, NOT THE BOUNDARY, and an earlier version of
+# this comment got that backwards -- it claimed `datasets/temp/<uuid>.npy`
+# "cannot match on the right of a longer path". It does match: `(?:^|/)` has to
+# accept a leading path, because the real download URL is
+# `.../s3/<bucket>/<workspace>/temp/<uuid>.npy` and the segment is never at the
+# start. What keeps a foreign source out is the UUID: `/temp/scan_001.tif` and
+# `datasets/temp/a.npy` both fail on it. An artifact file literally named
+# `temp/<uuid4>.<ext>` would be taken for a staged one, which is accepted --
+# nothing in this app writes one, and the alternative is losing the proxy form.
+_STAGED_PATH_RE = re.compile(
+    r"(?:^|/)temp/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.[A-Za-z0-9]+$"
+)
+
+
+def _staged_gone_message(source: str, status: int) -> str:
+    """What to tell a caller whose staged input is no longer readable.
+
+    One place, because the same sentence has to serve a 404 (the object was
+    deleted) and a 403 (its presigned signature expired). Both run on the same
+    one-hour clock from the mint, both have the same remedy, and a caller cannot
+    act on the difference between them.
+    """
+    return (
+        f"Staged source '{source}' could not be read (HTTP {status}) and is most "
+        f"likely gone. A file staged with `get_upload_url` lasts about 1 hour from "
+        f"the moment that URL was MINTED, not from when the upload finished -- and "
+        f"the presigned URL itself expires on the same clock, so an HTTP 403 here "
+        f"means the signature ran out rather than the permissions changing. "
+        f"Anything that stages and then waits -- a run queued behind another one, a "
+        f"second pass after a long training, or a dataset prepared by "
+        f"`preflight_training_dataset` and submitted later -- must re-stage first. "
+        f"A path that was never uploaded, or a typo, answers with the same 404. "
+        f"Re-request an upload URL, re-upload, and submit promptly."
+    )
+
+
+def _is_staged_source(source: str) -> bool:
+    """Is this a file staged through ``get_upload_url``?
+
+    NOT ``startswith("temp/")``. That tested the shape I pictured rather than the
+    thing: ``preflight_training_dataset(stage=True)`` re-stages the prepared arrays
+    and hands back presigned DOWNLOAD URLs, not ``temp/`` paths -- and the README
+    tells callers to feed exactly those to ``start_training``. So the one case this
+    row is about, a dataset prepared and then left to wait, arrived as
+    ``https://.../temp/<uuid>.npy?X-Amz-...`` and missed the staged branch
+    entirely, getting a message with no lifetime and no remedy.
+
+    NOT "has a ``/temp/`` segment" either, which is what this function said first
+    and which was worse than the bug it replaced. ``https://lab.example.org/temp/
+    scan_001.tif`` is somebody else's server, and an artifact path like
+    ``datasets/temp/a.npy`` is not staged at all -- both were being told, on a 403,
+    that their presigned signature had expired and that they should re-stage a file
+    they never staged. A confident wrong diagnosis, which is precisely what the
+    arms in this file's test call out.
+
+    So match WHAT THIS APP MINTS, not a word that happens to appear in a path.
+    Every staged path is written here as ``temp/<uuid4><ext>`` -- see
+    ``get_upload_url`` and ``_put_temp_embedding`` -- so the marker is a ``temp/``
+    segment followed by a UUID. The query string is cut first, so a
+    ``?prefix=temp/...`` parameter cannot masquerade as one either.
+    """
+    return _STAGED_PATH_RE.search(source.split("?", 1)[0]) is not None
 
 
 @bioengine.app(
@@ -1097,7 +1188,32 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
+        """Presigned S3 PUT URL for staging an input image or embedding.
+
+        TWO THINGS EXPIRE AN HOUR AFTER THIS CALL, and the clock starts HERE
+        rather than when the PUT lands:
+
+        * the OBJECT. ``ttl`` below is the storage service's deletion schedule --
+          it arranges for the staged file to be removed about an hour later.
+        * the URL. The signature has its own lifetime, ``expires_in``, which this
+          call does not pass and which defaults to the same hour. So the handout
+          is also an upload deadline.
+
+        An earlier version of this docstring said ``ttl`` was "not only a
+        signature lifetime" and that raising it "raises the window". Both were
+        wrong: ``ttl`` is ONLY the deletion schedule, and raising it alone widens
+        nothing a caller can use, because the signature still dies on the hour.
+        Widening the real window means raising ``expires_in`` as well -- on
+        ``get_file`` too, since ``preflight_training_dataset`` hands back download
+        URLs minted with its default.
+
+        The distinction is what costs time. Staging a dataset by minting many URLs
+        up front and uploading them in a long sequential loop spends the window on
+        the loop: the files staged first are near the end of their life when the
+        last one lands. Mint each URL next to its own upload, and anything that
+        stages and then WAITS -- a run queued behind another, a second evaluation
+        pass after a long training -- must re-stage first.
+        """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1206,8 +1322,34 @@ class EntryApp:
             else (await self._get_download_url(source))
         )
         resp = await self._http_retry("GET", url)
+        # A STAGED SOURCE IS ANSWERED ON 403 AS WELL AS 404, and both get the
+        # lifetime and the repair. Two things expire on the same clock, an hour
+        # after `get_upload_url` minted the URL: the storage service schedules the
+        # object's deletion (`ttl`), and the presigned signature itself runs out
+        # (`expires_in`, which defaults to the same hour). A dead object answers
+        # 404; a dead signature answers 403, and `_http_retry` retries 403 and
+        # hands it back, so `raise_for_status()` below used to turn the single most
+        # likely staging failure into an `HTTPStatusError` that was not even a
+        # `FileNotFoundError`.
+        #
+        # Measured against the live store: of 585 objects under `temp/`, 453 were
+        # under an hour old, 17 between one and 1.25 hours, and NONE between 1.25
+        # hours and 30 days -- an app staging hundreds an hour cannot leave that
+        # range empty unless they are removed.
+        #
+        # A 403 on a NON-staged source keeps its old behaviour deliberately: that
+        # is an access problem, not a lifetime one, and must not be dressed up as a
+        # missing file.
+        if resp.status_code in (403, 404) and _is_staged_source(source):
+            raise FileNotFoundError(_staged_gone_message(source, resp.status_code))
         if resp.status_code == 404:
-            raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
+            # A typo and a never-written path answer identically here, so the
+            # message offers both rather than asserting one.
+            raise FileNotFoundError(
+                f"Source '{source}' could not be read (HTTP 404). It may never have "
+                f"been uploaded, may have been removed, or may be a mistyped path -- "
+                f"a 404 cannot distinguish these."
+            )
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
         if ext == ".npy":
@@ -1734,7 +1876,70 @@ class EntryApp:
         import training
 
         preparing_hb = asyncio.create_task(self._preparing_heartbeat(session_id))
+        # WHETHER THE SLOT IS ALREADY HELD, RECORDED BEFORE ANY PREPARATION.
+        #
+        # QUEUED is only written further down, after the whole dataset has been
+        # resolved and materialised, because preparing while another run trains
+        # is deliberate -- it keeps the GPU from idling between runs. The cost
+        # is that for the whole of that phase a contended run is
+        # indistinguishable from an uncontended one, and anything that fails in
+        # it reports whatever error it hit with nothing saying a slot was busy.
+        # Measured end to end by a caller: a second start_training went
+        # PREPARING -> FAILED with a bare `get_service` timed-out message, and
+        # their conclusion was the right one -- a caller cannot tell contention
+        # from a real failure.
+        #
+        # So it is recorded in its own field rather than in `status`. Setting
+        # the status to QUEUED here instead would read better and cost more:
+        # the quiet-run sweep moves a run to STOPPED only from PREPARING or
+        # TRAINING and deliberately exempts QUEUED, so a run marked QUEUED
+        # before it prepares would make every stuck preparation immune to the
+        # sweep -- and preparation is the phase that does the downloading.
+        #
+        # BEST-EFFORT, AND INSIDE THE TRY, for the reason the heartbeat above
+        # gives in full: `write_status` raises `RunRecordLockTimeout` when the
+        # record mutex cannot be taken and `RunRecordUnreadable` when the file
+        # will not parse, which is right for a write that carries an outcome and
+        # wrong for one that carries a label. Raised where this sits -- before
+        # the `try` -- the exception escaped `_run_training` with no handler in
+        # scope: no FAILED record, the `finally` skipped, the heartbeat task left
+        # dangling and the session in `_training_tasks` for ever, leaving the run
+        # at PREPARING until the quiet-run sweep called it STOPPED. That is the
+        # same unreadable outcome this change exists to remove, reached from the
+        # other side, and it would have fired only on the contended path -- the
+        # one path this is about. A second writer for this record genuinely
+        # exists in the process (`_runs_sync_loop`), so the lock is contendable.
+        #
+        # SAMPLED ONCE, AND THAT IS THE FIELD'S MEANING, not an oversight: a run
+        # submitted while the slot was free and overtaken during its own
+        # preparation is NOT flagged. The question `slot_busy` answers is "was
+        # this run sharing a worker when it started", which is what a caller
+        # comparing two runs' timings needs and what the reported case was.
+        # Re-sampling would answer a different question ("was it ever
+        # contended") and would need a write per sample; `status` already
+        # reaches QUEUED for the live state, and the failure note is attached
+        # from this same reading, so the two agree by construction.
+        #
+        # `locked()` is ALL slots held, not one. At the default cap of 1 that
+        # is the same statement; above it, a run starting beside N-1 training
+        # runs reads false, which is the right answer to "was a slot free at
+        # submission" and
+        # is why the field is described as every slot being held rather than
+        # as the slot.
+        slot_busy = self._training_sem.locked()
         try:
+            if slot_busy:
+                training.write_status_best_effort(
+                    session_id,
+                    slot_busy=True,
+                    # Past tense on purpose: the field records the state AT
+                    # SUBMISSION and is never written back, so it is still on the
+                    # record after the run has trained and completed. The live
+                    # answer to "is it waiting?" is `status`, which reaches
+                    # QUEUED further down; a present-tense sentence here reads as
+                    # that on a finished run and contradicts it.
+                    slot_busy_message=_SLOT_BUSY_MESSAGE,
+                )
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
             )
@@ -1829,9 +2034,43 @@ class EntryApp:
             # quoting the URL. This catches the paths nobody has thought of,
             # which is the only kind that matters for a credential.
             safe = ngff_region.redact_store_credential(e)
-            logger.error(f"Training session {session_id} failed: {safe}")
+            # THE CONTENTION IS APPENDED, NOT SUBSTITUTED. The underlying error
+            # is the diagnostic and a caller needs it; what it does not say, and
+            # cannot, is that this run was sharing a worker with another one.
+            # The reported case was a bare `get_service` timed out, which reads
+            # as an unrelated RPC fault. Note this does NOT claim the contention
+            # caused the failure -- it says a slot was busy at the time, which is
+            # the fact the caller was missing.
+            # THE NOTE IS KEPT BY TRUNCATING THE ERROR, NOT THE WHOLE STRING.
+            #
+            # Appending and then slicing to the field's limit loses whichever end
+            # the slice drops, and the note is at that end: it is ~170
+            # characters, so any underlying error longer than ~630 cut it off
+            # COMPLETELY while the README and get_training_status both promise a
+            # failure under contention carries it. Measured on the harness
+            # below: an error of 700 characters kept the note, 790 and 2000
+            # stored an 800-character message with none of it. A Hypha
+            # RemoteException's traceback is routinely past 630, so that was the
+            # ordinary case rather than an edge.
+            #
+            # The error keeps the front, which is where its type and message
+            # are, and the note is always whole -- reversing which half is
+            # sacrificed, because a truncated diagnostic is still a diagnostic
+            # and a truncated note is nothing.
+            note = _SLOT_BUSY_NOTE
+            logged = f"{safe}{note}" if slot_busy else safe
+            logger.error(f"Training session {session_id} failed: {logged}")
+            if slot_busy and len(note) < _STATUS_MESSAGE_LIMIT:
+                room = _STATUS_MESSAGE_LIMIT - len(note)
+                message = f"{safe[:room]}{note}"
+            else:
+                # No contention, or a note that cannot fit at all: the error
+                # alone, clipped as before. The guard is not decoration -- a
+                # later edit lengthening the note past the limit would otherwise
+                # produce a message with no error text in it.
+                message = safe[:_STATUS_MESSAGE_LIMIT]
             training.write_status(
-                session_id, status="FAILED", message=safe[:800], terminated_by="entry"
+                session_id, status="FAILED", message=message, terminated_by="entry"
             )
         finally:
             preparing_hb.cancel()
@@ -2452,14 +2691,22 @@ class EntryApp:
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
-            "needs DENSE labels — annotate all objects per image.",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
+            "and y increasing DOWNWARD -- the raster convention, not y-up; y-up "
+            "polygons rasterise mirrored and train silently on wrong masks. One "
+            "id per polygon PART, so each MultiPolygon part counts separately "
+            "and an interior ring adds none). "
+            "AIS fine-tuning needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
             None, description="Optional validation images; same forms as train_images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
-            None, description="Validation labels."
+            None,
+            description="Validation labels; same forms as train_labels, including "
+            "a .geojson FeatureCollection read under the same convention "
+            "((x, y), origin top-left, y downward, one id per polygon part).",
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
@@ -2773,14 +3020,21 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y), origin TOP-LEFT and y "
+            "increasing DOWNWARD -- the raster convention; y-up polygons "
+            "rasterise mirrored. One id per polygon PART, so each MultiPolygon "
+            "part counts separately; interior rings are ignored).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."
         ),
         val_labels: Optional[List[str]] = Field(
             None,
-            description="Optional validation label sources, paired with val_images.",
+            description="Optional validation label sources, paired with val_images; "
+            "same forms as train_labels, .geojson included and read under the same "
+            "convention ((x, y), origin top-left, y downward, one id per "
+            "polygon part).",
         ),
         enable_clahe: bool = Field(
             False,
@@ -2917,7 +3171,20 @@ class EntryApp:
     ) -> Dict[str, Any]:
         """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
         STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
-        means another fine-tuning holds the single training slot."""
+        means every training slot is held by another fine-tuning (one slot by
+        default; MODEL_FINETUNE_MAX_CONCURRENT_TRAINING raises it).
+
+        `slot_busy` is true when all of them were held at the moment this
+        one started, with `slot_busy_message` saying so in words. It is the
+        answer to "was my run sharing a worker?", which `status` cannot give
+        during preparation: a contended run and an uncontended one both read
+        PREPARING while they resolve their inputs, so a fault in that phase used
+        to arrive as a bare transport error with nothing attributing it. The
+        field records the state AT SUBMISSION and is never written back, so it is
+        still true-as-written on a finished run; the live "is it waiting now?" is
+        `status` reaching QUEUED. A failure under contention also carries the
+        note appended to `message`, after the underlying error rather than
+        instead of it."""
         import training
 
         return training.get_status(session_id)
