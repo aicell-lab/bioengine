@@ -932,3 +932,84 @@ def test_the_preflight_NEVER_logs_through_SELF_because_EntryApp_HAS_NO_LOGGER():
         "no `logger` attribute, so every one of those raises AttributeError "
         "when reached. Use the module-level `logger`." % through_self
     )
+
+
+def test_a_RUNTIME_WHOSE_PING_RAISES_skips_the_preflight_WITHOUT_crashing():
+    """Path 1 of the five logging sites: `ping()` itself fails.
+
+    The guard treats this as a runtime problem and skips, rather than turning
+    it into a training refusal -- `_check_runtime_available` has already said
+    the runtime was reachable a moment ago. The skip is reached only by passing
+    THROUGH a logging call, so before the fix this raised `AttributeError` and
+    the deliberate tolerance became a crashed training call.
+
+    No arm covered this path. A mutant restoring all five logging calls through
+    `self` reddened three behavioural arms, not five, which is how I know.
+    """
+
+    class _PingRaises:
+        async def ping(self):
+            raise RuntimeError("ping timed out")
+
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+
+            async def _call(*a, **k):
+                raise AssertionError(
+                    "nothing should be called after a failed ping, got %r" % name
+                )
+
+            return _call
+
+    cls, inst = _entry_instance(_PingRaises())
+    # Returns rather than raising: the run is admitted, not refused.
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+
+
+def test_a_RE_PROBE_that_RAISES_after_seeding_leaves_the_run_REFUSED_not_crashed():
+    """Path 5 of the five: the post-seeding re-probe fails.
+
+    The mirror seeded something, so the refusal has to be recomputed -- and if
+    that recomputation cannot be done, the ORIGINAL refusal stands. Failing
+    closed is the point: admitting the run because the re-check broke would
+    restore exactly the late failure this guard removes.
+
+    The surviving refusal must arrive as the refusal, NOT as an
+    `AttributeError` from the logging call on the way to it. Both are
+    exceptions, so the arm pins the type and the message rather than just
+    asserting that something was raised.
+    """
+    calls = {"n": 0}
+
+    def _status(model_type):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _unreachable_parts(model_type)
+        raise RuntimeError("re-probe exploded")
+
+    def _ensure(model_type, **kw):
+        return {
+            "model_type": model_type,
+            "source": "mirror",
+            "parts": {},
+            "installed": [{"name": model_type, "sha256": "a" * 64, "bytes": 1}],
+            "unavailable": [],
+            "error": None,
+        }
+
+    runtime = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={
+            "base_checkpoint_status": _status,
+            "ensure_base_checkpoint": _ensure,
+        },
+    )
+    cls, inst = _entry_instance(runtime)
+    with pytest.raises(Exception) as ei:
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert not isinstance(ei.value, AttributeError), (
+        "the run was stopped by an AttributeError from a logging call, not by "
+        "the refusal: %r" % (ei.value,)
+    )
+    assert calls["n"] >= 2, "the re-probe was never attempted"
