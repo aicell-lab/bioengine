@@ -228,3 +228,23 @@ def test_e_the_legacy_no_app_dir_path_is_untouched(tmp_path, monkeypatch):
     _ensure_working_directory(log)
     assert Path(os.environ["HOME"]).resolve() == legacy.resolve()
     assert not _errors(log), f"the legacy path must not warn, got: {_errors(log)!r}"
+
+
+def test_i_a_repair_that_does_not_take_is_reported_as_a_failure(env, monkeypatch):
+    """The lead's requirement: verify the repair, do not assume it.
+
+    If assigning the variable does not actually change what the process sees, saying "repaired"
+    would put us back exactly where this function started — a replica that believes its HOME is
+    fine and fails on the first write. The ERROR must name the expected and the observed value.
+    """
+    monkeypatch.setenv("HOME", "/home/ray")
+    # Simulate a repair that does not take: Path.home() keeps answering the old value.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/home/ray")))
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+    assert "could NOT repair HOME" in errs, f"a repair that did not take must be reported: {errs!r}"
+    assert "HOME repaired to" not in errs, "it must not claim a repair that did not take"
+    assert "/home/ray" in errs and str(env / "home") in errs, (
+        "the message must name both the observed and the expected value"
+    )

@@ -295,7 +295,16 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
             # replaces one failure with a less obvious one.
             target.mkdir(parents=True, exist_ok=True)
             os.environ[var] = str(target)
-            repaired.append(var)
+            # VERIFY, do not assume. `Path.home()` does not simply read `os.environ["HOME"]` — on
+            # POSIX it consults the password database when HOME is unset, and a caller may read the
+            # variable through something that caches. So re-read what the process will actually see
+            # and compare it to the target; a repair that silently did not take would otherwise be
+            # reported as a success and put us back where this function started.
+            observed = Path.home() if var == "HOME" else Path(os.environ.get(var, ""))
+            if observed.resolve() != target.resolve():
+                failed.append((var, f"re-read gave {observed}, expected {target}"))
+            else:
+                repaired.append(var)
         except OSError as exc:
             failed.append((var, exc))
 
