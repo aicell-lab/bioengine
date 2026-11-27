@@ -58,6 +58,12 @@ IGNORED = "is IGNORED in"
 ENV_VAR = "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"
 PASSED_SIZE = 42
 
+# What the variable looked like BEFORE any test in this file ran. pytest imports test modules at
+# collection, so this is the pre-run state. The leak check at the end of the file compares against
+# it rather than against absence: a session that legitimately has the variable set in its own
+# environment must not make this file fail, and "absent" is only the usual case, not the invariant.
+ENV_VAR_BEFORE_ANY_TEST = os.environ.get(ENV_VAR)
+
 
 @pytest.fixture
 def captured(monkeypatch):
@@ -80,15 +86,26 @@ def captured(monkeypatch):
 
 
 @pytest.fixture
-def no_cache_env_leak(monkeypatch):
+def no_cache_env_leak():
     """Stop a construction that EXPORTS the variable from leaking it into later tests.
 
     ``single-machine`` and ``slurm`` construction really does
-    ``os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] = ...`` in this process. Recording the
-    variable with monkeypatch first means its pre-test state — usually absent — is restored at
-    teardown, so no later test inherits a value this file set.
+    ``os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] = ...`` in this process, so without this the
+    value survives the test and every later test in the session inherits it.
+
+    This does NOT use ``monkeypatch.delenv``. Deleting a variable that is ABSENT records nothing
+    to undo, so monkeypatch has no teardown to run and whatever the construction then writes
+    simply stays — which is precisely what the earlier version of this fixture did while claiming
+    the opposite. Restoring the pre-test state explicitly is the only version that holds when the
+    variable starts out absent, which is the normal case.
     """
-    monkeypatch.delenv(ENV_VAR, raising=False)
+    before = os.environ.pop(ENV_VAR, None)
+    try:
+        yield
+    finally:
+        os.environ.pop(ENV_VAR, None)  # drop whatever the construction exported
+        if before is not None:
+            os.environ[ENV_VAR] = before  # and put back what was there first
 
 
 @pytest.fixture
@@ -234,13 +251,19 @@ def test_the_value_is_actually_exported_in_a_mode_that_applies_it(
     was applied while Ray never saw it. `os.environ` is the only witness that can tell the claim
     from the act.
 
-    The variable is recorded with monkeypatch before construction (`self_started` does this via
-    `no_cache_env_leak`) so the real export this triggers does not leak into later tests.
+    The real export this triggers is undone by `no_cache_env_leak`, which `self_started` pulls
+    in. That fixture restores the pre-test state EXPLICITLY rather than through
+    `monkeypatch.delenv`, because deleting an absent variable records nothing to undo and so
+    undoes nothing -- see its docstring, and the arm at the end of this file that proves it.
     """
-    assert ENV_VAR not in os.environ, (
-        f"{ENV_VAR} was already set before construction, so finding it afterwards would prove "
-        "nothing; the no_cache_env_leak fixture is supposed to have removed it"
-    )
+    # NOT a leak detector: `no_cache_env_leak` has just removed the variable, so this cannot
+    # fail while that fixture is in place. It is a guard against the fixture being REMOVED or
+    # reordered — then a value left behind by an earlier test would make the assertion below pass
+    # without this construction having exported anything. Leak detection is
+    # `test_no_test_in_this_file_leaves_the_cache_variable_behind`, at the end of the file.
+    assert (
+        ENV_VAR not in os.environ
+    ), f"{ENV_VAR} was set before construction, so finding it afterwards would prove nothing"
 
     self_started(mode, runtime_env_pip_cache_size_gb=PASSED_SIZE)
 
@@ -310,4 +333,26 @@ def test_the_module_still_agrees_about_which_modes_apply_the_value():
         "the worker's SELF_STARTED_MODES no longer matches the modes these arms cover: "
         f"module says {tuple(SELF_STARTED_MODES)!r}, arms cover "
         f"{MODES_THAT_APPLY_THE_VALUE!r}. If that change is intended, update both."
+    )
+
+
+def test_no_test_in_this_file_leaves_the_cache_variable_behind():
+    """The leak detector, and it is declared LAST on purpose.
+
+    The arms above construct self-started clusters, which really export
+    ``RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB`` into this process. If their cleanup does not work, the
+    value is still here by the time this runs, and every test in the rest of the session inherits
+    it -- which can turn an unrelated test green or red for a reason nobody will find.
+
+    This file's own arms cannot see that: each of them sets the variable up the way it wants.
+    Only a test that looks at the environment WITHOUT touching it can, which is why this one takes
+    no fixtures at all. It reads what the file left.
+    """
+    now = os.environ.get(ENV_VAR)
+    assert now == ENV_VAR_BEFORE_ANY_TEST, (
+        f"{ENV_VAR} is {now!r} but was {ENV_VAR_BEFORE_ANY_TEST!r} before this file ran, so the "
+        "tests above leak it into every later test in the session. The no_cache_env_leak fixture "
+        "is meant to restore the pre-test state; note that monkeypatch.delenv on an ABSENT "
+        "variable records nothing to undo, which is how this leak existed while a fixture claimed "
+        "to prevent it."
     )
