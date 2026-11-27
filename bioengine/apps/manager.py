@@ -1528,6 +1528,14 @@ class AppsManager:
         self.logger.info(
             f"User '{user_id}' is starting undeployment of application '{application_id}'..."
         )
+        # Clear any record left behind by an EARLIER cancellation of this id before asking
+        # about this one. ``_cancel_deployment_process`` is also called on the update path,
+        # which has no reason to act on the answer — an update re-creates the application in
+        # the open, so a task that outlived its cancellation cannot orphan anything there. But
+        # the record would outlive its cause, and this stop would then read somebody else's
+        # hazard and refuse to drop a tracking entry it should drop. Draining first makes what
+        # is read below describe THIS teardown and nothing else.
+        self.app_builder.take_unconfirmed_build_cancellation(application_id)
         await self._cancel_deployment_process(application_id=application_id)
         # Did that cancellation actually finish the build task? ``ray.cancel`` is a request,
         # and the builder waits a bounded time for the task to end. If it did not end, the task

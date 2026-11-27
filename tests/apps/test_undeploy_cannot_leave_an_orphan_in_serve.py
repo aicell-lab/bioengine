@@ -944,8 +944,16 @@ async def test_an_UNCONFIRMED_build_cancel_keeps_the_app_tracked() -> None:
     log = _Logger()
     cluster = _ClusterStub(present_after_delete=[[]])  # deleted, and it stays gone
     mgr = _ManagerStub(cluster, log)
-    mgr.app_builder._unconfirmed_build_cancellations.add(APP)
     entry = mgr._deployed_applications[APP]
+
+    # Recorded BY the cancellation, which is when the builder really writes it — not seeded
+    # beforehand. Seeding beforehand would be a record from some EARLIER cancellation, which
+    # this method now deliberately discards (see the stale-record arm below), so the arm would
+    # be testing the opposite of what it claims.
+    async def _cancel_that_leaves_the_task_alive(application_id):
+        mgr.app_builder._unconfirmed_build_cancellations.add(application_id)
+
+    mgr._cancel_deployment_process = _cancel_that_leaves_the_task_alive
 
     await _real_or_missing("_undeploy_application")(
         mgr, application_id=APP, user_id="u"
@@ -1047,3 +1055,38 @@ async def test_the_SWEEP_WAITS_OUT_ITS_COOLDOWN_on_a_healthy_cluster() -> None:
         f"orphans are FOUND, so a healthy cluster pays the sweep every tick "
         f"({after_first} serve.status calls after one tick, {after_second} after two)"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_STALE_cancel_record_does_NOT_hold_a_clean_stop() -> None:
+    """The record describes ONE cancellation, so a leftover must not decide a later stop.
+
+    ``_cancel_deployment_process`` is also called on the deploy UPDATE path, which has no
+    reason to act on the answer: an update re-creates the application in the open, so a build
+    task that outlived its cancellation cannot orphan anything there. Nothing drains it on
+    that path — so without the drain at the start of the undeploy, the NEXT stop of this id
+    reads a hazard that belongs to somebody else's cancellation and refuses to drop a tracking
+    entry it should drop. The app then lingers in ``get_app_status`` forever, and only a second
+    ``stop_app`` clears it.
+
+    The companion of the arm above: there, the record is written BY this teardown's cancel and
+    must be honoured; here it predates it and must be ignored.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[[]])
+    mgr = _ManagerStub(cluster, log)
+    # Left over from an earlier cancellation of the same id. This teardown's own cancel adds
+    # nothing: the stub is a no-op, which is the "task ended cleanly" case.
+    mgr.app_builder._unconfirmed_build_cancellations.add(APP)
+
+    await _real_or_missing("_undeploy_application")(
+        mgr, application_id=APP, user_id="u"
+    )
+
+    assert mgr._deployed_applications == {}, (
+        "a stale record from an earlier cancellation kept this application tracked, so a "
+        "stop that fully succeeded reports as unclean and the entry never goes away"
+    )
+    assert (
+        not mgr.app_builder._unconfirmed_build_cancellations
+    ), "the stale record is still there, so it will decide the next stop too"

@@ -1093,13 +1093,6 @@ class AppBuilder:
         No worker-side cleanup needed: the worker never wrote anything to
         its own filesystem. Replicas sync source per file from Hypha.
         """
-        # A newer build for this id supersedes any earlier unconfirmed cancellation: the
-        # question the record answers is "can a task still re-create THIS application behind
-        # my back", and the deploy about to run will create it in the open. Without this the
-        # record could outlive its own cause — ``_cancel_deployment_process`` is also called on
-        # the UPDATE path, which does not drain it — and a later clean stop would then be
-        # reported as unclean.
-        self._unconfirmed_build_cancellations.discard(application_id)
         # Before serve.run, because that is what starts the replicas that
         # fetch them.
         await self._store_replica_secrets(
