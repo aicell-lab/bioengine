@@ -890,15 +890,25 @@ async def create_application_from_files(
             upload_errors.append((file_name, str(e)))
             logger.error(f"Failed to upload file '{file_name}': {e}")
 
-    # If any uploads failed, raise an error before removing old files
+    # If any uploads failed, raise an error before removing old files.
+    #
+    # The message names the state the artifact is LEFT IN, not just what went wrong. It is
+    # staged and uncommitted here, which is the recoverable outcome — but a caller who is only
+    # told "failed to upload" cannot tell that from the unrecoverable one, and the two want
+    # different actions. The staged version is also what the NEXT attempt meets, which is where
+    # a later "must be in staging mode" comes from.
     if upload_errors:
         error_details = "; ".join([f"{name}: {err}" for name, err in upload_errors])
         raise RuntimeError(
-            f"Failed to upload {len(upload_errors)} file(s): {error_details}"
+            f"Failed to upload {len(upload_errors)} file(s) to '{artifact.id}': "
+            f"{error_details}. The artifact is left STAGED and UNCOMMITTED, so no published "
+            f"version was changed; {len(new_files)} file(s) did upload into that staged "
+            f"version. Re-run the upload with the complete file set."
         )
 
     # Only remove old files if all new files were successfully uploaded
     files_to_remove = existing_files - new_files
+    removal_errors = []
     if files_to_remove:
         logger.info(
             f"Removing {len(files_to_remove)} old files that are no longer present"
@@ -912,9 +922,35 @@ async def create_application_from_files(
                     logger=logger,
                 )
             except Exception as e:
-                logger.warning(
-                    f"Failed to remove old file '{file_name}': {e}. Continuing anyway..."
-                )
+                removal_errors.append((file_name, str(e)))
+                logger.error(f"Failed to remove old file '{file_name}': {e}")
+
+    # A FAILED REMOVAL MUST NOT BE COMMITTED.
+    #
+    # This used to log "Continuing anyway..." at WARNING and commit regardless. A committed
+    # artifact version is IMMUTABLE and is exactly what a deploy runs, so that published a
+    # version holding a mix of this upload's files and leftovers from the previous one —
+    # permanently, under a version string that will never again mean anything else. A warning
+    # is not a remedy for a thing that cannot be undone.
+    #
+    # Measured in the field: an upload that failed this way left "a committed, mixed
+    # artifact", and the next attempt met "must be in staging mode" — the staged-mode error
+    # being the first thing the user actually saw, two steps from the cause.
+    #
+    # Raising instead leaves the artifact STAGED and uncommitted. That is recoverable: no
+    # published version changed, and the next upload re-stages from the full file set. The
+    # message says so, because a caller who is not told the state cannot act on it.
+    if removal_errors:
+        details = "; ".join(f"{name}: {err}" for name, err in removal_errors)
+        raise RuntimeError(
+            f"Upload of '{artifact.id}' did NOT complete: {len(removal_errors)} stale "
+            f"file(s) could not be removed ({details}). The artifact is left STAGED and "
+            f"UNCOMMITTED, so no published version was changed and nothing is serving this "
+            f"content. Committing it would have published a version mixing the "
+            f"{len(new_files)} file(s) just uploaded with the stale one(s) above, and a "
+            f"committed version cannot be corrected afterwards. Re-run the upload with the "
+            f"complete file set once the removal failure is resolved."
+        )
 
     # Commit the artifact under the manifest version tag (always a new tag —
     # stage_artifact rejects same-or-lower versions before we reach this point).
