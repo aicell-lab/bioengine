@@ -2667,7 +2667,14 @@ class AppsManager:
         # extra per tick, and is rate-limited because an orphan persists: without the
         # cooldown this would repeat the same error every monitoring interval, and an
         # error repeated every ten seconds is one an operator filters out.
-        if time.time() - self._last_orphan_report >= _ORPHAN_REPORT_COOLDOWN_SECONDS:
+        # getattr default: monitor_applications is also driven against AppsManager
+        # instances built without __init__, which carry none of its attributes. Reading
+        # this one directly turned 35 unrelated monitor tests into AttributeErrors. Same
+        # idiom as _co_tenancy_warnings in status().
+        if (
+            time.time() - getattr(self, "_last_orphan_report", 0.0)
+            >= _ORPHAN_REPORT_COOLDOWN_SECONDS
+        ):
             if await self.get_orphaned_applications(
                 serve_application_names=set(serve_status.applications or {})
             ):

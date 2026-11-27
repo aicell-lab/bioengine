@@ -399,3 +399,21 @@ def test_a_prefetched_status_is_used_instead_of_a_second_rpc() -> None:
         )
     )
     assert orphans == ["ghost"], orphans
+
+
+def test_the_sweep_tolerates_a_manager_built_without_init() -> None:
+    """The monitor is driven against AppsManager instances that never ran ``__init__``.
+
+    Adding a plain ``self._last_orphan_report`` read to the tick turned 35 unrelated monitor
+    tests into AttributeErrors, because those managers carry none of ``__init__``'s attributes.
+    The guard is a getattr default, matching what ``status()`` already does for
+    ``_co_tenancy_warnings``. Pinned structurally: a direct read reintroduces the break, and it
+    would surface far from here.
+    """
+    import inspect
+
+    source = inspect.getsource(AppsManager.monitor_applications)
+    assert 'getattr(self, "_last_orphan_report"' in source, (
+        "the cooldown timestamp is read directly, which raises AttributeError on every manager "
+        "built without __init__ - that is most of the monitor test suite"
+    )
