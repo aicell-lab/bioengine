@@ -417,6 +417,14 @@ def test_l_an_uncreatable_directory_IS_reported_as_unchanged(env, monkeypatch):
     assert os.environ["HOME"] == "/home/ray", "premise: the assignment never ran"
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason=(
+        "mode bits do not restrict root, so tempfile accepts the unwritable directory and this "
+        "arm's premise cannot hold. CI runs as root; test_m2 below carries the same contract by "
+        "a mechanism root cannot bypass, so the contract is still checked there."
+    ),
+)
 def test_m_an_unwritable_target_is_refused_because_tempfile_is_what_is_ASKED(
     env, monkeypatch
 ):
@@ -590,3 +598,42 @@ def test_q_a_WRONG_variable_masked_by_a_correct_cache_is_still_repaired(
     assert (
         Path(os.environ["TMPDIR"]).resolve() == good_tmp.resolve()
     ), f"TMPDIR was left at {os.environ['TMPDIR']!r}, which children would inherit"
+
+
+def test_m2_the_repair_is_verified_through_tempfile_even_where_PERMISSIONS_cannot_say_so(
+    env, monkeypatch
+):
+    """The root-proof half of R4-1, and the one that actually runs in CI.
+
+    `test_m` above makes the per-app tmp unwritable and relies on `tempfile` skipping it. That
+    is the realistic case, but it cannot run as root — root ignores mode bits, `tempfile`
+    accepts the directory, and the arm's own premise assertion says so rather than passing
+    vacuously. CI runs as root, so without this arm the contract would be unchecked exactly
+    where it matters.
+
+    So here the divergence is made at the LIBRARY BOUNDARY instead: `tempfile.gettempdir` is
+    patched to answer with a different directory. That is not circular — it patches the
+    standard library, not the code under test — and it pins precisely what R4-1 is about: the
+    re-read must ASK tempfile. Reading `os.environ` back instead agrees with itself and reports
+    a repair that did not take.
+    """
+    monkeypatch.setenv("HOME", str(env / "home"))
+    monkeypatch.setenv("TMPDIR", "/nonexistent-ro")
+    elsewhere = env / "somewhere-else"
+    elsewhere.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(elsewhere))
+
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+
+    assert "could NOT repair TMPDIR" in errs, (
+        "the value this process will use is not the per-app tmp, and the repair was reported "
+        f"as done anyway — the exact false success R4-1 is about. errors: {errs!r}"
+    )
+    assert (
+        "TMPDIR repaired to" not in errs
+    ), f"a repair that did not take was claimed: {errs!r}"
+    assert (
+        str(elsewhere) in errs
+    ), f"the message must name what the process will actually use: {errs!r}"
