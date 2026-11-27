@@ -253,8 +253,8 @@ def test_the_value_is_actually_exported_in_a_mode_that_applies_it(
     # NOT a leak detector: `no_cache_env_leak` has just removed the variable, so this cannot
     # fail while that fixture is in place. It is a guard against the fixture being REMOVED or
     # reordered — then a value left behind by an earlier test would make the assertion below pass
-    # without this construction having exported anything. Leak detection is
-    # `test_no_test_in_this_file_leaves_the_cache_variable_behind`, at the end of the file.
+    # reordered. Leak detection is the module-scoped
+    # `_cache_variable_is_left_as_it_was_found` teardown at the end of the file.
     assert (
         ENV_VAR not in os.environ
     ), f"{ENV_VAR} was set before construction, so finding it afterwards would prove nothing"
