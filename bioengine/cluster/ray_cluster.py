@@ -59,6 +59,9 @@ SELF_STARTED_MODES = ("single-machine", "slurm")
 # Reporting a bare boolean here told a SLURM operator the cap was applied while their replicas ran
 # on a different one, which is the same defect — a value reported as in force where it is not —
 # that the external-cluster case was fixed for.
+# The value set is CLOSED: "cluster" | "head-only" | "none", and `status`'s `scope` key reports
+# one of exactly these three. A renderer may switch on it. If a fourth is ever added, consumers
+# are expected to show the raw string rather than blank, so the new value degrades visibly.
 PIP_CACHE_SCOPES = {
     "single-machine": "cluster",
     "slurm": "head-only",
@@ -462,8 +465,10 @@ class RayCluster:
                 - last_cluster_update: Unix timestamp the newest snapshot was
                   written, or None if the monitor has not ticked yet
                 - runtime_env_pip_cache: {size_gb, requested, applied, scope, state, detail} —
-                  whether the pip cache size was applied, and where. `scope` is
-                  "cluster" | "head-only" | "none"; `applied` is true only for "cluster";
+                  whether the pip cache size was applied, and where. `scope` is one of a
+                  CLOSED set -- "cluster" | "head-only" | "none" -- and is the key to switch
+                  on; `state` is prose and may be reworded. `applied` is DEFINED as
+                  `scope == "cluster"`, so the two cannot drift;
                   `state` is the words ("applied" / "applied on the head node only" /
                   "not applied"); `requested` is None when no value was passed. Never
                   applied in external-cluster mode, where the Ray pods are the cluster
