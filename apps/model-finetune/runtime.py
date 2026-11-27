@@ -58,7 +58,7 @@ _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 BASE_CHECKPOINT_PROBE_TIMEOUT_S = 3.0
 
 # Methods a caller may rely on being present. Advertised through `ping`.
-RUNTIME_CAPABILITIES = ("base_checkpoint_status",)
+RUNTIME_CAPABILITIES = ("base_checkpoint_status", "ensure_base_checkpoint")
 
 
 def _url_reachable(url: str, timeout_s: float) -> bool:
@@ -90,6 +90,43 @@ def _url_reachable(url: str, timeout_s: float) -> bool:
         except Exception:
             continue
     return False
+
+
+#: Where the mirror artifact lives. Overridable by environment for a test
+#: deployment; the default is the production server, same as everything else
+#: this app talks to.
+_HYPHA_SERVER_URL = os.environ.get("HYPHA_SERVER_URL", "https://hypha.aicell.io")
+
+
+def _open_url_stream(url: str, timeout_s: float = 300.0):
+    """A readable stream over *url*. Separate so a test can pass its own.
+
+    `urlopen`'s object already has `.read(n)`, which is all the fence needs, so
+    the bytes are never collected into memory: a 375 MB encoder would otherwise
+    be held whole inside a Serve replica.
+    """
+    import urllib.request
+
+    return urllib.request.urlopen(url, timeout=timeout_s)
+
+
+def _install_from_url(bcm, root: str, name: str, url: str, opener) -> dict:
+    """Stream *url* into *root* as *name*, through the fence. Blocking.
+
+    Runs in a thread because it is a long synchronous read; the fence is
+    `bcm.install_verified`, and a `MirrorVerificationError` propagates on
+    purpose.
+    """
+    stream = opener(url)
+    try:
+        return bcm.install_verified(root, name, stream)
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
 
 
 # The third-party top-level modules this runtime's own method bodies import.
@@ -446,6 +483,179 @@ class RuntimeApp:
                 # obtainable from here".
                 info["reachable"] = res is True
         return out
+
+    async def ensure_base_checkpoint(
+        self,
+        model_type: str,
+        resolve_mirror_urls=None,
+        open_url=None,
+    ) -> Dict[str, Any]:
+        """Make this site able to produce *model_type*'s base weights.
+
+        UPSTREAM FIRST, AND THAT IS A REQUIREMENT RATHER THAN A PREFERENCE.
+        The mirror is only consulted for a part that is neither already cached
+        nor reachable upstream, so on a site that can reach EBI this method
+        performs no download and installs nothing -- it reduces to the probe it
+        already ran. A fallback that fetched from the mirror whenever the
+        mirror was closer would quietly make our copy the source of truth for
+        every site, and the next zoo-side correction would never arrive.
+
+        Returns ``{"model_type", "source", "parts", "installed",
+        "unavailable", "error"}``. ``source`` is "cache", "upstream",
+        "mirror" or "unavailable". ``unavailable`` names the parts no route
+        could supply, so the ADMISSION CHECK refuses with a reason instead of
+        a run discovering it minutes later under the GPU lock.
+
+        It REPORTS rather than raises for a missing route, and RAISES for a
+        file that failed the fence. Those are different: "I cannot get this"
+        is a verdict the caller turns into a refusal, while "I got this and it
+        is not what it claims to be" must stop everything, because the next
+        thing that happens otherwise is training on unknown weights.
+
+        `resolve_mirror_urls` and `open_url` are injectable so the
+        upstream-first rule and the fence can be exercised with no network.
+        Production passes neither.
+        """
+        import base_checkpoint_mirror as bcm
+
+        out: Dict[str, Any] = {
+            "model_type": model_type,
+            "source": "unavailable",
+            "parts": {},
+            "installed": [],
+            "unavailable": [],
+            "error": None,
+        }
+        status = await self.base_checkpoint_status(model_type)
+        out["parts"] = status.get("parts") or {}
+        if status.get("probe_error"):
+            # A probe that could not run is not evidence that a fallback is
+            # needed, and downloading on that basis would make a transient
+            # local failure rewrite the cache.
+            out["error"] = f"probe failed: {status['probe_error']}"
+            return out
+
+        try:
+            from micro_sam.util import models as _models
+
+            root = str(_models().path)
+        except Exception as exc:
+            out["error"] = "%s: %s" % (type(exc).__name__, exc)
+            return out
+
+        need = []
+        for part, info in out["parts"].items():
+            name = model_type if part == "encoder" else f"{model_type}_decoder"
+            if info.get("cached"):
+                continue
+            if info.get("reachable"):
+                continue  # upstream will serve it; micro-sam fetches as before
+            need.append(name)
+
+        if not need:
+            any_fetch = any(
+                not i.get("cached") and i.get("reachable")
+                for i in out["parts"].values()
+            )
+            out["source"] = "upstream" if any_fetch else "cache"
+            return out
+
+        # RE-CHECK THE DISK before fetching. The probe's answer is a moment
+        # old and another run on this same replica may have seeded the file
+        # since -- the cache is shared by every run in the app.
+        #
+        # THIS NARROWS THE WINDOW; IT DOES NOT CLOSE IT, and an earlier version
+        # of this comment claimed it did. Two admissions that both probe while
+        # the first 375 MB download is still in flight will both download,
+        # because the `.part` temp file is deliberately not visible at the real
+        # name. The RESULT stays correct -- unique temp names and an atomic
+        # os.replace -- so what is wasted is bandwidth, not correctness. A
+        # per-name lock would fix that and is not here.
+        still_missing = set(bcm.missing_parts(root, model_type))
+        # Only now is the mirror involved, and only for these names.
+        mirrored = [
+            n for n in need if n in bcm.MIRROR_CHECKPOINTS and n in still_missing
+        ]
+        out["unavailable"] = sorted(
+            set(need) - set(n for n in need if n in bcm.MIRROR_CHECKPOINTS)
+        )
+        if not mirrored:
+            # Either nothing is mirrored, or it arrived while we were asking.
+            if not out["unavailable"]:
+                out["source"] = "cache"
+            return out
+
+        resolve = resolve_mirror_urls or self._mirror_urls
+        opener = open_url or _open_url_stream
+        try:
+            urls = await resolve(mirrored)
+        except Exception as exc:
+            out["error"] = "could not resolve mirror urls: %s: %s" % (
+                type(exc).__name__,
+                exc,
+            )
+            # NAMED, not just counted. Leaving these out of `unavailable`
+            # meant a caller that words its refusal from that list printed an
+            # EMPTY list while refusing -- a refusal that cannot say what it
+            # could not get is the failure this preflight exists to remove.
+            out["unavailable"] = sorted(set(out["unavailable"]) | set(mirrored))
+            return out
+
+        for name in mirrored:
+            url = urls.get(name)
+            if not url:
+                out["unavailable"].append(name)
+                continue
+            # The fence runs inside `install_verified`; a MirrorVerificationError
+            # is deliberately NOT caught here.
+            record = await asyncio.to_thread(
+                _install_from_url, bcm, root, name, url, opener
+            )
+            out["installed"].append(record)
+            logger.warning(
+                "model-finetune: base checkpoint '%s' taken from the MIRROR "
+                "(upstream unreachable) and verified: sha256=%s bytes=%d",
+                name,
+                record["sha256"],
+                record["bytes"],
+            )
+
+        out["unavailable"] = sorted(set(out["unavailable"]))
+        out["source"] = (
+            "mirror" if out["installed"] and not out["unavailable"] else out["source"]
+        )
+        if out["installed"] and out["unavailable"]:
+            out["source"] = "unavailable"
+        return out
+
+    async def _mirror_urls(self, names) -> Dict[str, str]:
+        """Signed URLs for *names* from the mirror, over an ANONYMOUS connection.
+
+        No credential on purpose: the mirror is world-readable (verified with a
+        ranged GET), and an app the worker ADOPTED rather than deployed holds
+        no token -- which is exactly the state after the restart where a
+        fallback matters most.
+        """
+        from hypha_rpc import connect_to_server
+
+        import base_checkpoint_mirror as bcm
+
+        server = await connect_to_server({"server_url": _HYPHA_SERVER_URL})
+        try:
+            am = await server.get_service("public/artifact-manager")
+            out = {}
+            for name in names:
+                out[name] = await am.get_file(
+                    artifact_id=bcm.MIRROR_ARTIFACT_ID,
+                    file_path=name,
+                    version=bcm.MIRROR_VERSION,
+                )
+            return out
+        finally:
+            try:
+                await server.disconnect()
+            except Exception:
+                pass
 
     def _device(self) -> str:
         """Pick the compute device internally (device is not a public API param)."""

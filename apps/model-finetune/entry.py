@@ -125,6 +125,13 @@ GPU_BACKENDS = ("microsam", "cellpose")
 # could hang would be a worse version of the late failure it prevents.
 BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S = 12.0
 
+# The fallback's own budget, and it is a DOWNLOAD budget rather than a probe
+# one. The largest mirrored encoder is ~375 MB; the probe's 12 s is sized for a
+# HEAD, so reusing it would turn every fallback into a timeout and the feature
+# would look broken rather than slow. Reached only when the probe already
+# refused, so a site that can reach upstream never waits on this.
+BASE_CHECKPOINT_MIRROR_TIMEOUT_S = 900.0
+
 
 def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
     """Whether this cluster can place the GPU runtimes the enabled backends need.
@@ -839,6 +846,88 @@ class EntryApp:
                 "probe_error": "%s: %s" % (type(exc).__name__, exc),
             }
         refusal = training.base_checkpoint_refusal(model_type, status)
+
+        # THE MIRROR FALLBACK, AND IT BELONGS HERE RATHER THAN IN THE PROBE.
+        # The probe is read-only and runs on the admission path for every run;
+        # fetching inside it would make the common case pay for the rare one.
+        # This runs only once the probe's answer is a REFUSAL, so a site that
+        # can reach upstream never reaches this branch at all.
+        #
+        # Gated on the advertised capability, NOT on `getattr`: the runtime
+        # handle returns a bound method for any public name, so a getattr test
+        # is dead code and would call a method an older replica does not have.
+        if refusal and "ensure_base_checkpoint" in caps:
+            try:
+                seeded = await asyncio.wait_for(
+                    runtime.ensure_base_checkpoint(model_type),
+                    # ITS OWN BUDGET, because this one DOWNLOADS. The probe's
+                    # 12 s is sized for a HEAD; the largest mirrored encoder is
+                    # ~375 MB, which no probe timeout would fit, and reusing
+                    # that budget would turn every fallback into a timeout.
+                    timeout=BASE_CHECKPOINT_MIRROR_TIMEOUT_S,
+                )
+            except Exception as exc:
+                # FAILS CLOSED: the refusal computed above still stands, so a
+                # mirror that could not help leaves the run refused with the
+                # original reason rather than admitted. Logged because the
+                # reason the fallback did not help is otherwise invisible --
+                # and a fence rejection arrives here as a plain RPC error, so
+                # this is also where "the mirror served bytes that did not
+                # verify" becomes readable.
+                self.logger.warning(
+                    "the base-checkpoint mirror fallback did not help for %s "
+                    "(%s: %s); the run stays refused",
+                    model_type,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                if seeded.get("installed"):
+                    self.logger.warning(
+                        "seeded %d base-checkpoint part(s) for %s from the "
+                        "mirror: %s",
+                        len(seeded["installed"]),
+                        model_type,
+                        ", ".join(
+                            "%s sha256=%s" % (r["name"], r["sha256"])
+                            for r in seeded["installed"]
+                        ),
+                    )
+                # RE-PROBE WHENEVER THE FALLBACK RETURNED CLEANLY, not only
+                # when it installed something.
+                #
+                # A review caught this: `ensure_base_checkpoint` legitimately
+                # returns `installed: []` with no error when the state changed
+                # under the probe -- the file arrived between the probe and the
+                # fetch (which is the race the disk re-check closes), or its own
+                # re-probe found the part cached or upstream reachable after all.
+                # Keying the re-probe on `installed` kept the STALE refusal in
+                # exactly those cases, so a run whose weights ARE cached was
+                # refused with the message "not cached here and not reachable
+                # from here". The fallback having nothing to do is the GOOD
+                # outcome, and it was the one treated as failure.
+                #
+                # RE-PROBE rather than trusting the seeding result either way.
+                # The question is what the CACHE now holds, and the only
+                # authority on that is the same probe that refused -- this is
+                # the artifact-versus-our-own-account distinction, on a
+                # filesystem instead of an artifact.
+                if seeded.get("error") is None:
+                    try:
+                        status = await asyncio.wait_for(
+                            runtime.base_checkpoint_status(model_type),
+                            timeout=BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
+                        )
+                        refusal = training.base_checkpoint_refusal(model_type, status)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "could not re-check the base checkpoint for %s "
+                            "after seeding (%s: %s); the run stays refused",
+                            model_type,
+                            type(exc).__name__,
+                            exc,
+                        )
+
         if refusal:
             raise ValueError(refusal)
 
