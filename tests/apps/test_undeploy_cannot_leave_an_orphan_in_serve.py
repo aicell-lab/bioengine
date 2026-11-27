@@ -503,6 +503,12 @@ class _SweepManager(_ManagerStub):
         return True  # workspace filtering is pinned by its own arms below
 
 
+class _RealOwnerManager(_SweepManager):
+    """Uses the SHIPPED `_is_this_workers_app`, not a permissive stand-in."""
+
+    _is_this_workers_app = _real_or_missing("_is_this_workers_app")
+
+
 @pytest.mark.asyncio
 async def test_the_sweep_runs_WITH_NOTHING_TRACKED(monkeypatch) -> None:
     """The state the incident leaves, and the one the old placement skipped.
@@ -557,15 +563,15 @@ async def test_an_app_whose_owner_cannot_be_established_is_not_reported() -> Non
 
     On a shared cluster that direction produces a permanent false alarm, which is the noise the
     cooldown exists to avoid in the first place.
+
+    This arm drives the REAL `_is_this_workers_app`: the stub cluster has no `get_app_handle`,
+    so reading the owner raises, which is the production shape of "cannot tell". An earlier
+    version of this arm replaced `_is_this_workers_app` with its own stub and therefore tested
+    the stub — a mutant flipping the real method's failure path to True survived it untouched.
     """
     log = _Logger()
     cluster = _ClusterStub(present_after_delete=[["unknown-app"]])
-    mgr = _SweepManager(cluster, log, tracked={})
-
-    async def _cannot_tell(application_id):
-        return False
-
-    mgr._is_this_workers_app = _cannot_tell
+    mgr = _RealOwnerManager(cluster, log, tracked={})
 
     assert await _real_or_missing("get_orphaned_applications")(mgr) == []
     assert not log.messages("error")
@@ -595,3 +601,107 @@ async def test_a_REDEPLOY_during_the_confirm_window_is_left_alone() -> None:
     assert (
         cluster.deletes == 0
     ), f"the confirm loop deleted a freshly redeployed app {cluster.deletes} time(s)"
+
+
+# ───────── 7. the app stays VISIBLE while it is being stopped (round-1 finding (a)) ──────────
+
+
+class _SlowDeleteCluster(_ClusterStub):
+    """serve.delete blocks, as it did for 60s on the measured site, and records the state."""
+
+    def __init__(self, present_after_delete, observer):
+        super().__init__(present_after_delete)
+        self.observer = observer
+
+    async def call_with_reconnect(self, fn, *args):
+        if getattr(fn, "__name__", "") == "delete":
+            # Whatever a caller would see WHILE the delete is in flight.
+            self.observer()
+        return await _ClusterStub.call_with_reconnect(self, fn, *args)
+
+
+@pytest.mark.asyncio
+async def test_the_app_is_still_LISTED_while_its_delete_is_in_flight() -> None:
+    """`serve.delete` can block for a minute; the app must not vanish from the API meanwhile.
+
+    The entry used to be popped before the delete, so for the whole of that window an
+    application that was still running answered "not here" to get_app_status and could not be
+    reached by stop_app. That is this row's own complaint, produced by the stop itself.
+    """
+    log = _Logger()
+    seen = {}
+
+    def observe():
+        seen["tracked_during_delete"] = APP in mgr._deployed_applications
+        seen["auto_redeploy_during_delete"] = mgr._deployed_applications.get(
+            APP, {}
+        ).get("auto_redeploy")
+
+    cluster = _SlowDeleteCluster(present_after_delete=[[]], observer=observe)
+    mgr = _ManagerStub(cluster, log)
+
+    await AppsManager._undeploy_application(mgr, APP, "tester")
+
+    assert (
+        seen.get("tracked_during_delete") is True
+    ), "the app was invisible to get_app_status while its delete was in flight"
+    assert seen.get("auto_redeploy_during_delete") is False, (
+        "it stayed listed but ALSO stayed redeployable - the monitor could race the stop, "
+        "which is the hazard popping the entry was there to prevent"
+    )
+    # And once the delete is confirmed it really is gone.
+    assert APP not in mgr._deployed_applications
+
+
+@pytest.mark.asyncio
+async def test_a_stopping_app_is_never_in_the_monitors_redeploy_list() -> None:
+    """The guard that replaces the pop: the redeploy list is filtered on auto_redeploy."""
+    log = _Logger()
+    mgr = _ManagerStub(_ClusterStub(present_after_delete=[[]]), log)
+    mgr._deployed_applications[APP]["auto_redeploy"] = False
+    mgr._deployed_applications[APP]["stopping"] = True
+
+    redeployable = [
+        app_id
+        for app_id, info in mgr._deployed_applications.items()
+        if info["auto_redeploy"]
+    ]
+    assert redeployable == [], (
+        "a stopping app is still in the monitor's redeploy list, so a tick could redeploy "
+        "the app the user just asked to stop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_MONITOR_TICK_sweeps_when_the_worker_tracks_nothing(
+    monkeypatch,
+) -> None:
+    """Drives the real tick, because the defect was WHERE the call sits, not what it does.
+
+    The sweep used to be placed after `if not apps_to_redeploy: ... return`. Calling
+    `_report_orphans_if_due` directly — as the arm above does — cannot see that: it tests the
+    sweep in isolation and passes either way. Only a tick with NOTHING tracked, which is the
+    state a stop leaves, distinguishes the two placements.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[["orphan-app"]])
+    mgr = _SweepManager(cluster, log, tracked={})
+    monkeypatch.setattr(
+        manager_mod, "_ORPHAN_REPORT_COOLDOWN_SECONDS", 0, raising=False
+    )
+
+    renewed = []
+
+    async def _renew():
+        renewed.append(True)
+
+    mgr._renew_proxy_tokens = _renew
+    mgr.ray_cluster.check_connection = lambda: None
+
+    await AppsManager.monitor_applications(mgr)
+
+    assert renewed, "the tick did not run at all; this arm would pass vacuously"
+    assert any("orphan-app" in m for m in log.messages("error")), (
+        "a monitor tick with nothing tracked never reported the orphan — the sweep is "
+        f"unreachable on that path. errors seen: {log.messages('error')}"
+    )

@@ -1447,7 +1447,12 @@ class AppsManager:
             # auto_redeploy off. Tracking is the signal: the id being back in
             # _deployed_applications means somebody deployed it on purpose, and this undeploy
             # is done.
-            if application_id in self._deployed_applications:
+            # The entry this undeploy is tearing down is ALSO tracked - it is now kept,
+            # marked `stopping`, for the whole teardown so callers can still see it. So
+            # "tracked" alone no longer means "somebody redeployed it": the marker is what
+            # separates my own stop from a fresh deploy, which arrives without it.
+            tracked = self._deployed_applications.get(application_id)
+            if tracked is not None and not tracked.get("stopping"):
                 self.logger.info(
                     f"Application '{application_id}' is tracked again, so it was redeployed "
                     "while this undeploy was confirming its removal. Leaving the new "
@@ -1514,12 +1519,25 @@ class AppsManager:
         )
         await self._cancel_deployment_process(application_id=application_id)
 
-        # Drop the tracking entry BEFORE serve.delete. The monitor loop iterates
-        # _deployed_applications and fires auto-redeploy for anything unhealthy;
-        # if the entry survived the serve.delete window, a monitor tick could
-        # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
-        # first makes the app invisible to the monitor for the rest of teardown.
-        application_info = self._deployed_applications.pop(application_id, None)
+        # KEEP the tracking entry for the duration of the teardown, marked `stopping`.
+        #
+        # It used to be POPPED here, to stop a monitor tick re-adopting the app mid-stop and
+        # redeploying it. That hazard is real, but popping is a heavier instrument than it
+        # needs: the monitor's redeploy list is filtered on `auto_redeploy`, so clearing that
+        # flag already makes the app invisible to the only loop that could redeploy it — which
+        # is exactly how the delete-failed path below has always kept a surviving app tracked
+        # without it being redeployed.
+        #
+        # What popping first ALSO did was make the app invisible to `get_app_status` and
+        # unreachable by `stop_app` for the whole window — and `serve.delete` can block for a
+        # long time. MEASURED on a Kubernetes site: 60.09 seconds, with the confirm window
+        # after it. For that whole period an application that is still running answered
+        # "not here" to every API a caller has, which is this row's complaint in miniature,
+        # produced by the stop itself.
+        application_info = self._deployed_applications.get(application_id)
+        if application_info is not None:
+            application_info["auto_redeploy"] = False
+            application_info["stopping"] = True
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
@@ -1576,9 +1594,14 @@ class AppsManager:
         if delete_failed and application_info is not None:
             # The app is still running in Ray Serve. Leaving it untracked makes it
             # invisible to get_app_status and unreachable by stop_app, so it holds
-            # its GPU forever with no API route to release it. auto_redeploy is
-            # forced off so monitor_applications still ignores it.
+            # its GPU forever with no API route to release it. auto_redeploy stays
+            # off so monitor_applications still ignores it.
+            #
+            # The entry was never removed above, so this only has to make sure it is
+            # still there and no longer advertises itself as mid-stop: the stop is
+            # over, and it failed.
             application_info["auto_redeploy"] = False
+            application_info.pop("stopping", None)
             self._deployed_applications[application_id] = application_info
             self.logger.error(
                 f"Undeployment of application '{application_id}' FAILED: it is still "
