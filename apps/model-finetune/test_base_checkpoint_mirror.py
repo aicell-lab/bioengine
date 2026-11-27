@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import sys
 
 import pytest
 
@@ -157,3 +158,180 @@ def test_an_UNMIRRORED_model_type_yields_no_parts_rather_than_raising(tmp_path):
     path."""
     assert bcm.parts_for("vit_l_em_organelles") == []
     assert bcm.missing_parts(str(tmp_path), "vit_l_em_organelles") == []
+
+
+# ── the call site: upstream first, mirror only as a fallback ──────────────────
+#
+# These drive `ensure_base_checkpoint` with the probe and the network faked, so
+# "deNBI still uses upstream first" is a measured assertion rather than a claim
+# about a site nobody can reach from a test.
+
+
+def _runtime_with(monkeypatch, tmp_path, parts, opened):
+    """A runtime whose probe returns *parts* and whose mirror is in-memory.
+
+    Uses the loader and the micro-sam stub that `test_base_checkpoint_preflight`
+    already established -- `RuntimeApp` is decorated, so it is reached through
+    `func_or_class`, and micro-sam is a RUNTIME dependency that is not
+    importable here at all. A second copy of either would drift from the real
+    shape, which is the thing those helpers exist to prevent.
+    """
+    import runtime
+    import types
+
+    cls = getattr(runtime.RuntimeApp, "func_or_class", runtime.RuntimeApp)
+    inst = object.__new__(cls)
+
+    async def _status(model_type):
+        return {"model_type": model_type, "parts": parts, "probe_error": None}
+
+    inst.base_checkpoint_status = _status
+
+    root = tmp_path / "models"
+    root.mkdir(exist_ok=True)
+    reg = types.SimpleNamespace(path=str(root), urls={}, registry={})
+    mod = types.ModuleType("micro_sam.util")
+    mod.models = lambda: reg
+    pkg = types.ModuleType("micro_sam")
+    pkg.util = mod
+    monkeypatch.setitem(sys.modules, "micro_sam", pkg)
+    monkeypatch.setitem(sys.modules, "micro_sam.util", mod)
+
+    async def _resolve(names):
+        opened.setdefault("resolved", []).extend(names)
+        return {n: f"https://mirror.invalid/{n}" for n in names}
+
+    def _open(url, timeout_s=300.0):
+        name = url.rsplit("/", 1)[-1]
+        opened.setdefault("opened", []).append(name)
+        # Honest bytes would be hundreds of MB. Re-pin this entry to a small
+        # body and let the REAL fence check it, so the fence is exercised
+        # rather than bypassed.
+        body = b"\xab" * 64
+        xxh = bcm.MIRROR_CHECKPOINTS[name][0]
+        bcm.MIRROR_CHECKPOINTS[name] = (
+            xxh,
+            hashlib.sha256(body).hexdigest(),
+            len(body),
+        )
+        return io.BytesIO(body)
+
+    return runtime, inst, str(root), _resolve, _open
+
+
+def test_an_UPSTREAM_REACHABLE_part_is_NEVER_fetched_from_the_mirror(
+    monkeypatch, tmp_path
+):
+    """Clause 3. The mirror must not become the de facto source where EBI works.
+
+    If it did, our copy would silently become the source of truth everywhere and
+    the next zoo-side correction would never arrive.
+    """
+    import asyncio as aio
+
+    opened = {}
+    parts = {
+        "encoder": {"cached": False, "reachable": True, "url": "https://up/enc"},
+        "decoder": {"cached": False, "reachable": True, "url": "https://up/dec"},
+    }
+    _, inst, _, resolve, opener = _runtime_with(monkeypatch, tmp_path, parts, opened)
+    out = aio.run(
+        inst.ensure_base_checkpoint(
+            "vit_t_lm", resolve_mirror_urls=resolve, open_url=opener
+        )
+    )
+    assert out["source"] == "upstream", out
+    assert out["installed"] == [], out
+    assert opened.get("resolved") is None, "the mirror was consulted anyway"
+    assert opened.get("opened") is None, "the mirror was DOWNLOADED anyway"
+
+
+def test_a_CACHED_part_needs_neither_upstream_nor_the_mirror(monkeypatch, tmp_path):
+    import asyncio as aio
+
+    opened = {}
+    parts = {
+        "encoder": {"cached": True, "reachable": None, "url": None},
+        "decoder": {"cached": True, "reachable": None, "url": None},
+    }
+    _, inst, _, resolve, opener = _runtime_with(monkeypatch, tmp_path, parts, opened)
+    out = aio.run(
+        inst.ensure_base_checkpoint(
+            "vit_t_lm", resolve_mirror_urls=resolve, open_url=opener
+        )
+    )
+    assert out["source"] == "cache", out
+    assert opened == {}, opened
+
+
+def test_an_UNREACHABLE_part_IS_taken_from_the_mirror_and_verified(
+    monkeypatch, tmp_path
+):
+    import asyncio as aio
+
+    opened = {}
+    parts = {
+        "encoder": {"cached": False, "reachable": False, "url": "https://up/enc"},
+        "decoder": {"cached": True, "reachable": None, "url": None},
+    }
+    saved = dict(bcm.MIRROR_CHECKPOINTS)
+    try:
+        _, inst, root, resolve, opener = _runtime_with(
+            monkeypatch, tmp_path, parts, opened
+        )
+        out = aio.run(
+            inst.ensure_base_checkpoint(
+                "vit_t_lm", resolve_mirror_urls=resolve, open_url=opener
+            )
+        )
+    finally:
+        bcm.MIRROR_CHECKPOINTS.clear()
+        bcm.MIRROR_CHECKPOINTS.update(saved)
+    assert out["source"] == "mirror", out
+    assert [r["name"] for r in out["installed"]] == ["vit_t_lm"], out
+    # Only the unreachable part was fetched; the cached decoder was left alone.
+    assert opened["opened"] == ["vit_t_lm"], opened
+    assert os.path.exists(os.path.join(root, "vit_t_lm"))
+
+
+def test_a_part_WE_DO_NOT_MIRROR_is_reported_unavailable_not_silently_skipped(
+    monkeypatch, tmp_path
+):
+    """The admission check needs a reason, and "no route" must not read as "fine"."""
+    import asyncio as aio
+
+    opened = {}
+    parts = {
+        "encoder": {"cached": False, "reachable": False, "url": "https://up/enc"},
+    }
+    _, inst, _, resolve, opener = _runtime_with(monkeypatch, tmp_path, parts, opened)
+    out = aio.run(
+        inst.ensure_base_checkpoint(
+            "vit_l_em_organelles", resolve_mirror_urls=resolve, open_url=opener
+        )
+    )
+    assert out["source"] == "unavailable", out
+    assert out["unavailable"] == ["vit_l_em_organelles"], out
+    assert opened == {}, "nothing should have been fetched"
+
+
+def test_a_PROBE_that_failed_does_NOT_trigger_a_mirror_download(monkeypatch, tmp_path):
+    """A local probe failure is not evidence that upstream is down, and
+    downloading on that basis lets a transient glitch rewrite the cache."""
+    import asyncio as aio
+
+    opened = {}
+    _, inst, _, resolve, opener = _runtime_with(monkeypatch, tmp_path, {}, opened)
+
+    async def _broken(model_type):
+        return {"model_type": model_type, "parts": {}, "probe_error": "boom"}
+
+    inst.base_checkpoint_status = _broken
+    out = aio.run(
+        inst.ensure_base_checkpoint(
+            "vit_t_lm", resolve_mirror_urls=resolve, open_url=opener
+        )
+    )
+    assert out["source"] == "unavailable", out
+    assert "probe failed" in (out["error"] or ""), out
+    assert opened == {}, opened
