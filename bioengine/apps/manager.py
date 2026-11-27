@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -746,6 +747,24 @@ class AppsManager:
         self.worker_service_id = None
         self._deployment_lock = asyncio.Lock()
         self._deployed_applications = {}
+        # Application ids whose deploy_app call is still inside app_builder.build().
+        #
+        # This exists because `_deployed_applications` is registered only AFTER the build
+        # finishes, so during the build -- which is the whole window in which a caller's
+        # deploy_app RPC can time out -- the application is tracked nowhere and
+        # get_app_status could only say NOT_RUNNING, "call deploy_app", inviting a retry
+        # that would start a second build.
+        #
+        # It is deliberately NOT part of `_deployed_applications`: that dict is what the
+        # orphan sweep compares against Ray Serve's application list, so an entry there for
+        # an application Serve has never heard of would read as a ghost on every deploy.
+        #
+        # WRITES happen under `_deployment_lock`, which deploy_app already holds for its
+        # whole body. READS do not take that lock and must not: the lock is held across the
+        # build, so acquiring it in get_app_status would block every status call for the
+        # length of a deploy. A set membership test runs to completion without awaiting, so
+        # an unlocked read cannot observe a half-applied change.
+        self._deploying_application_ids = set()
 
         # Per-app auto-redeploy backoff state. Keyed by application_id; each
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
@@ -2126,6 +2145,28 @@ class AppsManager:
         """
         # Check if application is in tracked applications
         if application_id not in self._deployed_applications:
+            # A deploy that is still inside app_builder.build() is tracked nowhere else, and
+            # that build window is the ONLY one in which a caller's deploy_app RPC can time
+            # out -- registration happens after the build returns. Saying NOT_RUNNING here,
+            # with an invitation to call deploy_app, is what sends a timed-out caller into a
+            # second build racing the first.
+            #
+            # Read without taking _deployment_lock: deploy_app holds that lock across the
+            # whole build, so acquiring it here would block every status call for as long as
+            # a deploy takes. A set membership test does not await, so it cannot observe a
+            # half-applied change.
+            if application_id in self._in_flight_deploys():
+                return {
+                    "status": "DEPLOYING",
+                    "message": (
+                        f"Application '{application_id}' is still being built. It is not "
+                        "registered yet, which is why it does not appear in the application "
+                        "list. Do NOT call deploy_app again for this application_id: a "
+                        "second call would start a second build of the same application. A "
+                        "timeout from deploy_app does not mean the deploy failed. Re-read "
+                        "this status instead."
+                    ),
+                }
             # Application is not running, return simplified status
             return {
                 "status": "NOT_RUNNING",
@@ -2175,12 +2216,29 @@ class AppsManager:
                 # DEPLOYING is already in this method's documented state list; until now it
                 # was documented and never emitted.
                 status = "DEPLOYING"
-                message = (
-                    f"Application '{application_id}' is still being deployed. A timeout from "
-                    "deploy_app does NOT mean the deployment failed: poll this call until the "
-                    "status leaves DEPLOYING, rather than calling deploy_app again, which "
-                    "would race the deployment that is already running."
-                )
+                shortfall = application_info.get("resource_shortfall")
+                if shortfall:
+                    # Do NOT tell the caller to wait for this to finish. An application whose
+                    # replicas no single node can hold is not rejected -- the worker proceeds
+                    # on the assumption that autoscaling will add a bigger node, and if none
+                    # arrives the application stays here. Naming the shortfall is the only way
+                    # the caller can tell "still working" from "waiting for a node that may
+                    # never come".
+                    message = (
+                        f"Application '{application_id}' is being deployed, but the cluster "
+                        f"could not satisfy its request: {shortfall}. This may never resolve "
+                        "on its own -- it needs a node that fits or a smaller request. Do not "
+                        "call deploy_app again; that would start a second deployment of the "
+                        "same application."
+                    )
+                else:
+                    message = (
+                        f"Application '{application_id}' is being deployed and Ray Serve has "
+                        "no status for it yet. A timeout from deploy_app does not mean the "
+                        "deploy failed. Re-read this status rather than calling deploy_app "
+                        "again, which would start a second deployment of the same "
+                        "application."
+                    )
             else:
                 status = "NOT_STARTED"
                 message = f"Application '{application_id}' has not been deployed yet."
@@ -3998,6 +4056,43 @@ class AppsManager:
                 f"to roll forward."
             )
 
+    def _in_flight_deploys(self) -> set:
+        """The ids whose deploy is still inside the build, created on first use.
+
+        Lazily rather than relied upon from ``__init__``: ``AppsManager`` is also built with
+        ``object.__new__`` and partially populated, in tests and on recovery paths that never
+        run ``__init__``. Reading a missing attribute there would turn a status read or a
+        deploy into an AttributeError — measured, it broke 66 existing arms before this
+        accessor existed. A status call must never fail because of bookkeeping it only reads.
+        """
+        ids = getattr(self, "_deploying_application_ids", None)
+        if ids is None:
+            ids = set()
+            self._deploying_application_ids = ids
+        return ids
+
+    @asynccontextmanager
+    async def _mark_deploying(self):
+        """Yield a function that marks an application id as mid-build, and always unmark.
+
+        The unmark is in a ``finally`` on purpose. A marker left behind would make
+        get_app_status report DEPLOYING for ever for a deploy that in fact failed -- a worse
+        falsehood than the NOT_RUNNING this exists to replace. Every exit from deploy_app,
+        including the ValueErrors it raises before the build and anything the build itself
+        raises, therefore clears it.
+        """
+        marked = []
+
+        def mark(application_id: str) -> None:
+            self._in_flight_deploys().add(application_id)
+            marked.append(application_id)
+
+        try:
+            yield mark
+        finally:
+            for application_id in marked:
+                self._in_flight_deploys().discard(application_id)
+
     @schema_method
     async def deploy_app(
         self,
@@ -4168,7 +4263,7 @@ class AppsManager:
         """
         # Only allow one deployment task creation at a time
         # This ensures unique application_id and prevents race conditions
-        async with self._deployment_lock:
+        async with self._deployment_lock, self._mark_deploying() as mark_deploying:
             self._check_initialized()
 
             # Get the full artifact ID
@@ -4377,6 +4472,11 @@ class AppsManager:
                     f"User '{user_id}' is deploying new application '{application_id}' from artifact '{artifact_id}', "
                     f"version '{version}'; kwargs: {kwargs_str}; env_vars: {env_vars_str}"
                 )
+
+            # Mark the id as mid-build BEFORE the build starts. This window is the only
+            # one in which a caller's deploy_app RPC can time out, and until the
+            # registration below the application is tracked nowhere else.
+            mark_deploying(application_id)
 
             # Build the application first to validate format and catch errors early
             app = await self.app_builder.build(
