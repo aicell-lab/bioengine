@@ -249,6 +249,31 @@ class RayCluster:
             "slurm": {},
         }
 
+        # `runtime_env_pip_cache_size_gb` is validated in EVERY mode. A value of zero or less is
+        # wrong regardless of who starts Ray, and validating it only on the paths that use it let an
+        # external-cluster caller pass nonsense and hear nothing.
+        if runtime_env_pip_cache_size_gb <= 0:
+            raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+
+        # ...but it can only TAKE EFFECT where this process starts Ray. In external-cluster mode the
+        # Ray pods already exist and were created by the cluster operator, so an environment
+        # variable exported here never reaches them: the pods run on Ray's own default cache size.
+        #
+        # Say so, because the silence is the defect. Measured on an external-cluster site: the Ray
+        # workers held app environments of 5.7-7.9 GB each and evicted one another continuously
+        # (21-22 cache deletes and 29-31 adds per pod over one session), so a freshly deployed app's
+        # replicas sat in STARTING indefinitely while gigabytes were installed and discarded. The
+        # operator had configured this parameter and had no way to learn it did nothing.
+        if mode == "external-cluster":
+            self.logger.warning(
+                "runtime_env_pip_cache_size_gb=%s has NO EFFECT in external-cluster mode: the Ray "
+                "pods are created by the cluster operator, so RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB "
+                "must be set on those pods, not here. Until it is, they use Ray's default, and "
+                "app environments larger than half of it will evict one another and leave replicas "
+                "stuck in STARTING.",
+                runtime_env_pip_cache_size_gb,
+            )
+
         # Additional configuration for starting a Ray cluster
         if mode in ["single-machine", "slurm"]:
             # Find and store Ray executable path
@@ -291,9 +316,7 @@ class RayCluster:
                 }
             )
 
-            # Set runtime environment pip cache size
-            if runtime_env_pip_cache_size_gb <= 0:
-                raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+            # Set runtime environment pip cache size (validated above, for every mode)
             os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] = str(
                 runtime_env_pip_cache_size_gb
             )
