@@ -129,7 +129,14 @@ async def test_a_present_controller_stays_silent(caplog, monkeypatch) -> None:
         await manager.monitor_applications()
 
     assert len(calls) == 1, "the probe is the one added call per tick"
-    assert caplog.records == [], f"a healthy tick must say nothing: {caplog.records}"
+    # The orphan sweep reads Ray Serve's application list at most once per its own
+    # cooldown, and this fixture's serve.status raises, so it may emit ONE debug line saying
+    # it could not read the list. Everything above debug must still be silent: the claim this
+    # arm defends is that a healthy tick does not TELL AN OPERATOR anything, not that no code
+    # runs at all.
+    assert [
+        r for r in caplog.records if r.levelno > logging.DEBUG
+    ] == [], f"a healthy tick must say nothing above debug: {caplog.records}"
 
 
 @pytest.mark.asyncio
@@ -144,7 +151,12 @@ async def test_a_worker_tracking_nothing_does_not_even_probe(
         await manager.monitor_applications()
 
     assert calls == [], "nothing is tracked, so there is nothing to report about"
-    assert caplog.records == []
+    # Still no CONTROLLER PROBE, which is what this arm is about and what costs the most.
+    # The orphan sweep does now read Serve's list on this path, deliberately: a worker
+    # tracking nothing is exactly the state a stop leaves, and it is where an orphan is
+    # invisible, so skipping the sweep here was the hole a review refused. The cost
+    # is one status read per sweep cooldown, not one per tick.
+    assert [r for r in caplog.records if r.levelno > logging.DEBUG] == []
 
 
 @pytest.mark.asyncio
