@@ -453,14 +453,6 @@ def _slot_busy_message():
     return entry._SLOT_BUSY_MESSAGE
 
 
-def _slot_busy_note():
-    """The bracketed form appended to a failure message, derived from the
-    sentence above so the two cannot disagree."""
-    import entry
-
-    return entry._SLOT_BUSY_NOTE
-
-
 def _status_limit():
     """The limit, tolerating its absence.
 

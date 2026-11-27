@@ -1,7 +1,8 @@
 """At the code level: a run on ONE replica's disk is listed by ANOTHER.
 
-WHAT IT COVERS, AND WHY NOTHING ELSE DOES. The clauses say two replicas must
-list the SAME runs, and that a run started on either appears in both. Every
+WHAT IT COVERS, AND WHY NOTHING ELSE DOES. The requirement is that two
+replicas must list the SAME runs, and that a run started on either appears in
+both. Every
 existing test builds ONE instance against ONE sessions root -- including
 `test_ONE_REPLICAS_bookkeeping_does_not_reach_ANOTHERS`, which does make a
 second instance but shares the first's root and is about class-dict pollution,
