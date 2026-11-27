@@ -121,8 +121,10 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
   per session, run with `onnxruntime-web`, decode each box locally using the
   `compute_embedding` features. `compute_embedding` and `get_onnx_model` are
   **micro-sam only** — cpsam has no encoder embedding or ONNX prompt decoder.
-- **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
-  an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
+- **`get_upload_url(file_type)`** Presigned S3 PUT URL for staging an input image
+  (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`). **The one-hour
+  figure is the staged FILE's lifetime, not an upload deadline** — the file is
+  deleted about an hour after this call returns. See "Staged files" below.
 
 **Staged files live about an hour, and the clock starts at `get_upload_url`.**
 The `ttl` that call passes to the storage service is not only a signature

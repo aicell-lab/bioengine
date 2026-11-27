@@ -2507,7 +2507,10 @@ class EntryApp:
             None, description="Optional validation images; same forms as train_images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
-            None, description="Validation labels."
+            None,
+            description="Validation labels; same forms as train_labels, including "
+            "a .geojson FeatureCollection read under the same convention "
+            "((x, y), origin top-left, y downward, one id per ring).",
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
@@ -2832,7 +2835,9 @@ class EntryApp:
         ),
         val_labels: Optional[List[str]] = Field(
             None,
-            description="Optional validation label sources, paired with val_images.",
+            description="Optional validation label sources, paired with val_images; "
+            "same forms as train_labels, .geojson included and read under the same "
+            "convention ((x, y), origin top-left, y downward, one id per ring).",
         ),
         enable_clahe: bool = Field(
             False,
