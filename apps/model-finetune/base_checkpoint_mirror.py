@@ -18,7 +18,8 @@ TWO DIGESTS, TWO DIFFERENT JOBS, and conflating them is the trap:
 
 * ``xxh128`` is UPSTREAM's, copied from `micro_sam/v1/util.py`'s registry
   literals. It is *provenance*: evidence that the bytes we mirrored are the
-  bytes micro-sam publishes. It is   recorded here, and enforced by POOCH rather than by this module. pooch
+  bytes micro-sam publishes. It is recorded here, and enforced by POOCH
+  rather than by this module. pooch
   hash-checks a file ALREADY IN THE CACHE, so upstream's digest gates every USE
   of a seeded file and not merely the fetches pooch performs itself -- measured
   four ways, including that a wrong cached file with the origin DOWN makes pooch

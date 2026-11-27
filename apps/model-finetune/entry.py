@@ -899,7 +899,8 @@ class EntryApp:
                 # A review caught this: `ensure_base_checkpoint` legitimately
                 # returns `installed: []` with no error when the state changed
                 # under the probe -- the file arrived between the probe and the
-                # fetch (which is the race the disk re-check closes), or its own
+                # fetch (the window the disk re-check NARROWS -- it does not
+                # close it, as `ensure_base_checkpoint` says in terms), or its own
                 # re-probe found the part cached or upstream reachable after all.
                 # Keying the re-probe on `installed` kept the STALE refusal in
                 # exactly those cases, so a run whose weights ARE cached was
