@@ -150,12 +150,18 @@ class _Harness:
         m.app_builder = SimpleNamespace(build=_build)
         m._check_resources = _check_resources
 
+    #: What ``start()`` asks deploy_app for. An arm sets this to None to make a
+    #: version-less call -- round 2 of this change had an arm that set it while ``start()``
+    #: still hard-coded NEW, so the arm never made the call it claimed to and pinned
+    #: nothing. The attribute and its use must stay together.
+    requested_version = NEW
+
     def start(self):
         return asyncio.ensure_future(
             self.m.deploy_app(
                 artifact_id=ARTIFACT_ID,
                 application_id=APP_ID,
-                version=NEW,
+                version=self.requested_version,
                 context=CONTEXT,
             )
         )
@@ -384,11 +390,15 @@ async def test_the_update_is_named_even_when_serve_has_gone_quiet() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_field_is_set_even_when_the_caller_named_no_version() -> None:
-    """RED on main, and the common case: omitting the version is how a caller says 'newest'.
+async def test_a_version_less_update_reports_the_inherited_version() -> None:
+    """RED on main. What omitting the version actually does, measured not assumed.
 
-    If the field were None here it could not be told apart from "no deploy in flight", which
-    is the one thing it exists to answer.
+    ``deploy_app`` inherits the running version when the caller names none, and that happens
+    BEFORE the id is marked -- so an update never carries a null target. The field therefore
+    reports the OLD version here, which is correct: that IS what this deploy is heading for.
+
+    Round 2 of this change asserted "not None" instead, through a harness that never made a
+    version-less call, so it passed whatever the code did.
     """
     h = _Harness(gate="build")
     h.requested_version = None
@@ -396,10 +406,38 @@ async def test_the_field_is_set_even_when_the_caller_named_no_version() -> None:
     try:
         await asyncio.wait_for(h.reached.wait(), timeout=5)
         st = await h.status(SERVE_RUNNING_OLD)
-        assert st.get("updating_to_version") is not None, (
-            "a version-less update leaves updating_to_version None, so a caller cannot tell "
-            "it from no deploy being in flight"
+        assert st.get("updating_to_version") == OLD, (
+            f"a version-less update should report the inherited version {OLD!r}, got "
+            f"{st.get('updating_to_version')!r}"
         )
         assert NOT_DEPLOYED_PHRASE not in str(st.get("message", ""))
+    finally:
+        await h.finish(fut)
+
+
+@pytest.mark.asyncio
+async def test_the_latest_default_is_reachable_and_pinned() -> None:
+    """Makes the ``or "latest"`` default LIVE rather than dead code.
+
+    The default guarantees the field is never null while a deploy is in flight. With a
+    tracked entry whose own version is None -- which an adopted application can have -- the
+    inherit above yields None too, and the default is the only thing standing between the
+    caller and a null that is indistinguishable from "nothing in flight".
+
+    Round 2 found the previous version-less arm dead: removing the default passed every arm.
+    This one fails without it.
+    """
+    h = _Harness(gate="build")
+    h.m._deployed_applications[APP_ID]["version"] = None
+    h.requested_version = None
+    fut = h.start()
+    try:
+        await asyncio.wait_for(h.reached.wait(), timeout=5)
+        st = await h.status(SERVE_RUNNING_OLD)
+        assert st.get("updating_to_version") == "latest", (
+            f"with nothing to inherit the field must fall back to 'latest' rather than a "
+            f"null a caller cannot tell from 'no deploy in flight', got "
+            f"{st.get('updating_to_version')!r}"
+        )
     finally:
         await h.finish(fut)
