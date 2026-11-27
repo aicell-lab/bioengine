@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
@@ -389,6 +389,19 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# An orphan does not clear itself, so the monitor would report the same one on every tick.
+# At the default 10s interval that is six identical error lines a minute, which is how a real
+# signal becomes noise an operator filters. Long enough to stay visible, rare enough to read.
+_ORPHAN_REPORT_COOLDOWN_SECONDS = 300.0
+
+# How long absence must HOLD after a delete before the application counts as gone. ray.cancel
+# requests cancellation and does not prove the task is dead, and the measured re-creation landed
+# 4s after the delete reported success, so one sample straight afterwards answers for a build
+# that has not reached serve.run yet. 5 polls x 3s spans 12s of continuous absence, comfortably
+# past that, and only an undeploy pays it.
+_POST_DELETE_CONFIRM_POLLS = 5
+_POST_DELETE_CONFIRM_INTERVAL_SECONDS = 3.0
+
 # How long one monitor tick waits for the controller actor lookup. Measured
 # 0.10-0.12 s against a live head and 27.4 s against an unreachable one, so
 # this is ~100x the healthy case and still far inside the worker's 120 s
@@ -762,6 +775,7 @@ class AppsManager:
         # used to rate-limit re-firing while a redeploy's serve.run is still
         # bootstrapping the controller. See _recover_from_controller_loss.
         self._last_controller_recovery = 0.0
+        self._last_orphan_report = 0.0
 
         # Cache the result of the one-time FS-topology probe across Ray
         # nodes. None until the first list/clear-cache call from the
@@ -1262,6 +1276,229 @@ class AppsManager:
                 "Proceeding anyway."
             )
 
+    async def _serve_application_names(self) -> Optional[Set[str]]:
+        """Every application name Ray Serve currently holds.
+
+        ``None`` means the question could not be answered — Serve was
+        unreachable — which is deliberately NOT the same value as "Serve holds
+        nothing". Returning an empty set on failure would let a caller conclude
+        that an application is gone because the status call broke.
+        """
+        try:
+            serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+            return set(serve_status.applications or {})
+        except Exception as status_error:
+            # DEBUG, not WARNING: an unreadable Serve list here is not an operator-actionable
+            # event. The controller-loss path below reports a genuinely missing controller with
+            # its own verdict; this sweep going quiet for one cooldown is diagnostic only, and
+            # at WARNING it would fire on every tick of an unhealthy cluster.
+            self.logger.debug(
+                f"Could not read Ray Serve's application list: {status_error}"
+            )
+            return None
+
+    async def _serve_application_exists(self, application_id: str) -> bool:
+        """Whether Ray Serve still holds ``application_id``.
+
+        Unreadable Serve status answers ``False``: this guards a delete that
+        already reported success, and treating "cannot tell" as "still there"
+        would make every undeploy during a Serve hiccup keep a tracking entry
+        for an application that is actually gone.
+        """
+        names = await self._serve_application_names()
+        return bool(names and application_id in names)
+
+    async def get_orphaned_applications(
+        self, serve_application_names: Optional[Set[str]] = None
+    ) -> List[str]:
+        """Applications Ray Serve holds that this worker does not list.
+
+        An orphan is invisible to ``get_app_status`` and cannot be reached by
+        ``stop_app``, so it holds its CPUs and GPUs with no API route to free
+        them, and no watcher can attribute them. Surfacing the comparison is
+        what stops that state being silent — it was found by hand, on a site
+        where an orphan had pinned 2 of 3 GPUs.
+
+        An unreadable Serve status yields an empty list rather than claiming
+        every tracked application is orphaned.
+
+        **Only this worker's own applications count.** Several workers from different Hypha
+        workspaces can share one Ray cluster, and ``serve.status()`` returns every workspace's
+        apps — the same reason ``recover_deployed_applications`` filters before adopting. Without
+        the filter, "names minus the ones I track" reports a SIBLING's healthy application as an
+        orphan, at ERROR, every cooldown, for ever. A candidate whose ``app_data`` cannot be read
+        is NOT reported: on a shared cluster "I could not tell whose it is" must not become "it is
+        unmanaged", which is the direction that produces the permanent false alarm.
+        """
+        names = (
+            serve_application_names
+            if serve_application_names is not None
+            else await self._serve_application_names()
+        )
+        if names is None:
+            return []
+
+        candidates = sorted(names - set(self._deployed_applications))
+        orphans = [c for c in candidates if await self._is_this_workers_app(c)]
+        if orphans:
+            self.logger.error(
+                "Ray Serve is holding application(s) this worker does not track: "
+                f"{orphans}. They cannot be seen by get_app_status or stopped by "
+                "stop_app, and they still hold their resources."
+            )
+        return orphans
+
+    async def _is_this_workers_app(self, application_id: str) -> bool:
+        """Whether an untracked Serve application was deployed by THIS worker's workspace.
+
+        Reads the app's own ``app_data`` the same way the adoption path does. Anything that
+        cannot be established — no handle, no data, a timeout, a sibling's marker — answers
+        False, because the caller turns True into an ERROR naming the app as unmanaged.
+        """
+        try:
+            handle = await self.ray_cluster.call_with_reconnect(
+                serve.get_app_handle, application_id
+            )
+            app_data = await asyncio.wait_for(
+                handle.get_app_data.remote(), timeout=10.0
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Not reporting '{application_id}' as an orphan: its app_data could not be "
+                f"read ({type(exc).__name__}), so whose it is cannot be established."
+            )
+            return False
+        if not isinstance(app_data, dict):
+            return False
+        return _belongs_to_worker_workspace(
+            application_id=application_id,
+            app_data=app_data,
+            current_workspace=self.server.config.workspace,
+            logger=self.logger,
+        )
+
+    async def _report_orphans_if_due(
+        self, serve_application_names: Optional[Set[str]] = None
+    ) -> bool:
+        """Run the orphan sweep, at most once per cooldown. Returns whether it ran.
+
+        Separated from ``monitor_applications`` so it can be called BEFORE that method's
+        ``if not apps_to_redeploy: ... return``. It used to sit after it, which meant the sweep
+        never ran in precisely the state this row is about: after a stop, the worker can be
+        tracking nothing at all, or only apps with ``auto_redeploy`` off, and on both paths the
+        tick returned before reaching it. A watcher that is skipped exactly when an orphan is
+        most likely is not a watcher.
+        """
+        if (
+            time.time() - getattr(self, "_last_orphan_report", 0.0)
+            < _ORPHAN_REPORT_COOLDOWN_SECONDS
+        ):
+            return False
+        # Stamp whenever the sweep RAN, not only when it found something.
+        #
+        # Stamping on the found path alone makes the cooldown a no-op in the normal case: a
+        # healthy cluster finds nothing, never stamps, and so re-runs the whole sweep on EVERY
+        # monitor tick. That is not free. The sweep costs one `serve.status`, plus — for every
+        # application Ray Serve holds that this worker does not track, which on a shared
+        # cluster is every OTHER tenant's app — a `get_app_handle` and a `get_app_data`, each
+        # with a 10s timeout, issued sequentially inside the tick.
+        #
+        # Stamped BEFORE the call, so a sweep that raises also waits out the cooldown instead
+        # of retrying at tick frequency.
+        self._last_orphan_report = time.time()
+        await self.get_orphaned_applications(
+            serve_application_names=serve_application_names
+        )
+        return True
+
+    async def _delete_and_confirm_absent(
+        self,
+        application_id: str,
+        polls: Optional[int] = None,
+        interval: Optional[float] = None,
+    ) -> bool:
+        """Watch Ray Serve until the application has stayed absent, deleting any reappearance.
+
+        ``ray.cancel`` REQUESTS cancellation; it does not prove the task is dead. A task already
+        inside ``serve.run`` can run to the end of it, so a single check straight after the delete
+        can read "absent" for a build that re-creates the application a moment later. In the
+        incident the re-creation landed four seconds after the delete reported success.
+
+        So absence has to hold across consecutive polls spanning that window rather than be
+        sampled once. Any reappearance is reported LOUDLY and deleted again, and the clock
+        restarts — a build that re-creates the app twice must not pass because the second
+        creation happened to fall between two polls.
+
+        Returns True when the application is confirmed gone, False when it survived the window,
+        in which case the caller keeps it tracked so it stays stoppable.
+        """
+        # Read from the module in the BODY, not as default arguments. A default is evaluated
+        # once at def time, so a test that monkeypatches the module constant would change
+        # nothing and quietly pay the real sleep — which is exactly what happened: the arms
+        # took 79s with the patch supposedly applied.
+        polls = _POST_DELETE_CONFIRM_POLLS if polls is None else polls
+        interval = (
+            _POST_DELETE_CONFIRM_INTERVAL_SECONDS if interval is None else interval
+        )
+
+        # BOUNDED. Without a cap this loop never ends for an application that is present on
+        # every look: `consecutive_absent` only advances on an absence, so a build that keeps
+        # re-creating the app would spin here forever - inside an undeploy, on the worker's
+        # own event loop. Giving up and returning False is the safe answer: the caller then
+        # keeps the app TRACKED, which leaves it visible and stoppable.
+        max_rounds = polls * 4
+        consecutive_absent = 0
+        rounds = 0
+        while consecutive_absent < polls:
+            # A NEW deploy may legitimately reuse this id while the window is open. It
+            # re-tracks the id and puts the app back in Ray Serve — which from inside this loop
+            # is indistinguishable from the re-creation it is hunting. Without this check the
+            # loop deletes the user's brand-new application up to max_rounds times and then the
+            # caller's delete_failed path OVERWRITES its tracking entry with the stopped one,
+            # auto_redeploy off. Tracking is the signal: the id being back in
+            # _deployed_applications means somebody deployed it on purpose, and this undeploy
+            # is done.
+            # The entry this undeploy is tearing down is ALSO tracked - it is now kept,
+            # marked `stopping`, for the whole teardown so callers can still see it. So
+            # "tracked" alone no longer means "somebody redeployed it": the marker is what
+            # separates my own stop from a fresh deploy, which arrives without it.
+            tracked = self._deployed_applications.get(application_id)
+            if tracked is not None and not tracked.get("stopping"):
+                self.logger.info(
+                    f"Application '{application_id}' is tracked again, so it was redeployed "
+                    "while this undeploy was confirming its removal. Leaving the new "
+                    "deployment alone."
+                )
+                return True
+            rounds += 1
+            if rounds > max_rounds:
+                self.logger.error(
+                    f"Application '{application_id}' is still in Ray Serve after "
+                    f"{max_rounds} delete/confirm rounds. Giving up on confirming its "
+                    "removal and keeping it tracked so it stays visible and stoppable."
+                )
+                return False
+            if await self._serve_application_exists(application_id):
+                consecutive_absent = 0
+                self.logger.error(
+                    f"Application '{application_id}' is present in Ray Serve again after a "
+                    "successful delete: an in-flight build re-created it. Deleting it again."
+                )
+                try:
+                    await self.ray_cluster.call_with_reconnect(
+                        serve.delete, application_id
+                    )
+                except Exception as delete_err:
+                    self.logger.error(
+                        f"Re-delete of '{application_id}' failed: {delete_err}"
+                    )
+                    return False
+            else:
+                consecutive_absent += 1
+            if consecutive_absent < polls:
+                await asyncio.sleep(interval)
+        return True
+
     async def _undeploy_application(
         self,
         application_id: str,
@@ -1291,14 +1528,76 @@ class AppsManager:
         self.logger.info(
             f"User '{user_id}' is starting undeployment of application '{application_id}'..."
         )
-        await self._cancel_deployment_process(application_id=application_id)
 
-        # Drop the tracking entry BEFORE serve.delete. The monitor loop iterates
-        # _deployed_applications and fires auto-redeploy for anything unhealthy;
-        # if the entry survived the serve.delete window, a monitor tick could
-        # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
-        # first makes the app invisible to the monitor for the rest of teardown.
-        application_info = self._deployed_applications.pop(application_id, None)
+        # ONE teardown per application at a time. A second undeploy that arrives while this
+        # one is in flight is a NO-OP, not a second teardown.
+        #
+        # This became reachable through an earlier fix on this branch: keeping the entry listed
+        # for the whole teardown means `stop_app` on a stopping id passes its guard, where
+        # before it raised "not currently deployed" because the entry had been popped. Two
+        # concurrent undeploys then did real damage to each other — not merely duplicated work:
+        #
+        #   * undeploy #2's leading drain below CONSUMED undeploy #1's live record of an
+        #     unconfirmed build cancellation, and threw the value away. Both then read an empty
+        #     record, both concluded the cancel was confirmed, and the application was
+        #     untracked with its build task still able to re-create it. Measured by review,
+        #     task by task, and it is this row's own orphan once more.
+        #   * #2 also calls `deployment_task.cancel()` again, delivering a second
+        #     CancelledError into the builder while it waits, and issues a second
+        #     `serve.delete` for an application already being deleted.
+        #
+        # The marker is set BEFORE the cancellation, not after. The cancel awaits the
+        # deployment task — measured at up to 60s — and a marker set afterwards leaves exactly
+        # that window unguarded, which is the window the race lives in.
+        application_info = self._deployed_applications.get(application_id)
+        if application_info is not None and application_info.get("stopping"):
+            self.logger.info(
+                f"Application '{application_id}' is already being undeployed, so this request "
+                "is a no-op. The teardown already in flight owns it."
+            )
+            return
+        if application_info is not None:
+            application_info["auto_redeploy"] = False
+            application_info["stopping"] = True
+
+        # Clear any record left behind by an EARLIER cancellation of this id before asking
+        # about this one. ``_cancel_deployment_process`` is also called on the update path,
+        # which has no reason to act on the answer — an update re-creates the application in
+        # the open, so a task that outlived its cancellation cannot orphan anything there. But
+        # the record would outlive its cause, and this stop would then read somebody else's
+        # hazard and refuse to drop a tracking entry it should drop. Draining first makes what
+        # is read below describe THIS teardown and nothing else.
+        #
+        # Safe to drain here ONLY because of the guard above: the record this consumes can no
+        # longer belong to a concurrent teardown of the same id, since there cannot be one.
+        self.app_builder.take_unconfirmed_build_cancellation(application_id)
+        await self._cancel_deployment_process(application_id=application_id)
+        # Did that cancellation actually finish the build task? ``ray.cancel`` is a request,
+        # and the builder waits a bounded time for the task to end. If it did not end, the task
+        # can still reach ``serve.run`` and re-create this application AFTER the delete below —
+        # and after a window of any fixed length, because a task wedged in a runtime_env
+        # install outlasts it. The builder used to only LOG that, which this method cannot
+        # read; now it records it and this is where it is collected.
+        build_cancel_unconfirmed = self.app_builder.take_unconfirmed_build_cancellation(
+            application_id
+        )
+
+        # The tracking entry is KEPT for the duration of the teardown, marked `stopping` —
+        # done above, before the cancellation, so the guard covers the cancel window too.
+        #
+        # It used to be POPPED here, to stop a monitor tick re-adopting the app mid-stop and
+        # redeploying it. That hazard is real, but popping is a heavier instrument than it
+        # needs: the monitor's redeploy list is filtered on `auto_redeploy`, so clearing that
+        # flag already makes the app invisible to the only loop that could redeploy it — which
+        # is exactly how the delete-failed path below has always kept a surviving app tracked
+        # without it being redeployed.
+        #
+        # What popping first ALSO did was make the app invisible to `get_app_status` and
+        # unreachable by `stop_app` for the whole window — and `serve.delete` can block for a
+        # long time. MEASURED on a Kubernetes site: 60.09 seconds, with the confirm window
+        # after it. For that whole period an application that is still running answered
+        # "not here" to every API a caller has, which is this row's complaint in miniature,
+        # produced by the stop itself.
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
@@ -1330,21 +1629,100 @@ class AppsManager:
                 f"Error clearing application replica history for '{application_id}': {e}"
             )
 
-        if delete_failed and application_info is not None:
-            # The app is still running in Ray Serve. Leaving it untracked makes it
-            # invisible to get_app_status and unreachable by stop_app, so it holds
-            # its GPU forever with no API route to release it. auto_redeploy is
-            # forced off so monitor_applications still ignores it.
+        if not delete_failed:
+            # A SUCCESSFUL delete is not proof the application is gone. The build
+            # runs as a Ray task, and cancelling the deployment coroutine races
+            # it: if the task gets to ``serve.run`` after this delete, Ray Serve
+            # ends up holding an application that was just dropped from tracking
+            # above. Measured on a Kubernetes site — deleted in 0.03s, re-created
+            # by the surviving build task four seconds later, then invisible to
+            # every API that works from this list while holding 2 GPUs.
+            #
+            # So the delete is VERIFIED rather than assumed, and a reappearance
+            # is deleted again.
+            #
+            # WATCHED OVER A WINDOW, not polled once. ``ray.cancel`` returning does
+            # not mean the task is dead: it requests cancellation, and a task inside
+            # ``serve.run`` can still reach the end of it. A single poll straight
+            # after the delete therefore answers "absent" for a task that re-creates
+            # the application a second later — which is the exact timing measured in
+            # the incident, where the re-creation landed four seconds after the
+            # delete reported success. The window has to outlast that.
+            if not await self._delete_and_confirm_absent(application_id):
+                delete_failed = True
+
+        # Two different ways a stop can end without the application being safely gone, and
+        # both are answered the same way: KEEP IT TRACKED.
+        #
+        # Leaving it untracked makes it invisible to get_app_status and unreachable by
+        # stop_app, so it holds its GPU with no API route to release it. auto_redeploy stays
+        # off so monitor_applications still ignores it. The entry was never removed above, so
+        # this only has to make sure it is still there and no longer advertises itself as
+        # mid-stop: the stop is over, and it did not succeed.
+        if delete_failed:
+            not_safely_gone = (
+                "it is still running in Ray Serve. Keeping it tracked so it stays visible "
+                "and can be stopped again"
+            )
+        elif build_cancel_unconfirmed:
+            # The delete itself worked and the confirm window stayed clear — but the build
+            # task behind this application was never confirmed finished, and the window cannot
+            # outlast a wedged runtime_env install. If that task does reach ``serve.run``, the
+            # application comes back; dropping the entry now is precisely what turns that
+            # return into an orphan nothing lists. So the entry stays.
+            #
+            # WHAT THIS MESSAGE MUST NOT SAY is "stoppable". Keeping the entry makes a
+            # re-creation VISIBLE, and that is all. It does not survive another stop: on a
+            # second undeploy there is no deployment task left to cancel, so nothing can
+            # re-wait the build task — the ObjectRef died with the submit frame that held it —
+            # and the entry is dropped. An earlier version of this line promised
+            # stoppability, which actively invited the one action that discards the very
+            # tracking it was keeping. The remedy for a re-creation after that point is the
+            # orphan sweep (`get_orphaned_applications`), which exists for exactly this: a
+            # Serve application this worker does not list. So the message names it.
+            not_safely_gone = (
+                "the build task cancelled for it was never confirmed finished, so it may yet "
+                "re-create the application after this delete. Keeping it tracked so such a "
+                "re-creation is VISIBLE here rather than an orphan nobody can attribute. "
+                "Stopping it again drops this entry, after which the orphan sweep is what "
+                "reports a late re-creation"
+            )
+        else:
+            not_safely_gone = None
+
+        if not_safely_gone is not None and application_info is not None:
             application_info["auto_redeploy"] = False
+            application_info.pop("stopping", None)
             self._deployed_applications[application_id] = application_info
+            # "FAILED" is kept as the one greppable token for "this stop left something
+            # behind", whichever of the two reasons it was: an operator and a log watcher
+            # should not need to know the difference to find it.
             self.logger.error(
-                f"Undeployment of application '{application_id}' FAILED: it is still "
-                "running in Ray Serve. Keeping it tracked so it stays visible and "
-                "can be stopped again."
+                f"Undeployment of application '{application_id}' FAILED: {not_safely_gone}."
             )
             return
 
-        # Remove from internal tracking after all cleanup operations complete
+        # Remove from internal tracking after all cleanup operations complete — but ONLY the
+        # entry THIS undeploy was tearing down.
+        #
+        # A new deploy may legitimately reuse the id while the teardown is open, and because
+        # the entry is now kept for the whole teardown (above), that deploy takes the update
+        # path and REPLACES this dict with a fresh one carrying no `stopping` marker.
+        # `_delete_and_confirm_absent` recognises exactly that and returns early, "leaving the
+        # new deployment alone" — and then an unconditional pop here removed the NEW
+        # deployment's entry, leaving its build task running behind an application the worker
+        # no longer lists. That is this row's own defect, re-created by the teardown meant to
+        # prevent it, and it is why the check is IDENTITY rather than presence: the
+        # replacement is a different dict object, so `is` distinguishes "my entry is still
+        # here" from "somebody else's entry is here now". A bare `in` cannot.
+        current_info = self._deployed_applications.get(application_id)
+        if current_info is not application_info:
+            self.logger.info(
+                f"Application '{application_id}' was deployed again while this undeployment "
+                "was running, so its new tracking entry and state are left untouched."
+            )
+            return
+
         self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
         self._identity_warned.discard(application_id)
@@ -2498,6 +2876,12 @@ class AppsManager:
             for app_id, app_info in self._deployed_applications.items()
             if app_info["auto_redeploy"]
         ]
+        # BEFORE the early return below. An orphan is most likely exactly when this worker
+        # tracks nothing — which is the state a stop leaves — and the return skips everything
+        # after it. The sweep makes its own serve.status call at most once per cooldown, so the
+        # hot path pays nothing on the ticks in between.
+        await self._report_orphans_if_due()
+
         if not apps_to_redeploy:
             # Noticing is not redeploying. A worker tracking only opted-out apps
             # used to return here and never read Serve's state at all, which made
