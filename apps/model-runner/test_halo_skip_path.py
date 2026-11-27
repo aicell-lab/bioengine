@@ -268,25 +268,47 @@ class _FakeParameterizedSize:
         self.step = step
 
 
+#: Helpers the loaded predicates call. Exec'd from the SHIPPED source into the
+#: same namespace rather than stubbed, so a test cannot pass against a guard
+#: that only exists in this file.
+_SHIPPED_HELPERS = ("_axes_are_objects",)
+
+
+def _source_of(name: str, required: bool = True) -> Optional[str]:
+    """The source of one top-level def, out of the REAL shipped script.
+
+    ``required=False`` returns None instead of raising. That exists so a HELPER
+    which is absent from the script under test is SKIPPED rather than turned
+    into an AssertionError: run these tests against a build that predates the
+    guard and the predicate must then fail with its own real defect — the
+    AttributeError on ``ipt.id`` — not with "_axes_are_objects is not a
+    top-level def". A red for the wrong reason is indistinguishable from a red
+    for the right one, and it is the wrong reason that would disappear first.
+    """
+    tree = ast.parse(SCRIPT)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(SCRIPT, node) or ""
+    if required:
+        raise AssertionError("%s is not a top-level def in the child script" % name)
+    return None
+
+
 def _load_fits_whole(dino_block_size: int = 384):
     """Exec ``_fits_whole`` out of the REAL shipped source, with stubs.
 
     Deliberately not a copy of the function: a copy would keep passing after the
     shipped predicate changed underneath it.
     """
-    tree = ast.parse(SCRIPT)
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_fits_whole":
-            source = ast.get_source_segment(SCRIPT, node)
-            break
-    else:  # pragma: no cover - the guard below is the real assertion
-        raise AssertionError("_fits_whole is not a top-level def in the child script")
-
     namespace: Dict[str, Any] = {
         "ParameterizedSize": _FakeParameterizedSize,
         "DINO_BLOCK_SIZE": dino_block_size,
     }
-    exec(compile(source, "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
+    for helper in _SHIPPED_HELPERS:
+        src = _source_of(helper, required=False)
+        if src:
+            exec(compile(src, "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
+    exec(compile(_source_of("_fits_whole"), "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
     return namespace["_fits_whole"]
 
 
@@ -412,19 +434,17 @@ def test_a_non_space_axis_is_ignored_by_the_predicate() -> None:
 
 def _load_fn(name: str, dino_block_size: int = 384):
     """Exec one named top-level def out of the REAL shipped source, with stubs."""
-    tree = ast.parse(SCRIPT)
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            source = ast.get_source_segment(SCRIPT, node)
-            break
-    else:
-        raise AssertionError("%s is not a top-level def in the child script" % name)
     namespace: Dict[str, Any] = {
         "ParameterizedSize": _FakeParameterizedSize,
         "DINO_BLOCK_SIZE": dino_block_size,
         "Optional": Any,
     }
-    exec(compile(source, "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
+    for helper in _SHIPPED_HELPERS:
+        if helper != name:
+            src = _source_of(helper, required=False)
+            if src:
+                exec(compile(src, "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
+    exec(compile(_source_of(name), "<_WARM_CHILD_SCRIPT>", "exec"), namespace)
     return namespace[name]
 
 
@@ -755,3 +775,185 @@ def test_an_explicit_blocksize_wins_over_everything() -> None:
         _selected_branch(cellpose=True, fits=True, all_fixed=True, blocksize=16)
         == "blocksize-blocking"
     )
+
+
+# --- spec 0.4 descriptors, which every predicate here must DECLINE -----------
+#
+# A 0.4 input is shaped differently from a 0.5 one, and the difference is not
+# cosmetic: the predicates in this module read ``ipt.id`` and iterate
+# ``ipt.axes`` as axis OBJECTS. A 0.4 input has ``name`` instead, its ``axes``
+# is a STRING, and its extents live in a separate ``shape``. Measured on the
+# real zoo model conscientious-seashell (format_version 0.4.10):
+#     name='input0'   axes="bcyx"   shape=[1, 3, 512, 512]   and no `id`
+# against playful-scorpion (0.5.12), which has `id` and a list of axis objects.
+
+
+class _V04Input:
+    def __init__(
+        self,
+        name: str = "input0",
+        axes: str = "bcyx",
+        shape: Any = (1, 3, 512, 512),
+    ) -> None:
+        self.name = name
+        self.axes = axes  # a STRING, exactly as 0.4 declares it
+        self.shape = list(shape)
+        # No `id` attribute, deliberately: that absence IS the defect's trigger.
+
+
+def _v04_descr() -> _Descr:
+    return _Descr([_V04Input()])
+
+
+def test_the_spec_04_fake_really_lacks_what_the_predicates_read() -> None:
+    """Control for the three below: assert the fake is actually 0.4-shaped.
+
+    Without this, a fake that accidentally grew an ``id`` would make the three
+    tests pass for the wrong reason — they would be exercising a 0.5 input.
+    """
+    ipt = _V04Input()
+    assert not hasattr(ipt, "id"), "the fake must not carry id; 0.4 inputs do not"
+    assert isinstance(ipt.axes, str), "0.4 axes is a string such as 'bcyx'"
+    assert ipt.name == "input0"
+
+
+def test_fits_whole_declines_a_spec_04_descriptor() -> None:
+    """RED before the guard: raises AttributeError instead of answering.
+
+    ``_fits_whole`` dereferences ``ipt.id`` on the first line of its loop. Once
+    the dispatch guard stopped short-circuiting it behind ``cellpose``, every
+    non-Cellpose model reached it, and a 0.4 model crashed there with
+    ``AttributeError: 'InputTensorDescr' object has no attribute 'id'``.
+    False is the answer the function's own comment prescribes for a shape it
+    cannot reason about: keep the blocked path.
+    """
+    fits_whole = _load_fits_whole()
+    assert fits_whole(_v04_descr(), _sample(512, 512)) is False
+
+
+def test_all_space_axes_fixed_declines_a_spec_04_descriptor() -> None:
+    """RED before the guard, and silently so — the worse of the two.
+
+    This loop does not raise on a 0.4 descriptor: it iterates the string
+    "bcyx" as CHARACTERS, none of which has ``.type``, skips every one, and
+    returns True — claiming every space axis is fixed for a model whose axes it
+    never read. That routes a 0.4 model into the fixed-extent branch.
+    """
+    all_fixed = _load_fn("_all_space_axes_fixed")
+    assert all_fixed(_v04_descr()) is False
+
+
+def test_the_too_small_message_declines_a_spec_04_descriptor() -> None:
+    """There is no actionable sentence to offer about axes we cannot read."""
+    too_small = _load_fn("_fixed_extent_too_small")
+    assert too_small(_v04_descr(), _sample(512, 512)) is None
+
+
+def _branch_with_real_predicates(
+    descr: Any, sample: Any, cellpose: bool = False
+) -> str:
+    """Evaluate the REAL chain conditions with the REAL predicates loaded from the script.
+
+    ``_selected_branch`` injects booleans, which pins the chain's SHAPE but cannot show what a
+    particular descriptor does to it. This drives the shipped predicates themselves.
+    """
+    env: Dict[str, Any] = {
+        "cellpose": cellpose,
+        "default_blocksize_parameter": None,
+        "_fits_whole": _load_fits_whole(),
+        "_all_space_axes_fixed": _load_fn("_all_space_axes_fixed"),
+        "pipeline": type("P", (), {"model_description": descr})(),
+        "sample": sample,
+    }
+    for cond, branch in _dispatch_chain():
+        if cond is None:
+            return branch
+        if eval(cond, dict(env)):  # noqa: S307 - the condition is our own source
+            return branch
+    return "none"
+
+
+def test_a_spec_04_descriptor_reaches_the_final_else_through_the_REAL_chain() -> None:
+    """The restored path, driven rather than reasoned about.
+
+    The other 0.4 tests assert each predicate in isolation; this one feeds a 0.4 descriptor to the
+    real predicates through the real chain conditions and names the branch it lands on. That is the
+    branch an unguarded build cannot reach, because it raises before deciding.
+    """
+    assert _branch_with_real_predicates(_v04_descr(), _sample(512, 512)) == "final-else"
+
+
+def test_a_real_05_descriptor_still_reaches_skip_padding_through_the_REAL_chain() -> (
+    None
+):
+    """The paired control: the guard must not quietly disable the skip path for 0.5.
+
+    Without this, a guard that declined EVERYTHING would pass every 0.4 test above.
+    """
+    assert (
+        _branch_with_real_predicates(_fixed_256_model(), _sample(256, 256))
+        == "skip-padding"
+    )
+
+
+class _IdButStringAxes:
+    """Has ``id``, but ``axes`` is a string. Isolates the str check in the guard."""
+
+    def __init__(self) -> None:
+        self.id = "input0"
+        self.axes = "bcyx"
+
+
+class _IdAndListButAxisHasNoType:
+    """Has ``id`` and a LIST of axes, but the axis objects carry no ``.type``."""
+
+    def __init__(self) -> None:
+        self.id = "input0"
+        self.axes = [object(), object()]
+
+
+def test_the_guard_rejects_string_axes_even_when_id_is_present() -> None:
+    """A non-empty string-axes input is rejected even when ``id`` is present.
+
+    This pins the OUTCOME, not one arm. Measured by mutation: deleting the
+    ``isinstance(axes, str)`` arm leaves THIS case green, because iterating "bcyx" yields
+    characters and the ``hasattr(axis, "type")`` arm below rejects them. The arm that this case
+    cannot pin is pinned by ``test_the_guard_rejects_EMPTY_string_axes`` below, which is the input
+    that does separate them.
+    """
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_Descr([_IdButStringAxes()])) is False
+
+
+def test_the_guard_rejects_axis_objects_without_a_type_attribute() -> None:
+    """Isolates the last check, for the same reason as the one above."""
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_Descr([_IdAndListButAxisHasNoType()])) is False
+
+
+def test_the_guard_accepts_a_real_05_shaped_descriptor() -> None:
+    """The positive arm: a guard that rejected everything would pass all four tests above."""
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_fixed_256_model()) is True
+
+
+class _IdButEmptyStringAxes:
+    """Has ``id``, and ``axes`` is the EMPTY string. The one input that separates the guard's arms."""
+
+    def __init__(self) -> None:
+        self.id = "input0"
+        self.axes = ""
+
+
+def test_the_guard_rejects_EMPTY_string_axes() -> None:
+    """The empty string is why the ``isinstance(axes, str)`` arm is load-bearing.
+
+    For "bcyx" the ``hasattr(axis, "type")`` loop below would also reject. For "" it would not:
+    there are no characters, the loop body never runs, and without the str arm the guard answers
+    True — reporting that a 0.4 input carries 0.5 axis objects. A vacuous truth, inside a predicate
+    written to stop exactly that class of mistake.
+
+    Goes RED with the str arm deleted; "bcyx" alone does not.
+    """
+    guard = _load_fn("_axes_are_objects")
+    assert guard(_Descr([_IdButEmptyStringAxes()])) is False

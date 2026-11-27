@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import logging
 import os
+import tempfile
 import time
 from functools import wraps
 from pathlib import Path
@@ -219,6 +220,220 @@ def _ensure_working_directory(logger: logging.Logger) -> None:
     except OSError:
         pass
     logger.info(f"📁 Working directory: {workdir}/")
+    if app_dir_env:
+        _ensure_home_under_app_dir(workdir, logger)
+
+
+def _effective_value(var: str, *, refresh: bool = False) -> Path:
+    """What this process will ACTUALLY use for ``var``, not what was just written to it.
+
+    The difference is the whole point of the verify step, and it is real for one of the two
+    variables:
+
+    * ``TMPDIR`` — ``tempfile`` resolves its directory ONCE, on first use, and caches it in
+      ``tempfile.tempdir``. Every ``mkstemp``/``mkdtemp``/``NamedTemporaryFile`` in the process
+      then goes there, whatever the environment says afterwards; and any library that touched a
+      temporary file at import time has already triggered that resolution. So the cache is
+      CLEARED here before asking — which both makes the repair take effect and makes the answer
+      describe the process rather than the variable. Re-reading ``os.environ`` instead reads
+      back the value written one line earlier and therefore always agrees: measured by review,
+      the function logged "TMPDIR repaired to <app>/tmp" while ``tempfile.gettempdir()`` stayed
+      ``/tmp`` and ``mkdtemp()`` kept returning ``/tmp/tmp…``. A reported repair that did not
+      happen is exactly what this step exists to prevent.
+
+    * ``HOME`` — ``Path.home()`` reads ``os.environ["HOME"]`` and only consults the password
+      database when it is UNSET, which it cannot be one line after the assignment. So for HOME
+      this cannot fail in production, and the check is a REGRESSION GUARD rather than a runtime
+      check: it holds the contract "a repair is verified, never assumed" in place for whoever
+      edits this next, and its arm has to monkeypatch ``Path.home`` to fire it. Labelled as
+      such rather than justified by a fallback that does not apply.
+
+    ``refresh`` says whether to CLEAR the cache before asking:
+
+    * ``False`` — the DETECTION read. It answers "what would this process use right now", which
+      is the question the early-return needs: a variable that is already correct while the cache
+      is stale is still a replica that writes to the wrong place, and comparing ``os.environ``
+      there reported nothing at all. Measured by review on the hook-only path, where
+      ``replica_init`` assigns ``TMPDIR`` in-process after something has already warmed
+      ``tempfile``: zero ERROR lines, ``TMPDIR`` correct in the environment, and
+      ``gettempdir()`` still ``/tmp``.
+    * ``True`` — the read after a repair, which must also MAKE the repair take.
+
+    Not clearing on the detection read is deliberate. ``tempfile.tempdir`` holding a value is
+    indistinguishable through the public API from an app having set it on purpose, so clearing
+    it on every replica start would overwrite that choice even when nothing is wrong. On the
+    REPAIR path it is still overwritten — an app that points ``tempfile`` outside the per-app
+    directory loses that, exactly as it loses a ``TMPDIR`` pointing elsewhere, because forcing
+    the per-app directory is this function's job.
+    """
+    if var == "HOME":
+        return Path.home()
+    if refresh:
+        tempfile.tempdir = None
+    return Path(tempfile.gettempdir())
+
+
+def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
+    """Check, IN THE SERVING PROCESS, that ``HOME`` and ``TMPDIR`` point under the per-app
+    directory — and say so loudly and repair them if not.
+
+    WHAT WAS MEASURED, and only that — stated so neither instrument is read past what it answers.
+    On a live external-cluster site, a scan of ``/proc/<pid>/environ`` found eight of eight
+    ``ray::ServeReplica:*`` processes for a freshly deployed app had been **started** with
+    ``HOME=/home/ray``, the read-only image default. That is all ``/proc`` can say: it reports the
+    environment a process was started with, and an in-process ``os.environ["HOME"] = ...`` never
+    appears there (measured, with a control: after the assignment the string is absent from
+    ``/proc/self/environ`` while ``PATH=`` is present).
+
+    What establishes the EFFECTIVE value is the app's own refusal:
+    ``[Errno 30] Read-only file system: '/home/ray/.bioengine'``. An in-process assignment *does*
+    steer ``Path.home()``, so a process with it in effect would have resolved the per-app home; the
+    one that produced that error had not. The symptom is two steps from the cause.
+
+    The identical scan on another site showed six of six serving replicas under the per-app home,
+    and there ``/proc`` is the right instrument: a value visible in it can only have arrived WITH
+    the process — through the runtime_env — which is exactly the leg that version adds.
+
+    WHY THE TWO SITES DIFFERED — the cause, read out of the versions they actually run rather than
+    out of ``main``. The broken site ran worker 0.16.130, the healthy one 0.16.131:
+
+    * at 0.16.130 ``bioengine/apps/builder.py`` composes **no** ``env_vars["HOME"]`` at all, so the
+      per-actor leg does not exist there; and
+    * at 0.16.130 ``replica_init`` assigns ``HOME`` *after* ``_ensure_source``, so a sync that
+      raises leaves ``HOME`` at the image default — the ordering hazard that version's own
+      docstring warns about.
+
+    So on that site there was exactly ONE leg and it was order-dependent. Rolling the worker to
+    0.16.131 or later is the remedy for the cause; this function is defence in depth, not that
+    remedy. It is useful because it runs in the process that will do the writing, so it also covers
+    a future delivery path failing silently — but it does not pretend to explain anything beyond
+    what is written above.
+
+    CHECK AND REPAIR, not refuse: an app that can be made to work should work, and raising here
+    would turn a recoverable environment into a dead deployment. ERROR-level because a silent
+    repair would hide a real bootstrap defect; the repair keeps the site serving, the log is what
+    gets the delivery fixed.
+
+    ORDER MATTERS INSIDE HERE TOO. Each directory is created *before* its variable is assigned, and
+    each is reported separately. An earlier version assigned ``HOME`` first and then created
+    ``tmp``; when the ``tmp`` creation failed it logged "could NOT repair HOME" — while ``HOME`` had
+    in fact already been repaired, and ``TMPDIR`` had been pointed at a directory that did not
+    exist. The message contradicted the state.
+
+    AND THE FAILURE MESSAGE CARRIES THE STATE, for the same reason. The two ways this can fail
+    leave different state behind — a directory that could not be created leaves the variable
+    untouched, a re-read that disagrees means the variable was written and something else did not
+    follow — so a single "<var> is unchanged" sentence was false in the second case. See
+    :func:`_effective_value` for what "re-read" asks, and why it is a real runtime check for
+    ``TMPDIR`` and only a regression guard for ``HOME``.
+    """
+    repaired, failed = [], []
+
+    for var, target in (("HOME", app_dir / "home"), ("TMPDIR", app_dir / "tmp")):
+        current = os.environ.get(var)
+        effective = None
+        try:
+            # DETECTED through what the process will USE, not through the variable. Comparing
+            # os.environ here meant a replica whose TMPDIR was right but whose `tempfile`
+            # cache was stale matched, returned early, and was never told — while every
+            # temporary file it created still went to the old directory.
+            # BOTH must be right, and neither check subsumes the other. Enumerating the
+            # (variable, cache) states showed each single check has its own blind spot:
+            #
+            #  * the VARIABLE alone misses a correct variable with a stale `tempfile` cache —
+            #    the hook-only path, where every temporary file still goes to the old
+            #    directory while nothing is logged (review's R4-2);
+            #  * the EFFECTIVE value alone misses a WRONG variable that the cache happens to
+            #    mask. That one is not harmless: `os.environ["TMPDIR"]` is what every child
+            #    process and every library reading the environment inherits, so it stays
+            #    wrong for them while this process looks fine.
+            effective = _effective_value(var)
+            ok = (
+                current is not None
+                and Path(current).resolve() == target.resolve()
+                and effective.resolve() == target.resolve()
+            )
+        except OSError:
+            ok = False
+        if ok:
+            continue
+
+        # Name BOTH values when they disagree. The decision above is made on the EFFECTIVE
+        # value, so a message that printed only the variable could read "TMPDIR was <target>,
+        # not <target>" — true about nothing and pointing the reader at the wrong thing. That
+        # is the same class of defect as the repair message review rejected earlier on this
+        # branch, and it appeared the moment detection stopped reading the variable.
+        was = current if current else "<unset>"
+        if (
+            current is not None
+            and effective is not None
+            and str(effective) != str(Path(current))
+        ):
+            was = f"{current}, which this process would resolve to {effective},"
+        # `setdefault` is deliberately NOT used: a TMPDIR that is present but points somewhere
+        # unwritable is exactly the case worth repairing, and setdefault would leave it alone.
+        logger.error(
+            "BioEngine: %s was %s not %s, in the process that serves this replica. Repairing it "
+            "now; a write under it would otherwise have failed against a path this process cannot "
+            "write, and the cause would have looked like an application bug.",
+            var,
+            was,
+            target,
+        )
+        # Create first, assign second. Assigning a variable to a directory that does not exist
+        # replaces one failure with a less obvious one.
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # The assignment below never ran, so the variable really IS unchanged here. This is
+            # the only one of the two failure modes where that wording is true.
+            failed.append(
+                (
+                    var,
+                    f"the directory {target} could not be created ({exc}), so {var} is "
+                    f"unchanged and this replica will fail on its first write under it",
+                )
+            )
+            continue
+
+        try:
+            os.environ[var] = str(target)
+            observed = _effective_value(var, refresh=True)
+            match = observed.resolve() == target.resolve()
+        except OSError as exc:
+            failed.append(
+                (
+                    var,
+                    f"{var} was set to {target}, but reading back what this process will "
+                    f"actually use raised {exc}",
+                )
+            )
+            continue
+
+        if match:
+            repaired.append(var)
+        else:
+            # Truthful about what did and did not change. The variable WAS written; what reads
+            # it did not follow. Saying "<var> is unchanged" here was false — measured by
+            # review, with Path.home pinned: the log said HOME was unchanged while
+            # os.environ["HOME"] held the new value.
+            failed.append(
+                (
+                    var,
+                    f"{var} was set to {target}, but the value this process will actually use "
+                    f"is {observed}. The variable changed; what reads it did not, so a "
+                    "write under it still lands in the wrong place",
+                )
+            )
+
+    for var in repaired:
+        logger.error("BioEngine: %s repaired to %s", var, os.environ[var])
+    for var, detail in failed:
+        # The detail carries the state, because the two failure modes leave DIFFERENT state: a
+        # directory that could not be created leaves the variable untouched, while a re-read
+        # that disagrees means the variable was written and something else did not follow. One
+        # fixed sentence for both was false in the second case.
+        logger.error("BioEngine: could NOT repair %s. %s.", var, detail)
 
 
 def _install_secret_env_vars(instance: Any, logger: logging.Logger) -> None:
