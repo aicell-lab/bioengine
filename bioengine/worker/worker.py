@@ -2281,8 +2281,14 @@ class BioEngineWorker:
             "client_id": self.client_id,
             "ray_cluster": ray_cluster_status,
             "admin_users": self.admin_users,
-            # Ray Serve apps running on this cluster that the worker did NOT
-            # adopt, mapped to why. A skipped app keeps running and keeps its
+            # Ray Serve apps this worker SKIPPED while recovering at boot,
+            # mapped to why.
+            #
+            # ⚠ This is NOT an orphan detector and must not be read as one. It
+            # is a snapshot of what recovery passed over, taken at boot; an app
+            # that becomes untracked later never enters it, so an EMPTY dict
+            # means "recovery skipped nothing", never "there are no orphans".
+            # The live Serve-vs-tracked difference is a separate question. A skipped app keeps running and keeps its
             # GPUs while being absent from get_app_status, so without this it
             # is attributable to nothing — which is how a throwaway held 2 of
             # KTH's 3 GPUs with no surface naming it.
@@ -2294,10 +2300,10 @@ class BioEngineWorker:
             # `is_ready` line above uses `.get` — this endpoint answers
             # unauthenticated probes, so it must not raise if the apps manager
             # is absent or has not completed initialisation yet.
-            "unadopted_applications": dict(
+            "applications_skipped_at_recovery": dict(
                 getattr(
                     getattr(self, "apps_manager", None),
-                    "_unadopted_applications",
+                    "_applications_skipped_at_recovery",
                     {},
                 )
                 or {}

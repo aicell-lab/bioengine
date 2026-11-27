@@ -743,12 +743,12 @@ class AppsManager:
         # `_deployed_applications`. Two of those skips used to be silent (a
         # missing ProxyDeployment logged nothing; a sibling workspace logged at
         # DEBUG), so the app became invisible to every BioEngine surface at
-        # once — see the worker status field `unadopted_applications`.
+        # once — see the worker status field `applications_skipped_at_recovery`.
         #
         # Deleting the Serve app would be the wrong remedy: the
         # sibling-workspace case is another worker's app and legitimately not
         # ours to remove. Making it VISIBLE is the fix.
-        self._unadopted_applications: Dict[str, str] = {}
+        self._applications_skipped_at_recovery: Dict[str, str] = {}
 
         # Per-app auto-redeploy backoff state. Keyed by application_id; each
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
@@ -2099,7 +2099,7 @@ class AppsManager:
 
         # Rebuilt from scratch on every pass: an app adopted (or gone) since
         # the last pass must stop being reported as unadopted.
-        self._unadopted_applications = {}
+        self._applications_skipped_at_recovery = {}
 
         for application_id, application in serve_status.applications.items():
             if application_id in self._deployed_applications:
@@ -2107,7 +2107,7 @@ class AppsManager:
                 continue
 
             if "ProxyDeployment" not in application.deployments:
-                self._unadopted_applications[application_id] = (
+                self._applications_skipped_at_recovery[application_id] = (
                     "no ProxyDeployment in the Serve application, so it is not a "
                     "BioEngine app this worker can manage"
                 )
@@ -2136,7 +2136,7 @@ class AppsManager:
                         f"BioEngine major version break — redeploy this app "
                         f"explicitly to bring it under the new builder."
                     )
-                    self._unadopted_applications[application_id] = (
+                    self._applications_skipped_at_recovery[application_id] = (
                         f"app_data carries format_version={recovered_format!r}, "
                         "expected '0.6.0' (deployed before a major version break)"
                     )
@@ -2152,7 +2152,7 @@ class AppsManager:
                     current_workspace=self.server.config.workspace,
                     logger=self.logger,
                 ):
-                    self._unadopted_applications[application_id] = (
+                    self._applications_skipped_at_recovery[application_id] = (
                         "not stamped with this worker's workspace (deployed before "
                         "the cross-workspace filter, or owned by a sibling worker)"
                     )
@@ -2270,7 +2270,7 @@ class AppsManager:
                 self.logger.warning(
                     f"Failed to recover application '{application_id}' from Ray Serve: {e}"
                 )
-                self._unadopted_applications[application_id] = (
+                self._applications_skipped_at_recovery[application_id] = (
                     f"recovery raised {type(e).__name__}: {e}"
                 )
 
@@ -2281,7 +2281,7 @@ class AppsManager:
         else:
             self.logger.info("No existing Ray Serve applications needed recovery.")
 
-        if self._unadopted_applications:
+        if self._applications_skipped_at_recovery:
             # One line naming every one of them: a skipped app keeps running
             # and keeps its resources, so "it is not in my list" must never be
             # the only trace it leaves.
@@ -2289,10 +2289,10 @@ class AppsManager:
                 "%d Ray Serve application(s) are running but NOT managed by this "
                 "worker; they keep their resources and will not appear in "
                 "get_app_status: %s",
-                len(self._unadopted_applications),
+                len(self._applications_skipped_at_recovery),
                 ", ".join(
                     f"{app_id} ({reason})"
-                    for app_id, reason in sorted(self._unadopted_applications.items())
+                    for app_id, reason in sorted(self._applications_skipped_at_recovery.items())
                 ),
             )
 
