@@ -1097,7 +1097,21 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
+        """Presigned S3 PUT URL for staging an input image or embedding.
+
+        BOTH THE URL AND THE STAGED OBJECT EXPIRE, in about an hour, and the
+        second half is the one that surprises people: "1-hour TTL" reads as a
+        limit on how long you may UPLOAD, so a caller reasonably assumes that
+        once the PUT succeeds the file is durable. It is not. A `start_training`
+        submitted 74 minutes after staging failed with "Source 'temp/<uuid>.png'
+        does not exist or has expired", and an `infer` on a path staged 80
+        minutes earlier failed the same way.
+
+        So anything that stages and then WAITS must re-stage first. The case
+        that bites is a run which correctly sits QUEUED behind a long training:
+        the longer it waits its turn, the more likely its inputs are gone by the
+        time it starts.
+        """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1207,7 +1221,13 @@ class EntryApp:
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
-            raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
+            raise FileNotFoundError(
+                f"Source '{source}' does not exist or has expired. A staged "
+                f"upload and the object behind it both expire about an hour "
+                f"after `get_upload_url`, so a path staged earlier than that is "
+                f"gone: re-stage the file and submit again. This is the common "
+                f"outcome for a run that waited in the queue."
+            )
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
         if ext == ".npy":
@@ -2452,7 +2472,11 @@ class EntryApp:
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
+            "and y increasing DOWNWARD -- the raster convention, not y-up; "
+            "y-up polygons rasterise mirrored and train silently on wrong masks). "
+            "AIS fine-tuning "
             "needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
@@ -2773,7 +2797,10 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y), origin TOP-LEFT and y "
+            "increasing DOWNWARD -- the raster convention; y-up polygons "
+            "rasterise mirrored).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."
@@ -2804,7 +2831,9 @@ class EntryApp:
         ``enable_clahe``) — re-stages the prepared arrays into the app's temp store so
         the returned ``train_images``/``train_labels`` URL lists feed straight into
         ``start_training``. Returns a per-pair report plus counts so a dataset can be
-        vetted before committing to a long run. Staged URLs are short-lived — call
+        vetted before committing to a long run. Staged URLs AND the staged objects
+        themselves are short-lived (about an hour for both; see `get_upload_url`),
+        so a dataset staged and then left to wait must be re-staged — call
         start_training promptly.
         """
         if len(train_images) != len(train_labels):
