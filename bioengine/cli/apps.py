@@ -181,10 +181,14 @@ def validate(app_dir):
         f"there, `bioengine apps upload` refuses the bundle unless the manifest version is "
         f"higher than every version that id already carries — and if the lineage is not "
         f"yours, the id itself is what has to change.\n"
-        f"To see which ids exist: bioengine apps list — those are ARTIFACT ids, which is "
-        f"the set '{app_id}' has to be free in. The ids from `bioengine apps status` are "
-        f"APPLICATION ids of running deployments, a different namespace: an id absent there "
-        f"can still be taken as an artifact."
+        f"Upload resolves the id against the WHOLE workspace, not just the app "
+        f"collection, so `bioengine apps list` does not answer this: it shows only the app "
+        f"collection, which is the case that is already safe. If something that is NOT an "
+        f"app holds '{app_id}' there — a dataset, a model — upload DELETES that artifact "
+        f"and recreates it as an app. Check the workspace itself before uploading an id "
+        f"you did not pick. The ids from `bioengine apps status` are APPLICATION ids of "
+        f"running deployments, a different namespace again: an id absent there can still "
+        f"be taken as an artifact."
     )
 
 
