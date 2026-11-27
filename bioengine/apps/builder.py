@@ -30,7 +30,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import ray
 import yaml
@@ -162,6 +162,13 @@ _GPU_FRACTION_DECIMALS = 2
 _GPU_FRACTION_GRACE = 0.1
 
 
+# How long to wait for a cancelled build task to actually finish. ``ray.cancel``
+# only REQUESTS cancellation, so the ref becoming ready is the first evidence the
+# task has stopped. Bounded so a task wedged in a runtime_env install cannot hold
+# an undeploy open; a timeout is reported as "not confirmed", never as success.
+_BUILD_CANCEL_WAIT_SECONDS = 30.0
+
+
 class AppBuilder:
     """Build BioEngine apps from artifact storage for Ray Serve.
 
@@ -192,6 +199,11 @@ class AppBuilder:
         self.elastic_gpu_cluster: bool = elastic_gpu_cluster
         self.server_url: str = server_url
         self.data_server_url: Optional[str] = None
+        # Application ids whose cancelled build task was NOT confirmed finished. Such a task
+        # may still reach ``serve.run`` and re-create the application after the undeploy has
+        # deleted it, so the undeploy has to be able to ASK — a log line it cannot read is not
+        # a signal. Drained by ``take_unconfirmed_build_cancellation``.
+        self._unconfirmed_build_cancellations: Set[str] = set()
 
     def complete_initialization(
         self,
@@ -205,6 +217,18 @@ class AppBuilder:
 
     def update_data_server_url(self, data_server_url: str) -> None:
         self.data_server_url = data_server_url
+
+    def take_unconfirmed_build_cancellation(self, application_id: str) -> bool:
+        """Report AND clear whether this app's cancelled build task was left unconfirmed.
+
+        Draining is deliberate: the answer describes one teardown, and the caller acts on it by
+        keeping the tracking entry. Leaving it set would make every later stop of the same id
+        report the same stale hazard.
+        """
+        if application_id in self._unconfirmed_build_cancellations:
+            self._unconfirmed_build_cancellations.remove(application_id)
+            return True
+        return False
 
     # ────────────────────────── manifest ─────────────────────────────────
 
@@ -1080,34 +1104,124 @@ class AppBuilder:
         # module top-level imports ``hypha_rpc`` crashes the unpickle.
         # Sanitising dict args to primitives here keeps the
         # worker↔cluster RPC contract pure-data and cluster-env-agnostic.
+        # The ObjectRef is held in a NAME rather than inlined into ``ray.get``,
+        # because cancelling the caller has to be able to reach the Ray task.
+        # ``.remote(...)`` submits it immediately and ``asyncio.to_thread`` only
+        # WAITS for it, so cancelling this coroutine stops the wait and leaves
+        # the task running on the cluster — where it finishes by calling
+        # ``serve.run`` and re-creating the application.
+        #
+        # That is not hypothetical. Measured on a Kubernetes site: an operator
+        # undeployed an app whose build was in flight, the worker logged
+        # "Deployment task ... was cancelled", deleted the Serve application
+        # ("Deleted Ray Serve application ... in 0.03 seconds") and cleared its
+        # own tracking — and four seconds later this task reconnected and
+        # registered its replicas. Ray Serve then held an application the
+        # worker did not list, pinning 2 GPUs that nothing could attribute or
+        # free, because every tool that could have freed it works from the
+        # worker's list.
+        ref = ray.remote(
+            # max_calls=1: same reason as the introspect task — a fresh
+            # process guarantees the deployment class is imported from the
+            # refreshed source, not a stale sys.modules entry cached on a
+            # reused worker (the class is cloudpickled by value to the
+            # replicas, so the build worker's import is what they run).
+            num_cpus=0,
+            max_calls=1,
+            runtime_env=built_app.runtime_env,
+        )(build_and_run_application).remote(
+            _ensure_jsonable(built_app.spec),
+            _ensure_jsonable(built_app.translated_kwargs),
+            _ensure_jsonable(built_app.proxy_args),
+            application_id,
+            f"/{application_id}",
+            built_app.bioengine_uri,
+            built_app.proxy_pip,
+            built_app.user_replica_framework_pip,
+            _ensure_jsonable(built_app.replica_env_vars),
+            built_app.proxy_memory_in_gb,
+            _ensure_jsonable(built_app.scaling),
+        )
         try:
-            await asyncio.to_thread(
-                ray.get,
-                # max_calls=1: same reason as the introspect task — a fresh
-                # process guarantees the deployment class is imported from the
-                # refreshed source, not a stale sys.modules entry cached on a
-                # reused worker (the class is cloudpickled by value to the
-                # replicas, so the build worker's import is what they run).
-                ray.remote(num_cpus=0, max_calls=1, runtime_env=built_app.runtime_env)(
-                    build_and_run_application
-                ).remote(
-                    _ensure_jsonable(built_app.spec),
-                    _ensure_jsonable(built_app.translated_kwargs),
-                    _ensure_jsonable(built_app.proxy_args),
-                    application_id,
-                    f"/{application_id}",
-                    built_app.bioengine_uri,
-                    built_app.proxy_pip,
-                    built_app.user_replica_framework_pip,
-                    _ensure_jsonable(built_app.replica_env_vars),
-                    built_app.proxy_memory_in_gb,
-                    _ensure_jsonable(built_app.scaling),
-                ),
+            await asyncio.to_thread(ray.get, ref)
+        except asyncio.CancelledError:
+            # force=True kills the worker process running the task. A plain
+            # cancel only interrupts between lines of Python, and this task
+            # spends its time inside ``serve.run``, so the gentler form can
+            # return while the application is already being created.
+            self.logger.info(
+                f"Deployment of '{application_id}' was cancelled; cancelling the "
+                "in-flight build task so it cannot re-create the application."
             )
+            cancelled_cleanly = False
+            # RECORD FIRST, clear only on a CONFIRMED end. The record is the undeploy's only
+            # way to learn this outcome — it cannot read a log line — so it is written in the
+            # fail-safe direction: "not confirmed" until something proves otherwise.
+            #
+            # Writing it after the wait lost it entirely whenever the wait did not return
+            # normally, and there is a reachable way for that to happen now: since the
+            # tracking entry stays listed for the whole teardown, `stop_app` on an id that is
+            # already stopping is ACCEPTED where it used to raise "not currently deployed". A
+            # second undeploy then calls `deployment_task.cancel()` again while this coroutine
+            # is parked on the wait below, and `asyncio.CancelledError` derives from
+            # BaseException, so neither the `except Exception` nor anything after it runs. The
+            # record and the ERROR were both skipped and the app was untracked with its build
+            # task still alive.
+            self._unconfirmed_build_cancellations.add(application_id)
+            try:
+                ray.cancel(ref, force=True)
+                # ``ray.cancel`` RETURNING is not the task ENDING. Wait for the ref to
+                # become ready — the task is then genuinely finished (it raises
+                # TaskCancelledError on the cancelled path, which ``ray.get`` would
+                # surface and which is exactly the outcome wanted here).
+                #
+                # Bounded, because a task wedged inside a runtime_env install must not
+                # hold the undeploy open. If the wait times out the task is still alive
+                # and may yet call serve.run, so that is reported as NOT cancelled
+                # rather than assumed away: a fixed post-delete poll window cannot cover
+                # a multi-minute pip install, which is how the orphan is created.
+                done, _pending = await asyncio.to_thread(
+                    ray.wait, [ref], timeout=_BUILD_CANCEL_WAIT_SECONDS
+                )
+                cancelled_cleanly = bool(done)
+                if cancelled_cleanly:
+                    # The ONLY thing that clears the record: positive proof the task ended.
+                    self._unconfirmed_build_cancellations.discard(application_id)
+            except Exception as cancel_error:
+                self.logger.warning(
+                    f"Could not cancel the build task for '{application_id}': "
+                    f"{cancel_error}."
+                )
+            finally:
+                # In a `finally`, so an aborted wait still SAYS so. A second cancellation
+                # delivered while the wait is parked unwinds this frame with a BaseException,
+                # and a plain `if` after the try would never run — leaving the quietest
+                # possible version of the loudest thing here.
+                if not cancelled_cleanly:
+                    self._report_unconfirmed_build_cancellation(application_id)
+            raise
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc
         self.logger.info(f"Submitted '{application_id}' to Ray Serve")
+
+    def _report_unconfirmed_build_cancellation(self, application_id: str) -> None:
+        """Say LOUDLY that a cancelled build task was never confirmed finished.
+
+        Reported LOUDLY and attributed, never swallowed: this is the state in which an
+        application can still appear in Ray Serve after the worker has deleted it and stopped
+        tracking it.
+
+        A method rather than an inline block only so the caller can reach it from a
+        ``finally`` without repeating it on two paths.
+        """
+        self.logger.error(
+            f"The build task for '{application_id}' was NOT confirmed finished "
+            f"within {_BUILD_CANCEL_WAIT_SECONDS}s of cancelling it. It may still "
+            "call serve.run and re-create the application after the undeploy has "
+            "deleted it, which would leave an application Ray Serve holds and "
+            "this worker does not list."
+        )
 
 
 class BuiltApp:
