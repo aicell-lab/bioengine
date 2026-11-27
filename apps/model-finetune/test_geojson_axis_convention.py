@@ -90,6 +90,72 @@ def test_geojson_instance_ids_start_at_one_in_document_order() -> None:
     assert int(mask[25, 25]) == 2, int(mask[25, 25])
 
 
+def test_each_multipolygon_part_gets_its_own_instance_id() -> None:
+    """One id per POLYGON RING, not one per feature -- the docstring said feature.
+
+    `rasterize_geojson` increments `instance_id` inside the loop over a
+    MultiPolygon's parts, so a single two-part feature yields two instances. The
+    inherited docstring said "one instance per Polygon/MultiPolygon feature",
+    which reads as one id for the whole feature, and a caller counting instances
+    to sanity-check an upload would get a plausible-but-wrong number.
+    """
+    import training
+
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[1, 1], [10, 1], [10, 10], [1, 10], [1, 1]]],
+                        [[[20, 20], [30, 20], [30, 30], [20, 30], [20, 20]]],
+                    ],
+                },
+            }
+        ],
+    }
+    mask = training.rasterize_geojson(fc, width=W, height=H)
+    ids = sorted(int(v) for v in np.unique(mask) if v != 0)
+    assert ids == [1, 2], (
+        f"one feature with two MultiPolygon parts produced ids {ids}; the parts "
+        f"are numbered separately, so the count a caller sees is per ring"
+    )
+    assert int(mask[5, 5]) == 1 and int(mask[25, 25]) == 2
+
+
+def test_interior_rings_are_ignored_so_a_hole_is_filled() -> None:
+    """Only ring 0 is drawn, so a polygon with a hole trains as if it were solid.
+
+    Pinned because it is now written down. A caller who annotates a nucleus as a
+    ring inside a cell gets the ring filled with the cell's id instead of a hole,
+    and nothing says so at runtime.
+    """
+    import training
+
+    outer = [[8, 8], [56, 8], [56, 56], [8, 56], [8, 8]]
+    hole = [[24, 24], [40, 24], [40, 40], [24, 40], [24, 24]]
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [outer, hole]},
+            }
+        ],
+    }
+    mask = training.rasterize_geojson(fc, width=W, height=H)
+    assert int(mask[32, 32]) == 1, (
+        f"the hole centre is {int(mask[32, 32])}; interior rings are ignored, so "
+        f"it must carry the outer ring's id"
+    )
+    ids = sorted(int(v) for v in np.unique(mask) if v != 0)
+    assert ids == [1], ids
+
+
 def test_a_y_up_annotation_set_rasterises_mirrored_and_raises_nothing() -> None:
     """CONTROL, and the justification for documenting the convention.
 

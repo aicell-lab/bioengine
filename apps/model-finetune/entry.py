@@ -2484,7 +2484,9 @@ class EntryApp:
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
             "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
             "and y increasing DOWNWARD -- the raster convention, not y-up; y-up "
-            "polygons rasterise mirrored and train silently on wrong masks). "
+            "polygons rasterise mirrored and train silently on wrong masks. One "
+            "id per polygon RING, so each MultiPolygon part counts separately; "
+            "interior rings are ignored). "
             "AIS fine-tuning needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
@@ -2808,7 +2810,8 @@ class EntryApp:
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
             "coordinates are image pixels (x, y), origin TOP-LEFT and y "
             "increasing DOWNWARD -- the raster convention; y-up polygons "
-            "rasterise mirrored).",
+            "rasterise mirrored. One id per polygon RING, so each MultiPolygon "
+            "part counts separately; interior rings are ignored).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."

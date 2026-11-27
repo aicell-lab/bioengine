@@ -2372,7 +2372,13 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per Polygon/MultiPolygon feature, ids from 1 in document order.
+    One instance per polygon RING, ids from 1 in document order -- a ``Polygon``
+    is one instance and EACH PART of a ``MultiPolygon`` is its own, because the
+    id is incremented in the loop over parts below. An earlier version of this
+    docstring said "per Polygon/MultiPolygon feature", which reads as one id per
+    feature and gives a caller counting instances a plausible-but-wrong number.
+    Interior rings are ignored: only ring 0 of each part is drawn, so a hole is
+    filled with the outer id rather than cut out.
 
     COORDINATES ARE IMAGE PIXELS ``(x, y)`` WITH THE ORIGIN AT THE TOP-LEFT AND
     ``y`` INCREASING DOWNWARD -- the raster convention. That is not a choice made

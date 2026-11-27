@@ -199,7 +199,11 @@ launch instead of OOMing mid-train.
   `.geojson` FeatureCollection of polygons (rasterized to instances). Polygon
   coordinates are **image pixels in `(x, y)` order, origin at the top-left pixel
   and y increasing downward** — the raster convention, not y-up. One instance per
-  `Polygon`/`MultiPolygon` feature, numbered from 1 in document order. A
+  polygon **ring**, numbered from 1 in document order: a `Polygon` is one
+  instance, and **each part of a `MultiPolygon` is its own**, so the instance
+  count is per ring and not per feature. Interior rings (holes) are ignored — a
+  ring drawn inside a polygon is filled with the outer polygon's id, not cut out
+  of it. A
   FeatureCollection that carries polygons but rasterizes to nothing is rejected
   rather than trained on; a **y-up** one is not, because it rasterizes mirrored
   with every polygon still inside the image, so nothing raises and the run trains
