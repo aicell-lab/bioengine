@@ -1,9 +1,9 @@
-"""#0982 branch A: a MIRRORED generalist loads through micro-sam's registry.
+"""A MIRRORED generalist loads through micro-sam's registry.
 
 WHAT THE ROW IS ABOUT. Generalist annotation -- no fine-tuned checkpoint --
 fetched its weights from the bioimage.io zoo over a host this deployment cannot
 reach, with `known_hash=None` on both files. The training path already resolves
-base weights through micro-sam's registry, which #0961 seeds from a verified
+base weights through micro-sam's registry, which is seeded from a verified
 mirror and fences with a pinned sha256. Branch A puts the generalist on that
 same path.
 

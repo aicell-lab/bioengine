@@ -1,9 +1,4 @@
-"""#0904 clause 3, at the code level: a run on ONE replica's disk is listed by ANOTHER.
-
-STAGED, NOT COMMITTED. Round 7 is in flight at `c5656b82` and moving a head
-under a reviewer is a mistake this lane has already made once. This file lives
-outside the branch until that round returns; it is run against the branch from
-here.
+"""At the code level: a run on ONE replica's disk is listed by ANOTHER.
 
 WHAT IT COVERS, AND WHY NOTHING ELSE DOES. The clauses say two replicas must
 list the SAME runs, and that a run started on either appears in both. Every
