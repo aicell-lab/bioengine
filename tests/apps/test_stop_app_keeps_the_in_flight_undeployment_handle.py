@@ -212,35 +212,104 @@ async def test_the_second_stop_is_still_a_no_op_and_leaves_one_teardown() -> Non
     )
 
 
-@pytest.mark.asyncio
-async def test_a_stop_after_the_first_teardown_finished_may_store_a_fresh_handle() -> (
-    None
-):
-    """The fix must key on IN-FLIGHT, not on the key being present.
+class _FailThenBlockCluster(_ClusterStub):
+    """First delete RAISES; the second blocks until released.
 
-    Guards the lazy implementation that never overwrites once a handle exists: a later,
-    unrelated stop of an application whose previous teardown has completed is entitled to
-    store its own handle. GREEN today.
+    The raise is what puts the application on the delete-failed path, and that path is the
+    only one that leaves the entry TRACKED with a COMPLETED handle in it:
+    ``_undeploy_application`` sets ``auto_redeploy = False``, pops ``stopping``, puts
+    ``application_info`` back into ``_deployed_applications``, logs ``... FAILED`` and
+    returns. Its own log says the application is kept so it can be stopped again — so the
+    retry is a real, expected call, and it is the ``done()`` branch of the fix.
     """
-    mgr, cluster, first = await _first_stop_in_flight()
-    await _drain(mgr, cluster, first)
+
+    def __init__(self, present_after_delete):
+        super().__init__(present_after_delete)
+        self.second_delete_reached = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.delete_attempts = 0
+
+    async def check_connection(self):
+        return None
+
+    async def call_with_reconnect(self, fn, *args):
+        if getattr(fn, "__name__", "") == "delete":
+            self.delete_attempts += 1
+            if self.delete_attempts == 1:
+                raise RuntimeError(
+                    "serve.delete failed (arm: first teardown must FAIL)"
+                )
+            self.second_delete_reached.set()
+            await self.release_second.wait()
+        return await super().call_with_reconnect(fn, *args)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_after_a_FAILED_teardown_stores_the_new_handle() -> None:
+    """The fix must key on IN-FLIGHT, and this is the branch that pins ``done()``.
+
+    Round 1 of this change was REFUSED because the arm that used to sit here did not pin
+    anything: its first teardown SUCCEEDED, so the entry was popped and the arm then put a
+    fresh dict back with no ``undeployment_task`` at all. It therefore exercised only the
+    ``in_flight is None`` branch, and the reviewer MEASURED that the lazy mutant
+    ``if in_flight is None:`` passed all four arms and the whole orphan file, 31/31.
+
+    This arm reaches the other branch by failing the first delete, which is the path that
+    keeps the entry tracked with the completed first task still stored in it. A second stop
+    must then store ITS task, or a caller awaiting the handle is told the retry finished
+    before it started.
+    """
+    cluster = _FailThenBlockCluster(present_after_delete=[[APP], []])
+    mgr = _StopStub(cluster, _Logger())
+
+    await _stop_app()(mgr, application_id=APP, context=CTX)
+    first = mgr._deployed_applications[APP].get("undeployment_task")
+    assert first is not None, "stop_app stored no handle for the first teardown"
+    await asyncio.wait_for(asyncio.shield(first), timeout=5)
+
+    # The premise of this arm, asserted rather than assumed: the failed teardown left the
+    # entry TRACKED, holding a COMPLETED handle. Without this the arm proves nothing.
+    assert APP in mgr._deployed_applications, (
+        "the failed teardown dropped the application from tracking, so this arm never "
+        "reaches the done() branch it exists to pin"
+    )
     assert (
         first.done()
-    ), "teardown 1 did not finish, so this arm cannot test the settled case"
-
-    # The app may have been dropped from tracking by the completed teardown; re-add it so the
-    # second stop has something to stop. This is the "deployed again later" shape.
-    mgr._deployed_applications.setdefault(APP, {"auto_redeploy": True})
-    mgr._deployed_applications[APP].pop("stopping", None)
-    cluster.blocked_once = True  # do not block this one
-    cluster.release.set()
+    ), "the first teardown has not finished, so the handle is not settled"
+    assert mgr._deployed_applications[APP].get("undeployment_task") is first, (
+        "the completed first task is not the stored handle, so this arm is not testing "
+        "a stale handle"
+    )
+    assert cluster.delete_attempts == 1, "the first delete did not run exactly once"
 
     await _stop_app()(mgr, application_id=APP, context=CTX)
     stored = mgr._deployed_applications[APP].get("undeployment_task")
+
     try:
-        assert stored is not None and stored is not first, (
-            "a stop issued after the previous teardown completed must be able to store its "
-            "own handle, otherwise the handle goes stale for ever"
+        assert stored is not first, (
+            "a stop retried after a FAILED teardown left the completed first task as the "
+            "stored handle; awaiting it reports a teardown that has not been attempted"
+        )
+        # The harm, on this branch too: the retry is blocked in its delete, so awaiting the
+        # stored handle must not come back.
+        await asyncio.wait_for(cluster.second_delete_reached.wait(), timeout=5)
+        finished_early = True
+        try:
+            await asyncio.wait_for(asyncio.shield(stored), timeout=1.0)
+        except asyncio.TimeoutError:
+            finished_early = False
+        assert not finished_early, (
+            "awaiting the stored handle returned while the retry was still blocked in its "
+            "delete"
         )
     finally:
-        await _drain(mgr, cluster, stored)
+        # Only release_second exists here: this cluster extends _ClusterStub, not
+        # _BlockingCluster, so it has no `release`. (It had one in the first draft and the
+        # arm died in its own cleanup, after the assertions had already passed.)
+        cluster.release_second.set()
+        for t in (first, stored):
+            if t is not None:
+                try:
+                    await asyncio.wait_for(t, timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError):
+                    pass
