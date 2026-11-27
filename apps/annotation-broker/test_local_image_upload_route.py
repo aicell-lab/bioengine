@@ -89,19 +89,32 @@ def _broker(monkeypatch, *, manifest=None, listing=None):
 
     class _Am:
         async def list_files(self, _a, dir_path=None, stage=True, limit=None, offset=0):
-            """The paginated surface the marker read uses.
+            """The paginated surface BOTH the marker read and the image read use.
 
-            Present because the finish now FAILS CLOSED on a listing it could
-            not read in full, and an `_Am` without this method made every finish
+            Present because the finish FAILS CLOSED on a listing it could not
+            read in full, and an `_Am` without this method made every finish
             refuse through an AttributeError -- which is the fail-closed working,
             but against a double rather than against the case it is for.
+
+            It serves ``images`` as well, and leaving that out was a real trap
+            rather than an omission: it answered ``[]`` for every directory but
+            the marker one, so once the route's image reads were paged this
+            double said the dataset had no images at all. Tests then failed on
+            `already: False` and on a size that could not be read -- both of
+            them the route behaving correctly about a listing the DOUBLE had
+            emptied. `state["listing"]` is the one source for images here, the
+            same value `_list_files_safe` above returns, so the two surfaces
+            cannot disagree.
             """
-            rows = state["listing"] if dir_path == core.UPLOAD_MARKER_DIR else []
             if dir_path == core.UPLOAD_MARKER_DIR:
                 rows = [
                     {"name": n.split("/")[-1], "type": "file"}
                     for n in sorted(state["markers"])
                 ]
+            elif dir_path == "images":
+                rows = list(state["listing"])
+            else:
+                rows = []
             start = int(offset or 0)
             size = int(limit) if limit else len(rows)
             return rows[start : start + size]

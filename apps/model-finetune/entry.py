@@ -75,6 +75,26 @@ SERVER_URL = "https://hypha.aicell.io"
 # as UNHEALTHY by this check rather than timing the check itself out. Matches
 # annotation-broker's `_HEALTH_CALL_TIMEOUT_S`, which guards the same shape.
 _HEALTH_CALL_TIMEOUT_S = 15.0
+
+# How long `get_training_capabilities` waits for a backend's store verdict, and
+# how long it then stops asking a backend that did not answer.
+#
+# BOTH NUMBERS EXIST BECAUSE THIS METHOD IS POLLED BY THE ANNOTATE PAGE, and a
+# review measured what the first version cost: with VRAM declared, both backends
+# enabled and one runtime whose `ping` hangs, the call took 10.01 s and returned
+# no verdict anyway. Two faults, fixed separately. The views are now gathered
+# concurrently, so the worst case is ONE timeout rather than one per backend;
+# and the timeout is 2 s, matching the readiness probe, because `ping` reports a
+# cached verdict and does no I/O, so a runtime that is up answers in
+# milliseconds and 5 s only lengthened the wait for one that is not.
+#
+# The negative window is the other half. A cluster with fewer GPUs than enabled
+# backends leaves a backend UPSCALING indefinitely -- that is the permanent
+# state this method's own docstring describes, not a blip -- so retrying it on
+# every poll would pay the timeout forever. 30 s is short enough that a runtime
+# coming up is reflected within one or two polls.
+_STORE_VIEW_PING_TIMEOUT_S = 2.0
+_STORE_VIEW_UNREACHABLE_FOR_S = 30.0
 SUPPORTED_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg"]
 UPLOAD_FILE_TYPES = Literal[".npy", ".png", ".tiff", ".tif", ".jpeg", ".jpg", ".npz"]
 ModelType = Literal[
@@ -99,6 +119,18 @@ CELLPOSE_MODEL_TYPES = ("cpsam", "cpdino", "cpdino-vitb")
 # (bioengine/apps/builder.py), so the app's GPU floor is simply how many of
 # these are on. Named here because _gpu_placement_report has to count them.
 GPU_BACKENDS = ("microsam", "cellpose")
+
+# How long the whole base-checkpoint preflight may take, across all of a model
+# type's parts. Bounded because it sits on the admission path: a preflight that
+# could hang would be a worse version of the late failure it prevents.
+BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S = 12.0
+
+# The fallback's own budget, and it is a DOWNLOAD budget rather than a probe
+# one. The largest mirrored encoder is ~375 MB; the probe's 12 s is sized for a
+# HEAD, so reusing it would turn every fallback into a timeout and the feature
+# would look broken rather than slow. Reached only when the probe already
+# refused, so a site that can reach upstream never waits on this.
+BASE_CHECKPOINT_MIRROR_TIMEOUT_S = 900.0
 
 
 def _gpu_placement_report(enabled: Iterable[str]) -> Dict[str, Any]:
@@ -546,6 +578,29 @@ class EntryApp:
         # to max_replicas=1 (see the deployment decorator) — every aggregate lands in this
         # process. Raising max_replicas voids it and needs a pool-side lease instead.
         self._pool_locks: Dict[str, asyncio.Lock] = {}
+        # When each backend's `ping` last failed to answer, so the POLLED
+        # capabilities method stops asking a runtime that is not there. An
+        # under-GPU'd cluster leaves a backend UPSCALING permanently, and that
+        # is not a transient: without this, every poll pays the full timeout
+        # forever. Per-instance rather than class-level, so two replicas cannot
+        # share one another's negative verdict.
+        self._store_view_unreachable_at: Dict[str, float] = {}
+
+        # session_id -> the JSON this instance last pushed to the shared run
+        # record. Only used to skip an unchanged write; it is NOT a claim about
+        # what the artifact holds, since another instance may have written the
+        # same path since. Starting empty after a restart therefore costs one
+        # re-push per run and cannot lose anything.
+        self._runs_pushed: Dict[str, str] = {}
+        self._runs_sync_task: Optional[asyncio.Task] = None
+        # The shared history as last read. None means "never read": distinct
+        # from {} so the first listing refreshes rather than reporting an empty
+        # shared history it never asked for.
+        self._runs_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        # file name -> (size, last_modified) as the artifact last reported, so
+        # a refresh downloads only what changed.
+        self._runs_meta: Dict[str, Any] = {}
+        self._runs_cache_at: float = 0.0
 
     @bioengine.async_init
     async def _connect(self) -> None:
@@ -576,6 +631,10 @@ class EntryApp:
         )
         self._http = httpx.AsyncClient(timeout=60.0)
         self._busy.start()
+        # Started here rather than in __init__ because it needs the connection
+        # and the HTTP client this method builds. A restart re-runs _connect, so
+        # the loop comes back with the replica.
+        self._runs_sync_task = asyncio.create_task(self._runs_sync_loop())
         logger.info(f"Connected to Hypha server at {SERVER_URL}")
         self._log_gpu_placement()
 
@@ -699,6 +758,180 @@ class EntryApp:
             )
         return self.cellpose_runtime if backend == "cellpose" else self.runtime
 
+    async def _refuse_unavailable_base_checkpoint(self, model_type: str) -> None:
+        """Raise if this site cannot produce *model_type*'s base checkpoint.
+
+        The probe runs on the RUNTIME replica, because that is where micro-sam
+        and its cache live -- `micro-sam` is in requirements-runtime.txt and is
+        not importable in the worker image, so an entry-side check would be
+        measuring the wrong filesystem.
+
+        AN OLDER REPLICA IS DETECTED THROUGH `ping`, NOT THROUGH `getattr`.
+        `BioEngineRuntimeHandle.__getattr__` returns a bound method for ANY
+        public name, so `getattr(runtime, "base_checkpoint_status", None)` is
+        never None and a capability test written that way is dead code: the
+        call would fail at the far end, land in the except below, and refuse
+        EVERY micro-sam run during a rollout. `ping` exists on every version of
+        this runtime, so a payload whose `capabilities` lack the probe
+        identifies an old replica positively, and that skips -- restoring the
+        previous behaviour rather than stopping all training.
+
+        Once a replica HAS advertised the probe, the decision fails closed: a
+        probe error or an unanswerable part refuses, because admitting the run
+        when the check could not answer restores exactly what this removes.
+        """
+        import training
+
+        runtime = self._runtime_for(model_type)
+        try:
+            pong = await asyncio.wait_for(runtime.ping(), timeout=2.0)
+        except Exception as exc:
+            # The runtime was reachable a moment ago via _check_runtime_available;
+            # if its ping now fails, that is a runtime problem and not this
+            # guard's to convert into a training refusal.
+            logger.warning(
+                "could not read runtime capabilities (%s); skipping the "
+                "base-checkpoint preflight for %s",
+                exc,
+                model_type,
+            )
+            return
+        caps = (pong or {}).get("capabilities") or []
+        if "base_checkpoint_status" not in caps:
+            logger.warning(
+                "this runtime does not advertise base_checkpoint_status "
+                "(capabilities=%s); skipping the base-checkpoint preflight for "
+                "%s, so a run with unfetchable weights fails late as before",
+                list(caps),
+                model_type,
+            )
+            return
+
+        try:
+            status = await asyncio.wait_for(
+                runtime.base_checkpoint_status(model_type),
+                timeout=BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            # A TIMEOUT IS AN ANSWER, and it is the one that matters here.
+            # The case this guards against is a host that silently drops
+            # packets, and "could not be checked" is wrong for that -- the
+            # weights are not obtainable here within any budget a caller would
+            # wait for. Reported as unreachable parts so the message says so.
+            status = {
+                "model_type": model_type,
+                "parts": {
+                    "the weights": {
+                        "cached": False,
+                        "reachable": False,
+                        "url": None,
+                        # SAID EXPLICITLY, because the derived sentence would be
+                        # a falsehood: a part with no URL renders as "micro-sam
+                        # publishes no URL for it", which points a reader at the
+                        # registry when what actually happened is that this site
+                        # could not get an answer in time.
+                        "reason": (
+                            "the availability check did not answer within "
+                            f"{BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S:g}s, so the "
+                            "weights are treated as unobtainable here"
+                        ),
+                    },
+                },
+                "probe_error": None,
+            }
+        except Exception as exc:
+            status = {
+                "model_type": model_type,
+                "parts": {},
+                "probe_error": "%s: %s" % (type(exc).__name__, exc),
+            }
+        refusal = training.base_checkpoint_refusal(model_type, status)
+
+        # THE MIRROR FALLBACK, AND IT BELONGS HERE RATHER THAN IN THE PROBE.
+        # The probe is read-only and runs on the admission path for every run;
+        # fetching inside it would make the common case pay for the rare one.
+        # This runs only once the probe's answer is a REFUSAL, so a site that
+        # can reach upstream never reaches this branch at all.
+        #
+        # Gated on the advertised capability, NOT on `getattr`: the runtime
+        # handle returns a bound method for any public name, so a getattr test
+        # is dead code and would call a method an older replica does not have.
+        if refusal and "ensure_base_checkpoint" in caps:
+            try:
+                seeded = await asyncio.wait_for(
+                    runtime.ensure_base_checkpoint(model_type),
+                    # ITS OWN BUDGET, because this one DOWNLOADS. The probe's
+                    # 12 s is sized for a HEAD; the largest mirrored encoder is
+                    # ~375 MB, which no probe timeout would fit, and reusing
+                    # that budget would turn every fallback into a timeout.
+                    timeout=BASE_CHECKPOINT_MIRROR_TIMEOUT_S,
+                )
+            except Exception as exc:
+                # FAILS CLOSED: the refusal computed above still stands, so a
+                # mirror that could not help leaves the run refused with the
+                # original reason rather than admitted. Logged because the
+                # reason the fallback did not help is otherwise invisible --
+                # and a fence rejection arrives here as a plain RPC error, so
+                # this is also where "the mirror served bytes that did not
+                # verify" becomes readable.
+                logger.warning(
+                    "the base-checkpoint mirror fallback did not help for %s "
+                    "(%s: %s); the run stays refused",
+                    model_type,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                if seeded.get("installed"):
+                    logger.warning(
+                        "seeded %d base-checkpoint part(s) for %s from the "
+                        "mirror: %s",
+                        len(seeded["installed"]),
+                        model_type,
+                        ", ".join(
+                            "%s sha256=%s" % (r["name"], r["sha256"])
+                            for r in seeded["installed"]
+                        ),
+                    )
+                # RE-PROBE WHENEVER THE FALLBACK RETURNED CLEANLY, not only
+                # when it installed something.
+                #
+                # A review caught this: `ensure_base_checkpoint` legitimately
+                # returns `installed: []` with no error when the state changed
+                # under the probe -- the file arrived between the probe and the
+                # fetch (which is the race the disk re-check NARROWS -- it does
+                # not close it; see runtime.py's own note), or its own
+                # re-probe found the part cached or upstream reachable after all.
+                # Keying the re-probe on `installed` kept the STALE refusal in
+                # exactly those cases, so a run whose weights ARE cached was
+                # refused with the message "not cached here and not reachable
+                # from here". The fallback having nothing to do is the GOOD
+                # outcome, and it was the one treated as failure.
+                #
+                # RE-PROBE rather than trusting the seeding result either way.
+                # The question is what the CACHE now holds, and the only
+                # authority on that is the same probe that refused -- this is
+                # the artifact-versus-our-own-account distinction, on a
+                # filesystem instead of an artifact.
+                if seeded.get("error") is None:
+                    try:
+                        status = await asyncio.wait_for(
+                            runtime.base_checkpoint_status(model_type),
+                            timeout=BASE_CHECKPOINT_PREFLIGHT_TIMEOUT_S,
+                        )
+                        refusal = training.base_checkpoint_refusal(model_type, status)
+                    except Exception as exc:
+                        logger.warning(
+                            "could not re-check the base checkpoint for %s "
+                            "after seeding (%s: %s); the run stays refused",
+                            model_type,
+                            type(exc).__name__,
+                            exc,
+                        )
+
+        if refusal:
+            raise ValueError(refusal)
+
     async def _check_runtime_available(self, model_type: Optional[str] = None) -> None:
         runtime = self._runtime_for(model_type)
         try:
@@ -708,6 +941,123 @@ class EntryApp:
                 "GPU runtime is not available yet — inference, embedding, ONNX "
                 "export, and training are unavailable until it starts."
             ) from e
+
+    async def _runtime_store(self, model_type: Optional[str] = None) -> Dict[str, Any]:
+        """The store verdict of the RUNTIME that would serve *model_type*.
+
+        Asked of the runtime rather than computed here, and that distinction is
+        the whole point: a runtime replica has its own HOME, so the entry's own
+        store says nothing about the one training writes. #0931 measured a
+        replica writing the share while another in the same image could not
+        write anything, because the redirect pointing HOME at the share had not
+        run in that process.
+
+        An unreachable runtime yields `{}` rather than a verdict: "I could not
+        ask" must not read as "the store is fine", and it must not read as
+        "the store is broken" either -- the caller distinguishes them.
+        """
+        try:
+            # Inside the try, deliberately: `_runtime_for` itself raises when a
+            # backend is not deployed, and a half-constructed instance has no
+            # runtime handle at all. Neither is a store verdict, and neither
+            # may turn this diagnostic into the thing that breaks the call.
+            runtime = self._runtime_for(model_type)
+            return await asyncio.wait_for(runtime.store_status(), timeout=30.0)
+        except Exception as exc:
+            logger.warning(
+                f"could not read the runtime's store status: "
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            return {}
+
+    def _store_view_failures(self) -> Dict[str, float]:
+        """When each backend's store `ping` last failed, created on first use.
+
+        Reached through an accessor rather than read off the attribute directly
+        because this is a CACHE, "no failures recorded yet" is the right answer
+        for an instance that has no history, and several call sites build this
+        class without running `__init__`. Crashing one of them with an
+        AttributeError would turn a missing optimisation into a broken status
+        method -- which it did, once, before this accessor existed.
+        """
+        failures = getattr(self, "_store_view_unreachable_at", None)
+        if failures is None:
+            failures = {}
+            self._store_view_unreachable_at = failures
+        return failures
+
+    async def _backend_store_view(self, backend: str) -> Dict[str, Any]:
+        """A backend's store verdict for the STATUS surface, from the cache.
+
+        Read through `ping`, which reports the runtime's cached verdict and
+        never probes -- so this cannot write a file and cannot hang on a wedged
+        mount, which matters because `get_training_capabilities` is what the
+        annotate page polls. `store_status` would be the fresher answer and is
+        deliberately NOT used here for that reason; the refusal path uses it,
+        where one probe per training request is affordable.
+
+        `{}` means "could not ask", which is a third answer and is reported as
+        `writable: None` rather than collapsed into either verdict.
+
+        BOUNDED, AND IT STOPS ASKING A BACKEND THAT IS NOT THERE. See
+        `_STORE_VIEW_PING_TIMEOUT_S` for the measurement that forced both: the
+        caller is polled, and a backend left UPSCALING by an under-GPU'd cluster
+        never answers, so an unconditional ping per poll is an unbounded cost
+        for an answer that will not arrive. A backend that failed is skipped for
+        `_STORE_VIEW_UNREACHABLE_FOR_S` and reports the same `{}` it would have
+        reported after waiting -- the ANSWER is unchanged, only the waiting is.
+        """
+        failures = self._store_view_failures()
+        last_failed = failures.get(backend)
+        if (
+            last_failed is not None
+            and (time.time() - last_failed) < _STORE_VIEW_UNREACHABLE_FOR_S
+        ):
+            return {}
+        probe = "cpsam" if backend == "cellpose" else None
+        try:
+            runtime = self._runtime_for(probe)
+            out = await asyncio.wait_for(
+                runtime.ping(), timeout=_STORE_VIEW_PING_TIMEOUT_S
+            )
+        except Exception as exc:
+            failures[backend] = time.time()
+            logger.warning(
+                f"could not read the {backend} runtime's store verdict: "
+                f"{type(exc).__name__}: {str(exc)[:120]}. Not asking it again "
+                f"for {_STORE_VIEW_UNREACHABLE_FOR_S:.0f}s."
+            )
+            return {}
+        # Cleared on success, so a runtime that comes back is asked again
+        # without waiting out the window.
+        failures.pop(backend, None)
+        store = (out or {}).get("store")
+        return store if isinstance(store, dict) else {}
+
+    async def _require_runtime_store_writable(
+        self, model_type: Optional[str] = None
+    ) -> None:
+        """Refuse a training request up front if the runtime cannot write.
+
+        Before this, such a run was ACCEPTED, queued, handed to the runtime,
+        and died at the runtime's first status write -- leaving the user a Ray
+        traceback as the reason and the run FAILED. Refusing at the door costs
+        one cached probe and says which store and why.
+
+        An unreadable verdict does NOT refuse: `_check_runtime_available` has
+        already established that the runtime answers, so a missing verdict here
+        is this check's own failure, and taking the app's training offline
+        because a status call timed out would be a worse trade than letting the
+        run proceed and fail at its write, which is the behaviour today.
+        """
+        report = await self._runtime_store(model_type)
+        if report.get("writable") is False:
+            raise RuntimeError(
+                "Training is unavailable on this worker: "
+                + str(report.get("detail") or "the runtime cannot write its run store")
+                + " No run was started. This is a worker-side fault rather "
+                "than a problem with the request."
+            )
 
     async def _runtime_gpu_memory(
         self, model_type: Optional[str] = None
@@ -1486,6 +1836,445 @@ class EntryApp:
         finally:
             preparing_hb.cancel()
             self._training_tasks.pop(session_id, None)
+            # NOTHING is shared from here, deliberately. The terminal state is
+            # what a run history is most often asked about, so pushing it
+            # immediately is tempting -- but this `finally` also runs while a
+            # replica is being torn down, with a CancelledError in flight
+            # (`_prepare_training_data` raising CancelledError is a tested
+            # case). Awaiting a network call there either delays the
+            # cancellation or swallows it, and an export that reported a user
+            # stop it never received is a bug this app has already had. The
+            # record is on disk; the sync loop shares it within one poll, and
+            # after a restart it is re-read from disk and shared then.
+
+    # ------------------------------------------------------------------
+    # The shared run record
+    #
+    # Run history is a property of the PROJECT, not of one worker's filesystem.
+    # While each instance answers from its own disk, two instances of the app
+    # answer differently: measured on one worker as one administrator, the
+    # production instance listed 261 runs, a second instance listed 19, and the
+    # two had NOTHING in common. The records below are the
+    # shared copy that makes the history a property of the project rather than
+    # of whichever instance answered.
+    #
+    # Written with the APP's own credential, to ONE artifact named in
+    # `training.RUNS_ARTIFACT_ID`. Deliberately not a parameter anywhere: a
+    # Hypha token cannot be narrowed below its workspace, so a caller who could
+    # name the artifact could make this app write anything its credential
+    # reaches -- and `commit` on an artifact somebody else is staging publishes
+    # their pending work. The dataset paths in this app keep the opposite rule
+    # (`_pool_service`: a caller token, because the write acts as the caller);
+    # the two rules sit side by side, so which is which is stated rather than
+    # inferred.
+    #
+    # Measured on the live artifact before this was written: `edit(stage=True)`
+    # + `put_file` + `commit()` does NOT add a version -- the version list
+    # stayed at one entry across two commits -- and a second write to the same
+    # path replaces the first. A commit per record is therefore affordable; a
+    # design that added an immutable version per status update would have
+    # reached thousands.
+    # ------------------------------------------------------------------
+
+    #: How often an instance pushes the records whose content has changed.
+    #: Clause 3 of the issue is "within one poll", so this interval IS the
+    #: promise; it is a class attribute so a test can shorten it.
+    RUNS_SYNC_INTERVAL_S = 60.0
+
+    #: How long to wait before the single retry of a share. A class attribute
+    #: so a test can set it to zero: patching `asyncio.sleep` instead is how a
+    #: no-op lambda ends up calling the function it replaced, which recurses.
+    RUNS_RETRY_DELAY_S = 2.0
+
+    #: How stale a cached copy of the shared history may be before a listing
+    #: refreshes it. The sync loop refreshes it unconditionally each pass, so
+    #: this only bounds the gap for a listing that arrives between passes.
+    RUNS_CACHE_TTL_S = 30.0
+
+    #: How many entries to ask the artifact store for per page. A class
+    #: attribute so a test can set it to a handful and exercise the loop with
+    #: tens of records instead of thousands. The server's own default is 1000
+    #: and its ceiling is 10000, so asking for the maximum is not a fix -- it
+    #: is a higher cap, with the same silent truncation one threshold up.
+    RUNS_LIST_PAGE = 1000
+
+    #: How many record uploads (and read-backs) the backfill has in flight at
+    #: once. A class attribute so a test can set it to 1 and get the old
+    #: serial order back, or to a large number to check the bound is what
+    #: limits concurrency rather than luck.
+    #:
+    #: Bounded rather than unbounded on purpose: `asyncio.gather` over 313
+    #: uploads would open 313 connections at once against a shared artifact
+    #: store, which trades a timeout for a different kind of outage.
+    #:
+    #: MEASURED at 8 on a fabricated 320-record store: the apply finished in
+    #: 248 s, well inside the 600 s ceiling, but 30 PUTs reported failure -- and
+    #: 23 of those records WERE in the artifact afterwards while 7 were not. The
+    #: store's verdict is therefore unreliable in both directions under that
+    #: load, so the bound is 4 and the read-back is the only judge.
+    RUNS_MIGRATE_CONCURRENCY = 4
+
+    #: Seconds to wait after the commit before the first read-back. The ruling
+    #: that shaped this asked for "a short settle"; the repair pass covers a
+    #: record that is late rather than absent, but a settle costs one second and
+    #: removes a class of repair work that was never needed. A class attribute so
+    #: a test can set it to 0.
+    RUNS_READBACK_SETTLE_S = 1.0
+
+    # Class-level fallbacks for the cache, so a published method never raises
+    # AttributeError on an instance whose __init__ did not run. That is not a
+    # hypothetical: a half-constructed instance is how the suite exercises a
+    # single method, and it is also what a future refactor of the constructor
+    # would produce.
+    #
+    # Every write to these REPLACES the object and assigns the result to the
+    # INSTANCE; none mutates the shared default. That is a rule to keep rather
+    # than a property of the types: a review found this comment claiming it
+    # while `_persist_run_record` was doing `self._runs_pushed[sid] = ...`,
+    # which writes into the class dict on exactly the instances these
+    # fallbacks exist for, and would share one replica's bookkeeping with
+    # every other.
+    _runs_cache: Optional[Dict[str, Dict[str, Any]]] = None
+    _runs_meta: Dict[str, Any] = {}
+    _runs_cache_at: float = 0.0
+    _runs_pushed: Dict[str, str] = {}
+
+    async def _runs_artifact_manager(self):
+        """The artifact manager on the APP's own connection.
+
+        No caller client, by construction: there is no argument to pass one.
+        An earlier draft of this took `context["client"]` so the write could
+        carry the caller's identity, and measured on that branch the framework
+        never injected a context at all -- the method was declared without
+        `context=True`, so the fence read as present and was absent, while
+        `context` became a *published* parameter a caller could supply.
+        """
+        return await self._hypha.get_service("public/artifact-manager")
+
+    async def _persist_run_record(
+        self,
+        session_id: str,
+        status: Optional[Dict[str, Any]] = None,
+        *,
+        log_failure: bool = False,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Share one run's record. True if it landed.
+
+        Returns rather than raises, because every caller is doing something
+        else that must not fail with it: a finished run, or a poll that will
+        come round again.
+
+        `record` SUPPLIES THE DOCUMENT INSTEAD OF BUILDING ONE, and exists so a
+        caller can hash the exact bytes that will be written. Rebuilding the
+        record here would re-read the run, and a document built twice is not
+        necessarily the same document twice: a run that moved on, or merely an
+        `elapsed_s` derived from the clock, makes the second build differ from
+        the first. A caller that hashed the first and then wrote the second
+        would be attesting to bytes that never existed.
+
+        A commit can legitimately lose a race -- two instances can hold
+        `stage=True` on one artifact, and the first commit clears the single
+        artifact-level flag, so the second can find nothing staged. The bytes
+        are already uploaded at that point and the other commit may well have
+        published them, so one retry is attempted and then it is left to the
+        next poll.
+        """
+        import json as _json
+        import training
+
+        store = training.record_store_id()
+        if store is None:
+            # Sharing is OFF rather than guessed. See `record_store_id`: a
+            # replica that cannot tell which deployment it is must not write
+            # into another deployment's history.
+            return False
+        for attempt in (1, 2):
+            try:
+                if record is None:
+                    record = training.run_record(session_id, status)
+                path = training.run_record_path(session_id, store)
+                am = await self._runs_artifact_manager()
+                await am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True)
+                url = await am.put_file(training.RUNS_ARTIFACT_ID, file_path=path)
+                resp = await self._http.put(
+                    url, content=_json.dumps(record).encode("utf-8")
+                )
+                resp.raise_for_status()
+                await am.commit(artifact_id=training.RUNS_ARTIFACT_ID)
+                # REPLACED, not mutated: `_runs_pushed` has a class-level
+                # fallback for an instance whose __init__ did not run, and
+                # writing into it there would share one replica's bookkeeping
+                # with every other. A review caught the comment claiming these
+                # are never mutated in place while this line did exactly that.
+                self._runs_pushed = {
+                    **self._runs_pushed,
+                    session_id: _json.dumps(record, sort_keys=True),
+                }
+                return True
+            except training.InvalidSessionId:
+                # Not retryable and not this method's business to repair: the
+                # id never came from this server.
+                logger.warning(
+                    f"refusing to share a record for an id that is not a "
+                    f"session (length {len(str(session_id))})"
+                )
+                return False
+            except Exception as exc:
+                if attempt == 1:
+                    await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
+                    continue
+                if log_failure:
+                    logger.warning(
+                        f"could not share the run record for {session_id}: "
+                        f"{type(exc).__name__}: {str(exc)[:200]}. The run is "
+                        "unaffected; the next sync retries."
+                    )
+                return False
+        return False
+
+    async def _list_run_record_files(self, am, store) -> tuple:
+        """``(entries, complete)`` for a deployment's record directory.
+
+        **A TUPLE, AND THAT IS THE POINT.** `list_files` is paginated: the
+        server's own parameters are ``limit`` defaulting to **1000** with a
+        ceiling of **10000**, plus an ``offset``, and it returns a bare list of
+        ``{name, type, size, last_modified}``. There is nowhere in that answer
+        for a completeness flag to live, so a single call is a PAGE and not a
+        directory, and a caller handed a bare list cannot tell "all of them"
+        from "as many as I could get". Returning a tuple makes a caller that
+        ignores the second element fail loudly instead of quietly reading a
+        subset.
+
+        **The loop stops on an EMPTY page, never a SHORT one.** A page shorter
+        than the limit asked for is an ordinary answer -- the server may cap the
+        limit below the ask -- so treating "shorter than requested" as "that is
+        all of them" reintroduces the incomplete read one layer down.
+
+        **Progress is measured by NEW NAMES, not by page length.** A server that
+        ignored ``offset`` would serve page one forever; that terminates the
+        loop with ``complete=False`` and a warning rather than spinning. The
+        check counts names not seen before across ALL entries, including
+        directories and non-record files, because a page made entirely of those
+        is progress even though it contributes no records.
+
+        Deliberately NOT bounded by an arbitrary maximum: a cap here would be
+        the very defect this removes. The directory holds one small document per
+        run.
+        """
+        import training
+
+        dir_path = training.run_record_dir(store)
+        entries: Dict[str, tuple] = {}
+        seen: set = set()
+        offset = 0
+        while True:
+            page = await am.list_files(
+                artifact_id=training.RUNS_ARTIFACT_ID,
+                dir_path=dir_path,
+                limit=self.RUNS_LIST_PAGE,
+                offset=offset,
+            )
+            page = page or []
+            if not page:
+                return entries, True
+            fresh = 0
+            for e in page:
+                if not isinstance(e, dict):
+                    continue
+                name = e.get("name")
+                if not isinstance(name, str):
+                    continue
+                if name not in seen:
+                    seen.add(name)
+                    fresh += 1
+                if e.get("type") == "directory" or not name.endswith(".json"):
+                    continue
+                entries[name] = (e.get("size"), e.get("last_modified"))
+            if not fresh:
+                logger.warning(
+                    f"the run record listing stopped making progress at offset "
+                    f"{offset} ({len(seen)} name(s) seen); the store may be "
+                    "ignoring `offset`, so this listing is NOT known to be "
+                    "complete"
+                )
+                return entries, False
+            offset += len(page)
+
+    async def _read_run_records(
+        self, *, max_age_s: Optional[float] = None
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Every shared record for THIS deployment, keyed by session id.
+
+        None and `{}` are different answers and the caller treats them
+        differently: `{}` is "the shared history is empty", None is "the shared
+        history could not be read", and only the second one is a reason to say
+        so in the log while still answering from local disk.
+
+        CACHED, AND THE CACHE IS WHY THIS IS NOT A PAGE-POLL PROBLEM. The first
+        version re-fetched every record on every `list_training_sessions`: one
+        `get_file` RPC plus one HTTP GET per run, serially, which a review put
+        at about 520 round trips per poll at the 261 runs production already
+        holds. The listing now serves a cached copy, refreshed at most once per
+        `max_age_s`, and a refresh only downloads the records whose `size` or
+        `last_modified` changed -- both of which the artifact listing returns
+        (measured on the live artifact: `{"type": "file", "name": ...,
+        "size": 41, "last_modified": 1795649029.585}`). A steady-state refresh
+        is therefore ONE `list_files` call.
+
+        The change test is size-and-mtime, which cannot see a rewrite that
+        preserved both. Every write here goes through `put_file`, which sets a
+        fresh mtime, so the case needs two writes inside one mtime tick with an
+        identical length; the next changed write repairs it, and the
+        alternative -- re-downloading everything every time -- is the cost this
+        exists to avoid.
+
+        A record that will not parse is COUNTED and skipped rather than
+        dropping the whole read: one bad file must not empty a run history.
+        """
+        import json as _json
+        import training
+
+        if max_age_s is None:
+            max_age_s = self.RUNS_CACHE_TTL_S
+        now = time.time()
+        if self._runs_cache is not None and (now - self._runs_cache_at) <= max_age_s:
+            return self._runs_cache
+
+        store = training.record_store_id()
+        if store is None:
+            logger.warning(
+                f"{training.APPLICATION_ID_ENV} is not set on this replica, so it "
+                "cannot tell which deployment's run history is its own; the "
+                "listing answers from this instance's own disk only"
+            )
+            return None
+
+        try:
+            am = await self._runs_artifact_manager()
+            entries, listing_complete = await self._list_run_record_files(am, store)
+        except Exception as exc:
+            logger.warning(
+                f"the shared run history could not be listed "
+                f"({type(exc).__name__}: {str(exc)[:160]}); answering from this "
+                "instance's own disk only, which is incomplete"
+            )
+            return None
+
+        cached = dict(self._runs_cache or {})
+        meta = dict(self._runs_meta)
+        # A record removed from the artifact leaves the cache with it, so a
+        # deleted run does not live on in this replica's answer.
+        #
+        # ONLY WHEN THE LISTING IS KNOWN WHOLE. Absence from an INCOMPLETE
+        # listing is not evidence of deletion, and this is the sharper half of
+        # the paging defect: a truncated page would not merely shorten the
+        # answer, it would evict every already-known run that fell past the
+        # page and drop it from the history this replica serves. Keeping the
+        # cache is the safe direction -- a run that really was deleted lingers
+        # until a listing that can be trusted says so.
+        if listing_complete:
+            for gone in set(meta) - set(entries):
+                meta.pop(gone, None)
+                cached.pop(gone[: -len(".json")], None)
+        else:
+            logger.warning(
+                "the shared run history listing could not be proven complete, "
+                "so no record is being evicted from the cache; the answer may "
+                "omit runs this replica has never seen"
+            )
+
+        unreadable = fetched = 0
+        for name, stamp in entries.items():
+            session_id = name[: -len(".json")]
+            if meta.get(name) == stamp and session_id in cached:
+                continue
+            try:
+                url = await am.get_file(
+                    artifact_id=training.RUNS_ARTIFACT_ID,
+                    file_path=f"{training.run_record_dir(store)}/{name}",
+                )
+                resp = await self._http.get(url)
+                resp.raise_for_status()
+                record = _json.loads(resp.text)
+                key = (record or {}).get("session_id") or session_id
+                cached[key] = record
+                meta[name] = stamp
+                fetched += 1
+            except Exception:
+                unreadable += 1
+        if unreadable:
+            logger.warning(
+                f"{unreadable} shared run record(s) could not be read; the rest "
+                f"({len(cached)}) are listed"
+            )
+        self._runs_cache = cached
+        self._runs_meta = meta
+        self._runs_cache_at = now
+        if fetched:
+            logger.info(
+                f"shared run history: {len(cached)} record(s), {fetched} refreshed"
+            )
+        return cached
+
+    async def _sync_run_records(self) -> Dict[str, int]:
+        """Push the records whose content has changed since the last push.
+
+        Content-addressed rather than time-addressed: a record is pushed when
+        its JSON differs from what this instance last pushed. A poll that
+        re-pushed everything would rewrite 261 files a minute, and one that
+        pushed only on a status TRANSITION would miss a per-epoch metric, which
+        is most of what a run history is for.
+        """
+        import json as _json
+        import training
+
+        pushed = skipped = failed = 0
+        root = training.sessions_root()
+        for d in sorted(root.iterdir()) if root.exists() else []:
+            if not (d.is_dir() and (d / "status.json").exists()):
+                continue
+            if not training.SESSION_ID_PATTERN.match(d.name):
+                continue
+            try:
+                record = training.run_record(d.name)
+            except Exception:
+                failed += 1
+                continue
+            digest = _json.dumps(record, sort_keys=True)
+            if self._runs_pushed.get(d.name) == digest:
+                skipped += 1
+                continue
+            if await self._persist_run_record(d.name):
+                pushed += 1
+            else:
+                failed += 1
+        return {"pushed": pushed, "unchanged": skipped, "failed": failed}
+
+    async def _runs_sync_loop(self) -> None:
+        """The poll clause 3 is measured against.
+
+        Deliberately never raises out: a loop that dies takes the shared
+        history with it silently, and the instance would keep serving its own
+        disk as if that were the whole story.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.RUNS_SYNC_INTERVAL_S)
+                counts = await self._sync_run_records()
+                # Pull as well as push, so a run started on another replica is
+                # in this one's cache within a poll of being shared -- the
+                # clause this interval is measured against.
+                await self._read_run_records(max_age_s=0)
+                if counts["pushed"] or counts["failed"]:
+                    logger.info(f"shared run records: {counts}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"a run-record sync pass failed ({type(exc).__name__}: "
+                    f"{str(exc)[:160]}); the next pass retries"
+                )
 
     @bioengine.method
     async def get_training_capabilities(self) -> Dict[str, Any]:
@@ -1508,21 +2297,45 @@ class EntryApp:
         ``UPSCALING``, which never times out."""
         import training
 
-        microsam = (
-            await self._gpu_view("microsam")
-            if "microsam" in self._enabled_backends
-            else {}
+        # THE RUN STORE, per backend. A runtime replica has its own HOME, so a
+        # backend can have a perfectly good GPU and still be unable to write a
+        # single run record -- which is what happened in production while this
+        # method answered `trainable: True, reason: "fits"`. A review called
+        # that the status half of this row's clause 1, and it was right: the
+        # refusal at `start_training` tells a user who has already committed to
+        # a run, while the page reads THIS.
+        #
+        # EVERY VIEW IS GATHERED CONCURRENTLY, and the first version of this
+        # awaited them one after another. A review measured what that cost: with
+        # VRAM declared, both backends enabled and one runtime whose `ping`
+        # hangs, the call took 10.01 s and still returned no store verdict. The
+        # declared path exists precisely to answer CPU-side without waking a
+        # GPU, and serialising four awaits turned the page's poll into the sum
+        # of every timeout. Concurrently the worst case is the LONGEST one, not
+        # the sum -- and with VRAM declared the GPU views cost nothing at all,
+        # so what is left is a single bounded store probe.
+        enabled = [b for b in ("microsam", "cellpose") if b in self._enabled_backends]
+
+        async def _nothing() -> Dict[str, Any]:
+            return {}
+
+        gpu_order = ("microsam", "cellpose")
+        views = await asyncio.gather(
+            *(
+                self._gpu_view(b) if b in self._enabled_backends else _nothing()
+                for b in gpu_order
+            ),
+            *(self._backend_store_view(b) for b in enabled),
         )
-        cellpose = (
-            await self._gpu_view("cellpose")
-            if "cellpose" in self._enabled_backends
-            else {}
-        )
+        microsam, cellpose = views[0], views[1]
+        stores = dict(zip(enabled, views[len(gpu_order) :]))
+
         models = []
         for m in ModelType.__args__:
             backend = "cellpose" if m in CELLPOSE_MODEL_TYPES else "microsam"
             enabled = backend in self._enabled_backends
             gpu = cellpose if backend == "cellpose" else microsam
+            store = stores.get(backend) or {}
             required = training.min_training_vram_mb(m)
             rec = {
                 "model_type": m,
@@ -1548,6 +2361,15 @@ class EntryApp:
                     False,
                     "no GPU detected on the runtime",
                 )
+            elif store.get("writable") is False:
+                # Before the VRAM comparison on purpose: a replica that cannot
+                # write its run store cannot train whatever its GPU has, and
+                # reporting the VRAM reason would send the user to buy a bigger
+                # card for a read-only filesystem.
+                rec["trainable"] = False
+                rec["reason"] = str(
+                    store.get("detail") or "the runtime cannot write its run store"
+                )
             elif gpu["total_mb"] < required:
                 rec["trainable"] = False
                 rec["reason"] = f"needs ~{required} MB, GPU has {gpu['total_mb']} MB"
@@ -1568,6 +2390,18 @@ class EntryApp:
                 ),
             },
             "models": models,
+            # The per-backend store verdict as DATA, not only folded into a
+            # model's reason string: an operator wants to see which backend
+            # cannot write, and a UI should not have to parse prose for it.
+            # `writable: None` means the runtime could not be asked.
+            "stores": {
+                b: (
+                    stores.get(b) or {"writable": None, "detail": "not reported"}
+                    if b in self._enabled_backends
+                    else {"enabled": False}
+                )
+                for b in ("microsam", "cellpose")
+            },
             "parameters": self._training_parameter_schema(),
             # Why a backend reads 'runtime unavailable' when nothing is broken: on
             # a cluster with fewer GPUs than enabled backends the runtime never
@@ -1823,6 +2657,31 @@ class EntryApp:
             )
 
         await self._check_runtime_available(model_type)
+        # REFUSED AT THE DOOR if the runtime that would serve this cannot write
+        # its run store. Before this, the request was accepted, queued, handed
+        # to the runtime and died at the runtime's first status write -- the
+        # user's reason was a Ray traceback. The verdict is the runtime's own
+        # and is cached there, so this costs no write per request.
+        await self._require_runtime_store_writable(model_type)
+
+        # REFUSE A BASE CHECKPOINT THIS SITE CANNOT PRODUCE, before the GPU
+        # slot. Same reasoning as the fixed-tile check above: without this the
+        # first thing that consults the network about the base weights runs
+        # INSIDE the training worker, after the run has been admitted and the
+        # single GPU slot taken, so the caller waits for a slot and then gets a
+        # download error minutes later.
+        #
+        # Only when the base model would actually be fetched. A caller
+        # supplying their own starting weights -- init_checkpoint, a resume, or
+        # a pool init, all of which have resolved into `init_checkpoint` by
+        # now -- is not waiting on micro-sam's registry, and refusing them
+        # would be refusing a run this site CAN do.
+        #
+        # micro-sam types only: cellpose does not resolve weights through that
+        # registry, and asking the micro-sam runtime about `cpsam` would be
+        # asking the wrong backend.
+        if not init_checkpoint and model_type not in CELLPOSE_MODEL_TYPES:
+            await self._refuse_unavailable_base_checkpoint(model_type)
 
         gpu = await self._runtime_gpu_memory(model_type)
         required = training.min_training_vram_mb(model_type)
@@ -2064,6 +2923,625 @@ class EntryApp:
         return training.get_status(session_id)
 
     @bioengine.method(context=True)
+    async def migrate_run_records(
+        self,
+        apply: bool = Field(
+            False,
+            description=(
+                "Write the records. Omitted or false performs a DRY RUN that "
+                "writes nothing and returns the plan."
+            ),
+        ),
+        confirm: str = Field(
+            "",
+            description=(
+                "Must equal the number of records the dry run planned. Proves "
+                "the caller read the plan rather than passing apply=true."
+            ),
+        ),
+        verify_only: bool = Field(
+            False,
+            description=(
+                "Check whether the records are ALREADY in the shared record and "
+                "write nothing. For a caller whose apply was interrupted and who "
+                "needs to know whether it landed. Note it re-plans from the "
+                "worker's disk AS IT IS NOW, not from the interrupted run's plan, "
+                "so a run that has progressed since will read as mismatched."
+            ),
+        ),
+        context=None,
+    ) -> Dict[str, Any]:
+        """Backfill this worker's on-disk runs into the shared record. ADMIN ONLY.
+
+        DRY RUN BY DEFAULT. `apply` is the only thing that writes, and it
+        refuses unless `confirm` matches the count the dry run reported, so a
+        caller cannot write without having read the plan.
+
+        THE STORE IS ENUMERATED BY THE FILESYSTEM, never by a listing. The
+        per-caller listing returns what the CALLER may see -- measured at 269
+        of 291 on the production store, because a run belonging to somebody
+        else, or to an anonymous identity that no longer exists, is invisible
+        to it by design. A backfill driven by it would silently skip exactly
+        the runs most in need of being preserved, and `before == after` would
+        still pass because both sides would be counting the same subset.
+
+        EQUALITY IS BY ID SET AND CONTENT HASH, not by count. Two sets of the
+        same size are not the same set, and a record that lands with the wrong
+        content is not a record that landed. Both halves are enforced against
+        the ARTIFACT after the write, not against this replica's own account of
+        what it did: the records are listed and downloaded again, and `complete`
+        requires every one of them to hash to what the plan said it would.
+
+        Each record is built ONCE, in the plan, and that same document is what
+        gets written -- so the hash in the plan is a hash of the bytes that were
+        actually uploaded.
+
+        A run that starts between the dry run and the apply changes the count,
+        and the apply then REFUSES because `confirm` no longer matches. That is
+        the safe direction: it costs a second dry run and cannot write a plan
+        the caller has not seen.
+
+        Nothing on disk is written, moved or deleted. The migration only adds
+        documents to the runs artifact.
+        """
+        import hashlib
+        import json as _json
+
+        import training
+
+        if not training.caller_is_workspace_admin(context):
+            raise training.NotTheOwner(
+                "migrating the run history is an administrator action: it reads "
+                "every run on this worker, including runs that belong to other "
+                "callers, and writes them into the shared record"
+            )
+
+        store = training.record_store_id()
+        if not store:
+            # Sharing is OFF for this replica, so it cannot tell which
+            # deployment's history it would be writing into. Refusing is the
+            # only safe answer: a fallback bucket shared by every such replica
+            # is precisely the thing `record_store_id` exists to prevent.
+            raise RuntimeError(
+                "this replica cannot tell which deployment it belongs to, so it "
+                "must not write into any deployment's run history"
+            )
+
+        names, skipped = training.run_names_on_disk()
+        planned, unreadable = [], []
+        for name in names:
+            try:
+                # THE RECORD IS BUILT EXACTLY AS THE WRITER BUILDS IT, and it is
+                # kept so the write below uses this very document. An earlier
+                # version hashed `run_record(name, get_status(...))` -- the
+                # SHAPED status, which adds session_id, checkpoint_available,
+                # config and a clock-derived elapsed_s, and has the stale sweep
+                # applied -- while the write produced the RAW document. The two
+                # disagreed on every run, and on a run that had gone stale they
+                # disagreed on the status itself, so the plan attested to bytes
+                # nobody ever wrote.
+                # STRICT, and this is the one place that must be. The ordinary
+                # reader answers `{}` for a status document that will not
+                # parse, which is right for a listing -- one damaged run must
+                # not take out the poll around it. Here it would copy a corrupt
+                # run into the permanent record as an EMPTY one, replacing that
+                # run's history with nothing and reporting success, and the
+                # `unreadable` refusal below would never fire because nothing
+                # ever raised.
+                document = training.read_status_strict(name)
+                record = training.run_record(name, document)
+                path = training.run_record_path(name, store)
+            except Exception as exc:
+                unreadable.append(
+                    {"id": name, "error": "%s: %s" % (type(exc).__name__, exc)}
+                )
+                continue
+            body = _json.dumps(record).encode("utf-8")
+            planned.append(
+                {
+                    "id": name,
+                    "path": path,
+                    "record": record,
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                    "owner": (record.get("status") or {}).get("owner"),
+                }
+            )
+
+        plan = {
+            "store": store,
+            "on_disk": len(names),
+            "skipped_names": skipped,
+            "unreadable": unreadable,
+            "planned": len(planned),
+            "ids": sorted(p["id"] for p in planned),
+            "hashes": {p["id"]: p["sha256"] for p in planned},
+            "applied": 0,
+            "dry_run": not apply,
+        }
+
+        plan["verify_only"] = bool(verify_only)
+        if verify_only:
+            # READ-ONLY third mode, and the reason it exists: after an apply is
+            # interrupted -- a proxy timeout, a lost connection -- the caller has
+            # no way to learn whether the records landed. The only answer
+            # available was to list and hash the artifact from OUTSIDE the app,
+            # which is exactly the work this operation exists to spare them, and
+            # which is what had to be done once already.
+            #
+            # It runs the SAME read-back the apply runs -- against the artifact,
+            # by id set and content hash -- and writes nothing: no stage, no
+            # upload, no commit. `confirm` is not required, because there is
+            # nothing to confirm.
+            written, failed, put_unknown = [], [], []
+            stage_error = commit_error = None
+        elif not apply:
+            return plan
+        else:
+            if confirm != str(len(planned)):
+                raise ValueError(
+                    f"confirm must be {len(planned)!r} — the number of records this "
+                    f"run plans to write — and it was {confirm!r}. Run without "
+                    f"apply first and read the plan."
+                )
+            if unreadable:
+                raise RuntimeError(
+                    f"{len(unreadable)} run(s) could not be read, so a complete "
+                    f"backfill cannot be claimed; refusing rather than writing a "
+                    f"partial history"
+                )
+
+            # ONE STAGE, MANY UPLOADS, ONE COMMIT.
+            #
+            # This loop used to call `_persist_run_record` per record, and that
+            # helper wraps `edit(stage=True)` ... `commit()` around a SINGLE file.
+            # That is right for its other caller -- one run finishing on its own --
+            # and ruinous here: a 313-record backfill became 313 artifact commits,
+            # about 1565 round trips taken serially, which is what exceeded the
+            # proxy's 600 s ceiling and left this operation with no success path at
+            # production scale. The write itself was never the problem; the number
+            # of round trips was.
+            #
+            # `_persist_run_record` is deliberately NOT changed. The bulk shape
+            # belongs here, where the records are known to be independent of one
+            # another and a single stage/commit pair covers all of them.
+            written, failed, put_unknown = [], [], []
+            am = await self._runs_artifact_manager()
+
+            # NEITHER THE STAGE NOR THE COMMIT MAY RAISE OUT OF HERE.
+            #
+            # The stage flag is ARTIFACT-LEVEL, and another instance's commit clears
+            # it -- `_persist_run_record`'s docstring documents that race, and this
+            # replica's own `_runs_sync_loop` is a concurrent stage/commit writer
+            # every `RUNS_SYNC_INTERVAL_S`. Holding the flag open for the whole
+            # upload phase instead of one file makes that window much wider, so the
+            # race is likelier here, not rarer.
+            #
+            # An exception escaping this method is indistinguishable, from the
+            # caller's side, from "the write did not happen" -- which is the exact
+            # harm this operation exists to avoid, and a regression against the
+            # per-record path, which retried and still returned a report. So both
+            # are retried like that path, their failure is RECORDED, and the
+            # read-back below still runs so the caller gets a report either way.
+            async def _retrying(label: str, op) -> Optional[str]:
+                err = None
+                for attempt in (1, 2):
+                    try:
+                        await op()
+                        return None
+                    except Exception as exc:
+                        err = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+                        if attempt == 1:
+                            await asyncio.sleep(self.RUNS_RETRY_DELAY_S)
+                logger.warning(
+                    f"model-finetune: backfill could not {label} the runs artifact: {err}"
+                )
+                return err
+
+            stage_error = await _retrying(
+                "stage",
+                lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
+            )
+            upload_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+            async def _upload_one(entry: Dict[str, Any]) -> tuple:
+                # The PLANNED record, not a freshly built one, and serialised the
+                # same way the plan hashed it: the plan's sha256 is of exactly
+                # these bytes, so sending anything else would make the plan a
+                # statement about a document that was never uploaded.
+                body = _json.dumps(entry["record"]).encode("utf-8")
+                async with upload_sem:
+                    try:
+                        url = await am.put_file(
+                            training.RUNS_ARTIFACT_ID, file_path=entry["path"]
+                        )
+                        resp = await self._http.put(url, content=body)
+                        resp.raise_for_status()
+                    except Exception as exc:
+                        logger.warning(
+                            f"model-finetune: backfill could not upload the record "
+                            f"for '{entry['id']}': {type(exc).__name__}: {exc}"
+                        )
+                        return entry["id"], False
+                    return entry["id"], True
+
+            if stage_error is None:
+                # gather preserves argument order, so `written`/`failed` are built
+                # deterministically rather than in completion order.
+                # A PUT'S OWN VERDICT IS *UNKNOWN*, NOT AUTHORITATIVE.
+                #
+                # Measured on a 320-record store at concurrency 8: 30 PUTs
+                # raised, and 23 of those records were in the artifact
+                # afterwards while 7 were not. So reading a raised PUT as "this
+                # record is missing" would condemn records that landed, and
+                # reading a returned PUT as "landed" is the very error the
+                # read-back exists to catch. Both outcomes are recorded for the
+                # report and NEITHER decides.
+                for sid, ok in await asyncio.gather(*(_upload_one(i) for i in planned)):
+                    (written if ok else put_unknown).append(sid)
+            else:
+                # The artifact was never staged, so nothing could be uploaded. Every
+                # planned id is a failure, which is the truth and is reported rather
+                # than raised.
+                failed = [p["id"] for p in planned]
+
+            # Committed ONCE, and after every upload has been awaited. A commit
+            # taken while uploads were still in flight would publish a version the
+            # read-back below then compares against an incomplete set.
+            # WHAT THIS RETRY DOES AND DOES NOT COVER, because a review found the
+            # comment claiming more than the code delivers.
+            #
+            # It retries the commit ALONE, so it covers a TRANSIENT commit failure
+            # and nothing else. It cannot win the race named in
+            # `_persist_run_record`'s docstring: there, another writer's commit
+            # clears the ARTIFACT-LEVEL stage flag, and that flag stays cleared
+            # until somebody re-stages -- so a second `commit` fails for exactly
+            # the reason the first did. The per-record path survives that race
+            # because its retry repeats `edit(stage=True)` as well.
+            #
+            # Re-staging here would mean calling `edit(stage=True)` AFTER the
+            # uploads, and whether that preserves or discards a staged upload is
+            # NOT measured -- every other caller stages before uploading, so
+            # nothing in this file establishes it. Doing it on an assumption could
+            # throw away the whole upload phase to save a commit. So the narrow
+            # retry stays, and the behaviour under a cleared flag is: fail closed,
+            # record `commit_error`, and still report (there is an arm for it).
+            commit_error = None
+            if stage_error is None:
+                commit_error = await _retrying(
+                    "commit",
+                    lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+                )
+        plan["applied"] = len(written)
+        plan["failed"] = sorted(failed)
+        plan["stage_error"] = stage_error
+        plan["commit_error"] = commit_error
+
+        # THE ARTIFACT IS READ BACK. `written` only means "our commit returned"
+        # -- it is this replica's account of its own actions, and a backfill
+        # that grades itself on that has not checked anything. What the clause
+        # asks is whether the ARTIFACT holds the records, so the artifact is
+        # asked, and the bytes it serves are hashed and compared to the plan.
+        if not verify_only and stage_error is None:
+            # Short settle before asking what landed. Not load-bearing -- the
+            # repair pass handles a record that is merely late -- but cheap, and
+            # it keeps the repair for records that are actually wrong.
+            await asyncio.sleep(max(0.0, float(self.RUNS_READBACK_SETTLE_S)))
+
+        verified, verify_error = {}, None
+        try:
+            am = await self._runs_artifact_manager()
+            # PAGED, AND THE COMPLETENESS IS CARRIED, NOT INFERRED. A read-back
+            # that stopped at the first page would compare the plan against a
+            # SUBSET of the artifact. That direction happens to fail closed
+            # here -- an unseen id has no hash and lands in `mismatched` -- but
+            # it fails closed while blaming the records, reporting as corrupt a
+            # set of documents that are in fact present and correct. Saying
+            # instead that the READ could not be proven whole is the same
+            # refusal with the true reason attached.
+            listing, listing_complete = await self._list_run_record_files(am, store)
+            if not listing_complete:
+                raise RuntimeError(
+                    "the read-back listing could not be proven complete, so the "
+                    "artifact's contents cannot be compared against the plan"
+                )
+            # Filtered BEFORE fetching, not inside the loop: a record that
+            # belongs to another deployment or to an older run is not part of
+            # this plan and is not evidence either way about it, so there is no
+            # reason to spend a round trip on it.
+            targets = [f for f in listing if f[: -len(".json")] in plan["hashes"]]
+            verify_sem = asyncio.Semaphore(max(1, int(self.RUNS_MIGRATE_CONCURRENCY)))
+
+            async def _fetch_one(fname: str) -> tuple:
+                sid = fname[: -len(".json")]
+                async with verify_sem:
+                    url = await am.get_file(
+                        artifact_id=training.RUNS_ARTIFACT_ID,
+                        file_path=f"{training.run_record_dir(store)}/{fname}",
+                    )
+                    resp = await self._http.get(url)
+                    resp.raise_for_status()
+                    return sid, hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
+
+            # A raising fetch propagates out of gather and is caught by the
+            # handler below, which records it as `verify_error` -- the same
+            # behaviour the serial loop had. It must NOT be swallowed per
+            # record: a read-back that quietly skipped a record would leave its
+            # id absent from `verified`, and the mismatch list would then blame
+            # the record instead of the read.
+            for sid, digest in await asyncio.gather(*(_fetch_one(f) for f in targets)):
+                verified[sid] = digest
+        except Exception as exc:
+            verify_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+
+        plan["verified"] = len(verified)
+        plan["verify_error"] = verify_error
+        plan["mismatched"] = sorted(
+            sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
+        )
+        plan["put_unknown"] = sorted(put_unknown)
+        # Always present, so a caller can read it without knowing whether a
+        # repair pass ran. An absent key and an empty one are indistinguishable
+        # through `.get()`, and a caller that cannot tell them apart will read
+        # "no read failures" out of a report that never looked.
+        plan["reread_errors"] = []
+        plan["reread_error_detail"] = {}
+
+        # REPAIR PASS: re-upload ONLY what the read-back condemns.
+        #
+        # The read-back is the only judge of what landed, so it is also the only
+        # thing that can say what still needs writing. Retrying everything would
+        # re-upload hundreds of records that are already correct -- which is the
+        # cost this whole change exists to remove -- and retrying the PUTs that
+        # raised would retry the wrong set: measured at concurrency 8, 30 raised
+        # and only 7 of those were actually absent, while a PUT that returned
+        # cleanly can still have landed nothing.
+        #
+        # One pass, not a loop: if a record cannot be written twice under a
+        # bound of 4, that is a condition to report rather than to grind at.
+        plan["repaired"] = []
+        if (
+            not verify_only
+            and plan["mismatched"]
+            and stage_error is None
+            and commit_error is None
+            and verify_error is None
+        ):
+            bad = list(plan["mismatched"])
+            by_id = {e["id"]: e for e in planned}
+            retry = [by_id[sid] for sid in bad if sid in by_id]
+            logger.info(
+                f"model-finetune: backfill repairing {len(retry)} record(s) the "
+                f"read-back found missing or mismatched"
+            )
+            repair_error = await _retrying(
+                "re-stage for the repair pass",
+                lambda: am.edit(artifact_id=training.RUNS_ARTIFACT_ID, stage=True),
+            )
+            if repair_error is None:
+                await asyncio.gather(*(_upload_one(e) for e in retry))
+                repair_error = await _retrying(
+                    "commit the repair pass",
+                    lambda: am.commit(artifact_id=training.RUNS_ARTIFACT_ID),
+                )
+            plan["repair_error"] = repair_error
+
+            # RE-READ the repaired ids, because the repair's own PUT verdicts are
+            # no more authoritative than the first pass's were.
+            #
+            # PER ID, and an ABSENT record is "still missing" rather than a read
+            # failure. A review measured the difference: a single `gather` over
+            # every condemned id raised on the first failure and discarded
+            # EVERY digest in the batch -- including those of records the repair
+            # had just landed correctly. With 2 transient and 1 permanent
+            # failure the report read `repaired: []` and condemned all three,
+            # when the truth was two repaired and one unresolved. That is the
+            # same misreport this whole row exists to remove, so it cannot be
+            # allowed to live in the repair's own reporting.
+            #
+            # WHICH IDS ARE ABSENT IS DECIDED BY THE LISTING BELOW, not by a
+            # 404 on the fetch. An earlier version of this comment said a
+            # missing record "404s on its fetch", which stopped being how this
+            # works: a record the listing contains and the fetch then fails on
+            # -- 404 included, since it can only mean the record went away
+            # mid-pass -- is an absence of KNOWLEDGE and goes to
+            # `reread_errors`, not to `mismatched`.
+            #
+            # `repair_error` is reserved for exactly three things, and the code
+            # sets it for exactly those: a failed stage, a failed commit, and a
+            # listing that could not be proven complete -- a read that could not
+            # run AT ALL. Two things it is deliberately NOT used for:
+            #   * an individual record that is not there. That is not an error,
+            #     it is the answer, and it belongs in `mismatched`.
+            #   * an individual record that could not be READ. That is an
+            #     absence of knowledge about one record, not a failure of the
+            #     pass, and it belongs in `reread_errors`.
+            # The earlier wording of this comment claimed the wider "or a read
+            # that could not run", which read as covering a single failed fetch
+            # and did not match what the code did with one.
+            # ABSENCE IS DECIDED BY THE LISTING, NOT BY A FAILING FETCH, which
+            # is how the first read-back already does it. Treating every raised
+            # fetch as "the record is missing" blames the record for the read: a
+            # record the repair DID land, whose re-read then fails on the
+            # connection, was reported in `mismatched`/`failed` while the
+            # artifact held it correctly, and a caller acting on that re-uploads
+            # a record that is already right.
+            #
+            # Deciding it from the listing also keeps this honest across
+            # environments: an absent file surfaces as a different exception type
+            # depending on the HTTP client, so anything that sniffed the
+            # exception would behave differently in a test than in production.
+            # The listing answers the same way everywhere.
+            reread_errors: Dict[str, str] = {}
+            if repair_error is None:
+                # WRAPPED, because this function REPORTS rather than raises.
+                # The per-id gather uses `return_exceptions=True`, so before
+                # this re-listing existed no read failure in the repair could
+                # propagate. Adding an unwrapped await put the caller back to
+                # receiving a traceback and NO report -- the one outcome this
+                # whole operation exists to prevent, and a direct contradiction
+                # of the rule stated further down ("Reported as False rather
+                # than raised: the caller needs a verdict").
+                relist_unusable = None
+                relisting, relisting_complete = [], False
+                try:
+                    relisting, relisting_complete = await self._list_run_record_files(
+                        am, store
+                    )
+                except Exception as exc:
+                    relist_unusable = (
+                        "the repair's re-read listing could not be read: %s: %s"
+                        % (type(exc).__name__, str(exc)[:200])
+                    )
+                if relist_unusable is None and not relisting_complete:
+                    relist_unusable = (
+                        "the repair's re-read listing could not be proven "
+                        "complete, so which records are absent cannot be said"
+                    )
+                if relist_unusable is not None:
+                    # A listing that cannot be proven whole cannot say which
+                    # records are absent, and GUESSING WOULD BLAME THEM -- so
+                    # not one of the condemned ids is reported as mismatched
+                    # here. Every one is unestablished, which is the true
+                    # statement: the repair may well have landed them, and an
+                    # earlier version of this code said exactly that in a
+                    # comment and then blamed them anyway.
+                    repair_error = relist_unusable
+                    plan["repair_error"] = repair_error
+                    for sid in bad:
+                        reread_errors[sid] = relist_unusable
+                else:
+                    present = {f[: -len(".json")] for f in relisting}
+                    missing = [sid for sid in bad if sid not in present]
+                    for sid in missing:
+                        # Left out of `verified`, so the comparison below reports
+                        # it as still mismatched -- which is exactly true.
+                        logger.info(
+                            f"model-finetune: record '{sid}' is still absent "
+                            f"from the artifact after the repair"
+                        )
+                    to_fetch = [sid for sid in bad if sid in present]
+                    results = await asyncio.gather(
+                        *(_fetch_one(f"{sid}.json") for sid in to_fetch),
+                        return_exceptions=True,
+                    )
+                    for sid, outcome in zip(to_fetch, results):
+                        if isinstance(outcome, BaseException):
+                            # The listing said this record IS there, so a failed
+                            # read is an absence of KNOWLEDGE about it, not
+                            # knowledge that it is absent. A 404 here means it
+                            # went away between the listing and the fetch, which
+                            # also cannot be called established.
+                            reread_errors[sid] = "%s: %s" % (
+                                type(outcome).__name__,
+                                str(outcome)[:200],
+                            )
+                            logger.warning(
+                                f"model-finetune: record '{sid}' was listed but "
+                                f"could not be read back, so its state is not "
+                                f"established: {type(outcome).__name__}: "
+                                f"{outcome}"
+                            )
+                            continue
+                        got_sid, digest = outcome
+                        verified[got_sid] = digest
+            plan["reread_errors"] = sorted(reread_errors)
+            plan["reread_error_detail"] = dict(sorted(reread_errors.items()))
+            plan["verified"] = len(verified)
+            # An id whose state could not be established is NOT mismatched and
+            # NOT repaired. It is neither claim, and reporting it as either one
+            # is the misreport this row exists to remove.
+            unknown = set(reread_errors)
+            plan["mismatched"] = sorted(
+                sid
+                for sid, h in plan["hashes"].items()
+                if verified.get(sid) != h and sid not in unknown
+            )
+            plan["repaired"] = sorted(set(bad) - set(plan["mismatched"]) - unknown)
+
+        # THE PUSHED BOOKKEEPING FOLLOWS THE READ-BACK, so it belongs here --
+        # after the repair pass -- not next to the uploads. Keying it on what the
+        # ARTIFACT holds is the whole point: recording only the ids whose PUT
+        # returned leaves out the put_unknown ids that did land and the ids the
+        # repair fixed, and the next sync then re-pushes them one commit each.
+        #
+        # Placing it before the read-back is also simply wrong: `verified` does not
+        # exist yet there, which is how this was found -- 22 tests raised
+        # UnboundLocalError rather than a wrong answer, which is the good direction.
+        if not verify_only and stage_error is None and commit_error is None:
+            pushed = dict(self._runs_pushed)
+            by_id = {e["id"]: e["record"] for e in planned}
+            for sid, digest in verified.items():
+                if sid in by_id and digest == plan["hashes"].get(sid):
+                    pushed[sid] = _json.dumps(by_id[sid], sort_keys=True)
+            self._runs_pushed = pushed
+        # COMPLETE IS THE CONJUNCTION, and every term is load-bearing: nothing
+        # failed to write, the id set that landed is the id set that was
+        # planned, the read-back itself succeeded, and every record the artifact
+        # serves hashes to what the plan said it would. Dropping the last term
+        # is what let a record land with the wrong content and still be called
+        # complete.
+        # "NOT LANDED" AND "PRESENT, BUT NOT PUT THERE BY THIS RUN" ARE
+        # DIFFERENT, and a report that cannot distinguish them invites the wrong
+        # repair: a caller seeing only `complete: False` re-runs, and re-uploading
+        # 313 records to fix nothing is the cost of not saying so.
+        #
+        # Named for a WRITE error, not a commit error, because a review showed it
+        # fires on a failed STAGE too -- and truthfully so. With the stage
+        # refused nothing is uploaded, yet the artifact can still hold every
+        # planned record from an EARLIER run, which is exactly what an
+        # interrupted caller wants to know. The earlier name said "commit" and
+        # the comment claimed another writer's commit had published our uploads;
+        # neither is true in the stage case.
+        #
+        # `complete` stays False either way: this run did not establish that
+        # state and must not claim it.
+        plan["records_present_despite_write_error"] = bool(
+            (stage_error or commit_error)
+            and verify_error is None
+            and not plan["mismatched"]
+            and set(plan["ids"]) <= set(verified)
+        )
+        # `complete` MEANS SOMETHING DIFFERENT IN A READ than in a write, and
+        # saying so explicitly is the point. In verify_only nothing was written,
+        # so `set(written) == set(ids)` can never hold and the answer would have
+        # been False however complete the artifact was -- which is a verify that
+        # always says "no". For a read the question is only whether the artifact
+        # holds every planned record, by the same id set and content hash.
+        if verify_only:
+            plan["complete"] = (
+                verify_error is None
+                and not plan["mismatched"]
+                and set(plan["ids"]) <= set(verified)
+            )
+            return plan
+
+        # THE READ-BACK IS THE ONLY JUDGE, so `complete` no longer consults
+        # `written`. That term asserted "every PUT returned", and a PUT's verdict
+        # has been measured unreliable in both directions -- it condemned 23
+        # records that had landed and cleared none of the 7 that had not. What
+        # remains is what the artifact itself says, plus the write-side errors
+        # that mean this replica cannot vouch for the artifact's state at all.
+        plan["failed"] = sorted(plan["mismatched"])
+        plan["complete"] = (
+            not plan["mismatched"]
+            # A record whose state could not be ESTABLISHED is not a pass. It is
+            # excluded from `mismatched` on purpose -- it is not known to be
+            # wrong -- so without this term narrowing the blame would have
+            # quietly turned an unknown into a success.
+            and not plan.get("reread_errors")
+            and verify_error is None
+            and plan.get("repair_error") is None
+            # A stage or commit that failed after its retry means the artifact
+            # may not hold what was uploaded, so the run is not complete even if
+            # every PUT returned. Reported as False rather than raised: the
+            # caller needs a verdict, and an exception here is indistinguishable
+            # from "the write never happened".
+            and stage_error is None
+            and commit_error is None
+        )
+        return plan
+
+    @bioengine.method(context=True)
     async def list_training_sessions(self, context=None) -> Dict[str, Any]:
         """The fine-tuning runs YOU may see, keyed by session_id.
 
@@ -2084,6 +3562,14 @@ class EntryApp:
         honest consequence of that is an EMPTY listing for everybody. That is
         the safe direction, and it is also indistinguishable from "this worker
         has no runs", so the decorator is covered by a test rather than trusted.
+
+        The runs come from the SHARED record, with this instance's own disk
+        layered on top of it -- so a run started on another instance is listed
+        here, and a run this instance started a moment ago is listed before the
+        next sync has shared it. If the shared record cannot be read the
+        listing still answers from local disk, which is incomplete and says so
+        in the log: a run history that is short is worse than one that is
+        slow, and both are better than one that raises.
         """
         import training
 
@@ -2092,12 +3578,40 @@ class EntryApp:
         # read inside `get_status` -- 3 per run, so 783 for the 261 runs on the
         # production store.
         records, dataset_ids, skipped = training.scan_runs_for_listing()
+
+        # The shared half. None and {} are DIFFERENT answers here: {} is "the
+        # shared history is empty", None is "it could not be read", and only
+        # the second is a reason to say so while still answering from local
+        # disk. Collapsing them with `or {}` computes the distinction and then
+        # throws it away, which leaves a silently short history -- the failure
+        # this log exists to make visible.
+        shared = await self._read_run_records()
+        if shared is None:
+            print(
+                "[model-finetune] the shared run history could not be read; "
+                "answering from this instance's disk only, so the listing is "
+                "INCOMPLETE",
+                flush=True,
+            )
+            shared = {}
+
+        # The collision rule and the dataset union live in `merge_run_sources`,
+        # not here, so that what a caller gets and what a test composes are the
+        # same code.
+        records, shared_ids, dataset_ids = training.merge_run_sources(
+            records, dataset_ids, shared
+        )
+
         writable = await self._caller_managed_datasets(dataset_ids, context)
         # `skipped` is passed on, not dropped: `list_sessions` logs the stray
         # directory names it was handed, and those names are caller-controlled,
         # so the log is their only trace.
         return training.list_sessions(
-            context, writable_datasets=writable, records=records, skipped=skipped
+            context,
+            writable_datasets=writable,
+            records=records,
+            shared_ids=shared_ids,
+            skipped=skipped,
         )
 
     async def _caller_managed_datasets(self, dataset_ids, context) -> frozenset:

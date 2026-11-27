@@ -34,6 +34,40 @@ from bioengine.utils import (
     stream_logging_format,
 )
 
+# The pip cache size BioEngine applies where it starts Ray itself. Ray's own default is 10 GB,
+# which is smaller than two of the app environments seen in practice, so the whole cache can be
+# evicted by a single deploy.
+DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB = 30
+
+# The modes in which this process starts Ray, and therefore the only modes in which exporting
+# RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB here can reach the Ray processes that read it.
+SELF_STARTED_MODES = ("single-machine", "slurm")
+
+# WHICH NODES that export actually reaches, which is NOT the same question as whether this
+# process starts Ray. Ray reads the cap per node, out of each runtime_env agent's own
+# environment, so exporting it here governs exactly the processes that inherit this environment:
+#
+#   single-machine   the whole cluster, because the cluster is this one host
+#   slurm            the HEAD ONLY. The compute-node raylets are launched by
+#                    `slurm_workers.py` under `apptainer exec --cleanenv`, which starts from an
+#                    empty environment and is handed back only SLURM_JOB_ID and
+#                    PYTHONNOUSERSITE. The cap is not among them, so every compute node keeps
+#                    Ray's own default of 10 GB however large a value the operator passed.
+#   external-cluster nothing. The Ray pods are created by the cluster operator and this worker
+#                    neither sets nor reads their environment.
+#
+# Reporting a bare boolean here told a SLURM operator the cap was applied while their replicas ran
+# on a different one, which is the same defect — a value reported as in force where it is not —
+# that the external-cluster case was fixed for.
+# The value set is CLOSED: "cluster" | "head-only" | "none", and `status`'s `scope` key reports
+# one of exactly these three. A renderer may switch on it. If a fourth is ever added, consumers
+# are expected to show the raw string rather than blank, so the new value degrades visibly.
+PIP_CACHE_SCOPES = {
+    "single-machine": "cluster",
+    "slurm": "head-only",
+    "external-cluster": "none",
+}
+
 
 class ProxyHandleAbsentError(RuntimeError):
     """The cached ``proxy_actor_handle`` is ``None``, so there is nothing to call.
@@ -112,7 +146,13 @@ class RayCluster:
         head_num_gpus: int = 0,
         head_memory_in_gb: Optional[int] = None,
         head_memory_budget_fraction: float = 0.9,
-        runtime_env_pip_cache_size_gb: int = 30,  # Ray default is 10 GB
+        # `None` means "not passed", which is NOT the same as `DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB`
+        # and is why this default is not that number: the two have to be told apart so the worker
+        # can be loud about a value an operator chose and cannot get, without alarming every
+        # operator who never chose one. The effective value is the same either way.
+        runtime_env_pip_cache_size_gb: Optional[
+            int
+        ] = None,  # Ray's own default is 10 GB
         force_clean_up: bool = True,
         enable_container_runtime: bool = False,
         # SLURM Worker Configuration parameters
@@ -158,7 +198,23 @@ class RayCluster:
                 memory reservation plus the memory already held by other tenants of the
                 host may occupy before a startup warning is logged. Default 0.9. Set to
                 0 to disable the check. Never blocks startup.
-            runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB. Default 30.
+            runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB.
+                Applied by exporting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB, which Ray reads PER NODE
+                out of each runtime_env agent's own environment. So which nodes it reaches depends
+                on the mode, and `status`'s `runtime_env_pip_cache.scope` reports which:
+                  - single-machine: the whole cluster ("cluster", state "applied").
+                  - slurm: THE HEAD NODE ONLY ("head-only", state "applied on the head node
+                    only"). The compute-node raylets are launched under
+                    `apptainer exec --cleanenv`, which is not given this variable, so they keep
+                    Ray's own default of 10 GB — the figure to size compute-node scratch from.
+                    Passing the variable yourself through `further_apptainer_args` would change
+                    that, and `status` would not know: it reports what this worker exports, not
+                    what the job script was told to forward.
+                  - external-cluster: nowhere ("none", state "not applied"), because the Ray pods
+                    are created by the cluster operator and the value has to be set on those pods
+                    instead. Passing it in that mode logs an error at startup.
+                None (the default) means not passed, and DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB is
+                used.
             force_clean_up: Force cleanup of previous Ray cluster on start. Default True.
             enable_container_runtime: Opt-in container-as-runtime for apps
                 using ``@bioengine.app(container_image=…)`` (single-machine
@@ -249,8 +305,63 @@ class RayCluster:
             "slurm": {},
         }
 
+        # `runtime_env_pip_cache_size_gb` is validated in EVERY mode. A value of zero or less is
+        # wrong regardless of who starts Ray, and validating it only on the paths that use it let an
+        # external-cluster caller pass nonsense and hear nothing.
+        #
+        # Only a PASSED value is validated: `None` is "not passed", and the default below is this
+        # module's own, never the caller's mistake.
+        self._runtime_env_pip_cache_requested = runtime_env_pip_cache_size_gb
+        if runtime_env_pip_cache_size_gb is not None:
+            if runtime_env_pip_cache_size_gb <= 0:
+                raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+            self._runtime_env_pip_cache_size_gb = int(runtime_env_pip_cache_size_gb)
+        else:
+            self._runtime_env_pip_cache_size_gb = DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB
+
+        # ...but it can only TAKE EFFECT where this process starts Ray. In external-cluster mode the
+        # Ray pods already exist and were created by the cluster operator, so an environment
+        # variable exported here never reaches them: the pods run on Ray's own default cache size.
+        #
+        # Say so, because the silence is the defect. Measured on an external-cluster site: the Ray
+        # workers held app environments of 5.7-7.9 GB each and evicted one another continuously
+        # (21-22 cache deletes and 29-31 adds per pod over one session), so a freshly deployed app's
+        # replicas sat in STARTING indefinitely while gigabytes were installed and discarded. The
+        # operator had configured this parameter and had no way to learn it did nothing.
+        #
+        # ERROR level, and only for a value the caller actually PASSED. Those two go together: an
+        # alarm that fires on every external-cluster worker, including the ones whose pods are
+        # configured correctly, is an alarm operators learn to scroll past — and then it no longer
+        # reports the case it exists for. the `status` property states the unapplied value either way, so
+        # nothing is hidden by staying quiet about a default nobody chose.
+        # Whether THIS PROCESS exports the value at all, which is what decides the startup
+        # message below. It is NOT the same as the status field's `applied`: slurm exports it
+        # (so no error here) yet governs only the head node (so status says "head-only").
+        self._runtime_env_pip_cache_applied = mode in SELF_STARTED_MODES
+        if not self._runtime_env_pip_cache_applied:
+            # The wording stops short of claiming what the pods' cache size IS. This worker can
+            # neither read nor set their environment, so an operator who HAS set
+            # RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB on the pods would otherwise be told a falsehood
+            # about their own cluster by a message whose whole purpose is to be believed.
+            unapplied = (
+                "runtime_env_pip_cache_size_gb=%s is IGNORED in %s mode: the Ray pods are created "
+                "by the cluster operator, so RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB has to be set on "
+                "those pods and cannot be applied from here. This worker cannot see their "
+                "environment, so it cannot report the size in force; where that variable is "
+                "unset, Ray's own default of 10 GB applies, and app environments larger than half "
+                "of it evict one another and leave replicas stuck in STARTING."
+            )
+            if self._runtime_env_pip_cache_requested is not None:
+                self.logger.error(
+                    unapplied, self._runtime_env_pip_cache_requested, mode
+                )
+            else:
+                # Nobody asked for this value, so it is not an operator error and must not shout.
+                # It is still reported by `status()` as not applied.
+                self.logger.debug(unapplied, self._runtime_env_pip_cache_size_gb, mode)
+
         # Additional configuration for starting a Ray cluster
-        if mode in ["single-machine", "slurm"]:
+        if mode in SELF_STARTED_MODES:
             # Find and store Ray executable path
             self.ray_exec_path = self._find_ray_executable()
             self.serve_exec_path = self._find_serve_executable()
@@ -291,14 +402,13 @@ class RayCluster:
                 }
             )
 
-            # Set runtime environment pip cache size
-            if runtime_env_pip_cache_size_gb <= 0:
-                raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+            # Set runtime environment pip cache size (validated above, for every mode). This is
+            # the only place the value is applied, which is why it has no effect anywhere else.
             os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] = str(
-                runtime_env_pip_cache_size_gb
+                self._runtime_env_pip_cache_size_gb
             )
             self.logger.debug(
-                f"Setting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB to {runtime_env_pip_cache_size_gb}"
+                f"Setting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB to {self._runtime_env_pip_cache_size_gb}"
             )
 
             # Set SLURM worker configuration if in slurm mode
@@ -363,6 +473,15 @@ class RayCluster:
                 - nodes: Most recent worker nodes status grouped by state
                 - last_cluster_update: Unix timestamp the newest snapshot was
                   written, or None if the monitor has not ticked yet
+                - runtime_env_pip_cache: {size_gb, requested, applied, scope, state, detail} —
+                  whether the pip cache size was applied, and where. `scope` is one of a
+                  CLOSED set -- "cluster" | "head-only" | "none" -- and is the key to switch
+                  on; `state` is prose and may be reworded. `applied` is DEFINED as
+                  `scope == "cluster"`, so the two cannot drift;
+                  `state` is the words ("applied" / "applied on the head node only" /
+                  "not applied"); `requested` is None when no value was passed. Never
+                  applied in external-cluster mode, where the Ray pods are the cluster
+                  operator's, and only on the head in slurm mode.
         """
         status = {
             "head_address": self.address,
@@ -396,6 +515,61 @@ class RayCluster:
         # UI code can render unconditionally; empty is the normal case, and is
         # also what an unmounted census directory produces.
         status["co_tenancy_warnings"] = list(getattr(self, "_co_tenancy_warnings", []))
+
+        # Whether the pip cache size was APPLIED, and to WHICH NODES. Always present, with
+        # `state` carrying the words rather than leaving a reader to infer them from a bare
+        # boolean: a startup log line scrolls away, and the operator asking "did my setting
+        # take?" is reading status, often long afterwards. `applied` is true only when the cap
+        # governs the whole cluster, so a consumer that keys off it cannot print "applied" for a
+        # SLURM cluster whose compute nodes are on a different cap.
+        #
+        # `requested` is None when nobody passed a value, which is NOT the same as having
+        # passed the default — telling those apart is what lets the startup message be an
+        # error for a value somebody chose and silence for one nobody did.
+        #
+        # Read through `getattr`, for the same reason the `co_tenancy_warnings` line above
+        # does: this property is also called on instances built with `RayCluster.__new__`,
+        # which never ran `__init__` and so carry none of these attributes. Reading them
+        # directly turned two unrelated tests into AttributeErrors. `scope` is derived from
+        # `self.mode` rather than stored, so it needs no fallback and cannot go stale against
+        # the mode.
+        # `scope` says WHICH NODES the cap governs, and `applied` now means "in force for the
+        # whole cluster" — the question an operator is really asking. They differ on SLURM, where
+        # the export reaches the head and no compute node, and where a bare `applied: true` was
+        # therefore a falsehood about the nodes the replicas run on.
+        pip_cache_scope = PIP_CACHE_SCOPES.get(self.mode, "none")
+        pip_cache_applied = pip_cache_scope == "cluster"
+        pip_cache_detail = {
+            "cluster": None,
+            "head-only": (
+                "the cap governs the head node only: the compute-node raylets are launched under "
+                "`apptainer exec --cleanenv`, which is not given "
+                "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB, so they keep Ray's own default of 10 GB and "
+                "that is the figure to size compute-node scratch from"
+            ),
+            "none": (
+                f"the Ray pods in {self.mode} mode are created by the cluster operator, so "
+                "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB has to be set on those pods and cannot be "
+                "applied from here; this worker cannot see their environment, and where that "
+                "variable is unset Ray's own default of 10 GB applies"
+            ),
+        }[pip_cache_scope]
+        status["runtime_env_pip_cache"] = {
+            "size_gb": getattr(
+                self,
+                "_runtime_env_pip_cache_size_gb",
+                DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB,
+            ),
+            "requested": getattr(self, "_runtime_env_pip_cache_requested", None),
+            "applied": pip_cache_applied,
+            "scope": pip_cache_scope,
+            "state": {
+                "cluster": "applied",
+                "head-only": "applied on the head node only",
+                "none": "not applied",
+            }[pip_cache_scope],
+            "detail": pip_cache_detail,
+        }
 
         return status
 

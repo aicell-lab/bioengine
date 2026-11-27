@@ -473,3 +473,64 @@ async def test_the_PUBLISHED_listing_LOGS_a_stray_directory(runs, monkeypatch, c
         "the published listing skipped a stray directory without logging it; "
         f"the name is caller-controlled and this log is its only trace. Got: {printed!r}"
     )
+
+
+# ── the ruling: the widening is for OWNED runs only ───────────────────────
+
+
+def test_a_CO_MANAGER_DOES_NOT_SEE_AN_OWNERLESS_RUN_ON_THEIR_DATASET():
+    """The lead's ruling on this row, and the code broke it before this test.
+
+    Measured on the branch before the fix: `_owner_or_comanager` returned True
+    for a run with NO recorded owner whose `dataset_artifact_id` the caller
+    manages — so an ownerless run was visible to a co-manager, and resumable by
+    one, because `caller_may_resume_run` shares this leg.
+
+    Two statements agreed with each other before the code did. The ruling: the
+    widening applies to OWNED runs only — a co-manager sees the runs of other
+    MANAGERS on that dataset — and ownerless runs stay admin-only. And the
+    shipped README already said resuming an ownerless run requires `rw`/admin
+    on `bioimage-io`, "because with no recorded owner there is nobody for the
+    ownership check to match you against".
+
+    The rule is not "a manager of the dataset may act on anything filed under
+    it". It is "a manager may act on a COLLEAGUE's run", and an ownerless run
+    has no colleague.
+    """
+    ctx = {"user": {"id": "co-manager", "email": "cm@example.org"}}
+    managed = frozenset({"bioimage-io/ds"})
+
+    ownerless = {"dataset_artifact_id": "bioimage-io/ds"}
+    assert training._owner_or_comanager(ownerless, ctx, managed) is False
+
+    # ...and an empty-string owner is the same case, not a different one.
+    for empty in ("", None):
+        rec = {"owner": empty, "dataset_artifact_id": "bioimage-io/ds"}
+        assert training._owner_or_comanager(rec, ctx, managed) is False, empty
+
+
+def test_THE_WIDENING_STILL_WORKS_for_a_COLLEAGUES_run():
+    """The control. A leg that refused everything would satisfy the test above
+    and remove the feature this row exists to add."""
+    ctx = {"user": {"id": "co-manager", "email": "cm@example.org"}}
+    managed = frozenset({"bioimage-io/ds"})
+
+    colleague = {"owner": "someone-else", "dataset_artifact_id": "bioimage-io/ds"}
+    assert training._owner_or_comanager(colleague, ctx, managed) is True
+
+    # the caller's OWN run, with no dataset recorded at all, still passes on the
+    # owner leg — so requiring an owner for the dataset leg did not narrow that.
+    own = {"owner": "co-manager"}
+    assert training._owner_or_comanager(own, ctx, frozenset()) is True
+
+
+def test_A_NON_MEMBER_sees_neither_kind():
+    """The other control: the dataset leg is what admits a co-manager, so a
+    caller who manages nothing must be refused for both kinds of run."""
+    ctx = {"user": {"id": "stranger", "email": "s@example.org"}}
+    nothing = frozenset()
+
+    owned = {"owner": "someone-else", "dataset_artifact_id": "bioimage-io/ds"}
+    ownerless = {"dataset_artifact_id": "bioimage-io/ds"}
+    assert training._owner_or_comanager(owned, ctx, nothing) is False
+    assert training._owner_or_comanager(ownerless, ctx, nothing) is False

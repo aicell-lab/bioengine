@@ -51,6 +51,105 @@ ZOO_MODELS = {
 }
 _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
+
+def _generalist_uses_registry(model_type: str) -> bool:
+    """Does this generalist resolve through micro-sam's registry rather than the zoo?
+
+    TRUE for exactly the model types the verified mirror holds, and the set is
+    ASKED OF THE MIRROR rather than written down a second time. A separate list
+    here would go stale the moment the mirror gains a type -- which is the same
+    argument this app already makes against a hard-coded model-type list in the
+    base-checkpoint preflight.
+
+    The other generalists keep the zoo path unchanged. That is deliberate and
+    narrow: moving a type with no mirrored copy would swap one unreachable host
+    for another while changing which code path a user's annotation runs through,
+    for no gain. Extending the mirror is what makes them movable, and it is its
+    own piece of work.
+    """
+    import base_checkpoint_mirror as bcm
+
+    return model_type in ZOO_MODELS and bool(bcm.parts_for(model_type))
+
+
+# How long the base-checkpoint reachability probe may take PER FILE. Short on
+# purpose: this runs on the admission path, and the thing it protects against
+# is a run that claims the GPU and then discovers the weights minutes later.
+# A probe that could itself take minutes would reproduce the problem.
+BASE_CHECKPOINT_PROBE_TIMEOUT_S = 3.0
+
+# Methods a caller may rely on being present. Advertised through `ping`.
+RUNTIME_CAPABILITIES = ("base_checkpoint_status", "ensure_base_checkpoint")
+
+
+def _url_reachable(url: str, timeout_s: float) -> bool:
+    """Is *url* fetchable from HERE, without downloading it?
+
+    A HEAD, falling back to a 1-byte ranged GET, because some stores answer
+    HEAD with 405 while serving GET perfectly well -- treating that as
+    unreachable would refuse a model the site can actually train.
+
+    Any failure is False rather than an exception: the caller is deciding
+    whether to admit a run, and "I could not tell" has to behave like "not
+    available here" or the refusal it feeds is not a refusal at all.
+    """
+    import urllib.error
+    import urllib.request
+
+    for make in (
+        lambda: urllib.request.Request(url, method="HEAD"),
+        lambda: urllib.request.Request(url, headers={"Range": "bytes=0-0"}),
+    ):
+        try:
+            with urllib.request.urlopen(make(), timeout=timeout_s) as resp:
+                if 200 <= getattr(resp, "status", 0) < 400:
+                    return True
+        except urllib.error.HTTPError as exc:
+            if 200 <= exc.code < 400:
+                return True
+            continue
+        except Exception:
+            continue
+    return False
+
+
+#: Where the mirror artifact lives. Overridable by environment for a test
+#: deployment; the default is the production server, same as everything else
+#: this app talks to.
+_HYPHA_SERVER_URL = os.environ.get("HYPHA_SERVER_URL", "https://hypha.aicell.io")
+
+
+def _open_url_stream(url: str, timeout_s: float = 300.0):
+    """A readable stream over *url*. Separate so a test can pass its own.
+
+    `urlopen`'s object already has `.read(n)`, which is all the fence needs, so
+    the bytes are never collected into memory: a 375 MB encoder would otherwise
+    be held whole inside a Serve replica.
+    """
+    import urllib.request
+
+    return urllib.request.urlopen(url, timeout=timeout_s)
+
+
+def _install_from_url(bcm, root: str, name: str, url: str, opener) -> dict:
+    """Stream *url* into *root* as *name*, through the fence. Blocking.
+
+    Runs in a thread because it is a long synchronous read; the fence is
+    `bcm.install_verified`, and a `MirrorVerificationError` propagates on
+    purpose.
+    """
+    stream = opener(url)
+    try:
+        return bcm.install_verified(root, name, stream)
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
 # The third-party top-level modules this runtime's own method bodies import.
 # Imported once at replica startup by the smoke test below so a replica whose
 # runtime_env install did not take fails instead of being advertised as ready.
@@ -120,10 +219,37 @@ class RuntimeApp:
         self._busy = busy.BusyLog(
             {"micro-sam GPU work (_gpu_lock)": self._gpu_lock.locked}
         )
+        # Whether THIS replica's run store accepts a write, and when that was
+        # last established. A runtime replica has its own HOME and therefore
+        # its own store: #0931 measured one replica writing the share while
+        # another, in the same pod image, could not write anything, because
+        # the redirect that points HOME at the share had not run. So this is a
+        # fact about the process, not about the cluster, and it cannot be
+        # answered by asking the entry.
+        #
+        # None means "not established yet" and is reported as such rather than
+        # as either answer.
+        self._store_ok: Optional[bool] = None
+        self._store_detail: str = "not probed yet"
+        self._store_checked_at: float = 0.0
 
     @bioengine.async_init
     async def _start_busy_log(self) -> None:
         self._busy.start()
+        # The store verdict is established ONCE here, so the first caller gets
+        # an answer rather than "not probed yet". It shares this hook because
+        # an app may declare only one `@bioengine.async_init` -- adding a
+        # second raises ReservedMethodNameError at import, which is how I found
+        # out.
+        #
+        # Deliberately NOT fatal. A replica that cannot write the run store can
+        # still serve inference, and failing init would take the GPU runtime
+        # down for a fault only training cares about -- the restart loop this
+        # design exists to avoid, reached from the other side.
+        try:
+            await self._probe_store()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"the startup store probe itself failed: {exc}")
 
     @bioengine.smoke_test
     async def _import_runtime_stack(self) -> None:
@@ -181,6 +307,73 @@ class RuntimeApp:
                 "runtime_env_setup-*.log on the node."
             )
 
+    #: How long a store verdict is reused before `store_status` re-probes. The
+    #: probe writes a file, so this is not free; the fault it detects is a
+    #: property of the process and effectively static, so a minute is ample.
+    # Class-level defaults, so `ping` cannot raise AttributeError on an
+    # instance whose __init__ did not run -- which is how the suite exercises
+    # `ping` alone, and it is also what any future constructor refactor would
+    # produce. Immutable values only; every write assigns to the INSTANCE.
+    _store_ok: Optional[bool] = None
+    _store_detail: str = "not probed yet"
+    _store_checked_at: float = 0.0
+
+    STORE_PROBE_TTL_S = 60.0
+
+    async def _probe_store(self) -> Dict[str, Any]:
+        """Establish whether this replica can write its run store.
+
+        Runs the write probe off the event loop: it touches a filesystem that
+        may be a network mount, and a hung mount must not block this replica's
+        other callers.
+
+        NO `@bioengine.health_check` CALLS THIS, and that is the design rather
+        than an omission. A failing Serve health check RESTARTS the replica, so
+        reporting an unwritable store through the health check would crash-loop
+        the GPU runtimes under a cluster-side fault the app cannot repair --
+        which is exactly the condition that produced this row, and it lasted
+        hours. Any "fail after N attempts" threshold is a bet on how long such
+        a fault lasts; a probe that never fails the check cannot be tuned
+        wrong. The fault is surfaced instead through `ping`/`store_status` and
+        refused at the door by the entry, which is what an operator and a user
+        need. The cost, stated: Serve's own health view stays green.
+        """
+        import training
+
+        try:
+            root = await asyncio.to_thread(training.assert_sessions_root_writable)
+            self._store_ok = True
+            self._store_detail = f"the run store at {root} accepts writes"
+        except Exception as exc:
+            self._store_ok = False
+            self._store_detail = str(exc)
+        self._store_checked_at = time.time()
+        return self._store_report()
+
+    def _store_report(self) -> Dict[str, Any]:
+        return {
+            "writable": self._store_ok,
+            "detail": self._store_detail,
+            "checked_at": self._store_checked_at,
+            "age_s": (
+                None
+                if not self._store_checked_at
+                else round(time.time() - self._store_checked_at, 1)
+            ),
+        }
+
+    async def store_status(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
+        """This replica's store verdict, re-probed if the cached one is stale.
+
+        Composition endpoint, like `ping` and `gpu_memory_info` -- not a Hypha
+        method, so a caller cannot reach it directly and cannot ask this
+        replica to write on demand.
+        """
+        ttl = self.STORE_PROBE_TTL_S if max_age_s is None else max_age_s
+        if self._store_ok is None or (time.time() - self._store_checked_at) > ttl:
+            return await self._probe_store()
+        return self._store_report()
+
     async def ping(self) -> Dict[str, Any]:
         """Internal liveness for the entry's readiness check — not a Hypha method,
         but reachable via the composition handle. Unlocked so it answers during
@@ -191,6 +384,18 @@ class RuntimeApp:
             "loaded_model_type": self._loaded_model_type,
             "gpu_busy": self._gpu_lock.locked(),
             "uptime": time.time() - self.start_time,
+            # The CACHED store verdict. `ping` never probes: the entry calls it
+            # inside a 2 s readiness timeout, and a replica wedged on a hung
+            # mount must not make that readiness check hang -- which is the
+            # failure the timeout exists for in the first place.
+            "store": self._store_report(),
+            # WHAT THIS REPLICA CAN BE ASKED, so a newer entry can tell an older
+            # replica from a broken one. `getattr` on the composition handle
+            # cannot: BioEngineRuntimeHandle.__getattr__ returns a bound method
+            # for ANY public name, so a missing method is indistinguishable from
+            # a present one until the call fails -- and treating that failure as
+            # "unavailable" would refuse every run during a rollout.
+            "capabilities": sorted(RUNTIME_CAPABILITIES),
         }
 
     async def gpu_memory_info(self) -> Dict[str, Any]:
@@ -202,6 +407,276 @@ class RuntimeApp:
 
             self._gpu_mem_cached = training.detect_gpu_memory()
         return self._gpu_mem_cached
+
+    async def base_checkpoint_status(self, model_type: str) -> Dict[str, Any]:
+        """Can THIS SITE produce the base weights training would start from?
+
+        Composition endpoint, not a Hypha method. Answers for the TRAINING base
+        model, which is a different thing from the zoo weights `_zoo_weights`
+        fetches for inference: `train_sam` with no `checkpoint_path` resolves
+        the base model through micro-sam's OWN pooch registry, so probing the
+        zoo cache would answer a question nobody asked and pass while the
+        training fetch still failed.
+
+        A STATEMENT ABOUT THE SITE, not a list of model types. A hard-coded
+        list goes stale the moment a mirror gains a file, and the whole point
+        of this probe is that the same model_type is runnable where a mirror or
+        upstream is reachable and not runnable where neither is.
+
+        Read-only and bounded: it stats the cache and, only for what is not
+        cached, issues a HEAD with a short timeout. It never downloads -- the
+        cost it exists to avoid is exactly the one a download would pay.
+
+        CACHED MEANS PRESENT, NOT VALID. The check is `os.path.exists`, so a
+        file whose hash no longer matches micro-sam's registry counts as
+        cached here while `pooch.fetch` would re-download it. That is the
+        right trade for an admission check -- verifying hashes would mean
+        reading every byte of multi-hundred-megabyte weights on a path that
+        must stay quick -- but it means this answers "is there a file here",
+        and a corrupt one still fails later.
+
+        Returns the parts rather than a verdict, so the caller decides and the
+        decision is testable without a network: ``{"model_type", "parts":
+        {name: {"cached": bool, "reachable": bool|None, "url": str|None}},
+        "probe_error": str|None}``. ``reachable`` is None when it was not
+        asked, because the file is already cached.
+        """
+        import os
+
+        out: Dict[str, Any] = {
+            "model_type": model_type,
+            "parts": {},
+            "probe_error": None,
+        }
+        try:
+            from micro_sam.util import models as _models
+
+            registry = _models()
+            root = str(registry.path)
+            urls = dict(getattr(registry, "urls", {}) or {})
+            known = set(getattr(registry, "registry", {}) or {})
+        except Exception as exc:  # the probe itself failed; say so, do not guess
+            out["probe_error"] = "%s: %s" % (type(exc).__name__, exc)
+            return out
+
+        # The encoder is keyed by the model type; the AIS decoder by
+        # "<model_type>_decoder". BOTH are needed, and a site can hold one and
+        # not the other -- so checking only the encoder would admit a run whose
+        # decoder is unobtainable here.
+        # THE PARTS ARE PROBED CONCURRENTLY, and the arithmetic is the reason.
+        # `_url_reachable` makes up to TWO attempts (HEAD, then a ranged GET),
+        # so a part costs up to 2 x BASE_CHECKPOINT_PROBE_TIMEOUT_S. Run
+        # sequentially, two parts cost up to 4x that -- which overran the
+        # entry's own budget, so the caller's timeout fired first and the user
+        # was told the check "could not be checked" instead of that the weights
+        # are unavailable here. That is the wrong sentence for the one case
+        # this probe exists for: a host that silently drops packets.
+        pending = []
+        for part, key in (
+            ("encoder", model_type),
+            ("decoder", f"{model_type}_decoder"),
+        ):
+            if key not in known:
+                continue  # micro-sam does not publish this part for this type
+            cached = os.path.exists(os.path.join(root, key))
+            info: Dict[str, Any] = {
+                "cached": cached,
+                "reachable": None,
+                "url": urls.get(key),
+            }
+            out["parts"][part] = info
+            if not cached and info["url"]:
+                pending.append((info, info["url"]))
+
+        if pending:
+            results = await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        _url_reachable, url, BASE_CHECKPOINT_PROBE_TIMEOUT_S
+                    )
+                    for _, url in pending
+                ),
+                return_exceptions=True,
+            )
+            for (info, _), res in zip(pending, results):
+                # An exception here is not "reachable unknown": the caller is
+                # deciding whether to admit a run, so it has to read as "not
+                # obtainable from here".
+                info["reachable"] = res is True
+        return out
+
+    async def ensure_base_checkpoint(
+        self,
+        model_type: str,
+        resolve_mirror_urls=None,
+        open_url=None,
+    ) -> Dict[str, Any]:
+        """Make this site able to produce *model_type*'s base weights.
+
+        UPSTREAM FIRST, AND THAT IS A REQUIREMENT RATHER THAN A PREFERENCE.
+        The mirror is only consulted for a part that is neither already cached
+        nor reachable upstream, so on a site that can reach EBI this method
+        performs no download and installs nothing -- it reduces to the probe it
+        already ran. A fallback that fetched from the mirror whenever the
+        mirror was closer would quietly make our copy the source of truth for
+        every site, and the next zoo-side correction would never arrive.
+
+        Returns ``{"model_type", "source", "parts", "installed",
+        "unavailable", "error"}``. ``source`` is "cache", "upstream",
+        "mirror" or "unavailable". ``unavailable`` names the parts no route
+        could supply, so the ADMISSION CHECK refuses with a reason instead of
+        a run discovering it minutes later under the GPU lock.
+
+        It REPORTS rather than raises for a missing route, and RAISES for a
+        file that failed the fence. Those are different: "I cannot get this"
+        is a verdict the caller turns into a refusal, while "I got this and it
+        is not what it claims to be" must stop everything, because the next
+        thing that happens otherwise is training on unknown weights.
+
+        `resolve_mirror_urls` and `open_url` are injectable so the
+        upstream-first rule and the fence can be exercised with no network.
+        Production passes neither.
+        """
+        import base_checkpoint_mirror as bcm
+
+        out: Dict[str, Any] = {
+            "model_type": model_type,
+            "source": "unavailable",
+            "parts": {},
+            "installed": [],
+            "unavailable": [],
+            "error": None,
+        }
+        status = await self.base_checkpoint_status(model_type)
+        out["parts"] = status.get("parts") or {}
+        if status.get("probe_error"):
+            # A probe that could not run is not evidence that a fallback is
+            # needed, and downloading on that basis would make a transient
+            # local failure rewrite the cache.
+            out["error"] = f"probe failed: {status['probe_error']}"
+            return out
+
+        try:
+            from micro_sam.util import models as _models
+
+            root = str(_models().path)
+        except Exception as exc:
+            out["error"] = "%s: %s" % (type(exc).__name__, exc)
+            return out
+
+        need = []
+        for part, info in out["parts"].items():
+            name = model_type if part == "encoder" else f"{model_type}_decoder"
+            if info.get("cached"):
+                continue
+            if info.get("reachable"):
+                continue  # upstream will serve it; micro-sam fetches as before
+            need.append(name)
+
+        if not need:
+            any_fetch = any(
+                not i.get("cached") and i.get("reachable")
+                for i in out["parts"].values()
+            )
+            out["source"] = "upstream" if any_fetch else "cache"
+            return out
+
+        # RE-CHECK THE DISK before fetching. The probe's answer is a moment
+        # old and another run on this same replica may have seeded the file
+        # since -- the cache is shared by every run in the app.
+        #
+        # THIS NARROWS THE WINDOW; IT DOES NOT CLOSE IT, and an earlier version
+        # of this comment claimed it did. Two admissions that both probe while
+        # the first 375 MB download is still in flight will both download,
+        # because the `.part` temp file is deliberately not visible at the real
+        # name. The RESULT stays correct -- unique temp names and an atomic
+        # os.replace -- so what is wasted is bandwidth, not correctness. A
+        # per-name lock would fix that and is not here.
+        still_missing = set(bcm.missing_parts(root, model_type))
+        # Only now is the mirror involved, and only for these names.
+        mirrored = [
+            n for n in need if n in bcm.MIRROR_CHECKPOINTS and n in still_missing
+        ]
+        out["unavailable"] = sorted(
+            set(need) - set(n for n in need if n in bcm.MIRROR_CHECKPOINTS)
+        )
+        if not mirrored:
+            # Either nothing is mirrored, or it arrived while we were asking.
+            if not out["unavailable"]:
+                out["source"] = "cache"
+            return out
+
+        resolve = resolve_mirror_urls or self._mirror_urls
+        opener = open_url or _open_url_stream
+        try:
+            urls = await resolve(mirrored)
+        except Exception as exc:
+            out["error"] = "could not resolve mirror urls: %s: %s" % (
+                type(exc).__name__,
+                exc,
+            )
+            # NAMED, not just counted. Leaving these out of `unavailable`
+            # meant a caller that words its refusal from that list printed an
+            # EMPTY list while refusing -- a refusal that cannot say what it
+            # could not get is the failure this preflight exists to remove.
+            out["unavailable"] = sorted(set(out["unavailable"]) | set(mirrored))
+            return out
+
+        for name in mirrored:
+            url = urls.get(name)
+            if not url:
+                out["unavailable"].append(name)
+                continue
+            # The fence runs inside `install_verified`; a MirrorVerificationError
+            # is deliberately NOT caught here.
+            record = await asyncio.to_thread(
+                _install_from_url, bcm, root, name, url, opener
+            )
+            out["installed"].append(record)
+            logger.warning(
+                "model-finetune: base checkpoint '%s' taken from the MIRROR "
+                "(upstream unreachable) and verified: sha256=%s bytes=%d",
+                name,
+                record["sha256"],
+                record["bytes"],
+            )
+
+        out["unavailable"] = sorted(set(out["unavailable"]))
+        out["source"] = (
+            "mirror" if out["installed"] and not out["unavailable"] else out["source"]
+        )
+        if out["installed"] and out["unavailable"]:
+            out["source"] = "unavailable"
+        return out
+
+    async def _mirror_urls(self, names) -> Dict[str, str]:
+        """Signed URLs for *names* from the mirror, over an ANONYMOUS connection.
+
+        No credential on purpose: the mirror is world-readable (verified with a
+        ranged GET), and an app the worker ADOPTED rather than deployed holds
+        no token -- which is exactly the state after the restart where a
+        fallback matters most.
+        """
+        from hypha_rpc import connect_to_server
+
+        import base_checkpoint_mirror as bcm
+
+        server = await connect_to_server({"server_url": _HYPHA_SERVER_URL})
+        try:
+            am = await server.get_service("public/artifact-manager")
+            out = {}
+            for name in names:
+                out[name] = await am.get_file(
+                    artifact_id=bcm.MIRROR_ARTIFACT_ID,
+                    file_path=name,
+                    version=bcm.MIRROR_VERSION,
+                )
+            return out
+        finally:
+            try:
+                await server.disconnect()
+            except Exception:
+                pass
 
     def _device(self) -> str:
         """Pick the compute device internally (device is not a public API param)."""
@@ -300,7 +775,31 @@ class RuntimeApp:
                 f" (finetuned: {checkpoint})" if checkpoint else ""
             )
             logger.info(f"🔄 Loading μSAM model '{label}' on {device}...")
-            if checkpoint is None and model_type in ZOO_MODELS:
+            if checkpoint is None and _generalist_uses_registry(model_type):
+                # MIRRORED GENERALIST: let micro-sam resolve the model from its
+                # OWN registry, which `ensure_base_checkpoint` has already
+                # seeded from the verified mirror when upstream is unreachable.
+                # One weight path, one cache root, one fence -- and generalist
+                # annotation inherits the offline behaviour for free.
+                #
+                # AND IT STILL GETS AIS, which is the thing that made this
+                # worth measuring rather than assuming. In the pinned
+                # micro-sam 1.8.11, `get_sam_model` with no `checkpoint_path`
+                # calls `_download_sam_model`, which fetches
+                # `f"{model_type}_decoder"` whenever the registry holds that
+                # key, and `get_sam_model` then puts it in
+                # `state["decoder_state"]`; `get_predictor_and_segmenter`
+                # selects AIS on exactly that key being present. So handing
+                # over pre-loaded files is unnecessary here -- the comment
+                # below, which says it is, is true only of the ZOO files,
+                # whose paths micro-sam does not know.
+                predictor, segmenter = get_predictor_and_segmenter(
+                    model_type=model_type,
+                    device=device,
+                    # None → μSAM auto-selects AIS when a decoder is present.
+                    segmentation_mode=None,
+                )
+            elif checkpoint is None and model_type in ZOO_MODELS:
                 # get_predictor_and_segmenter has no decoder_path, so pre-load the
                 # two pinned files via get_sam_model and hand it the assembled state.
                 from micro_sam.util import get_sam_model
@@ -489,6 +988,61 @@ class RuntimeApp:
             finally:
                 sam.to(device)
 
+    async def _seed_generalist_base(self, model_type: str, checkpoint=None) -> None:
+        """Make a MIRRORED generalist's weights obtainable before the GPU thread.
+
+        `_ensure_model` runs in a worker thread under the GPU lock and resolves
+        a mirrored generalist through micro-sam's registry. That resolve can
+        only use what is already on disk or what it can fetch from upstream --
+        it knows nothing about the mirror. So the mirror has to be consulted
+        from the ASYNC side, which is where `ensure_base_checkpoint` lives,
+        before the thread starts.
+
+        Deliberately a NO-OP for anything else: a fine-tuned checkpoint brings
+        its own weights, and an unmirrored generalist still takes the zoo path,
+        where this would seed a cache nobody reads.
+
+        BEST-EFFORT, and that is not laziness. `ensure_base_checkpoint` already
+        REPORTS an unobtainable part rather than raising, and the refusal a
+        caller deserves is the admission check's, with the part named. Raising
+        here would turn "the mirror is briefly unreachable" into a failed
+        annotation even on a site whose cache already holds the weights -- the
+        resolve in the thread is what decides, and it is the honest place for
+        the error.
+        """
+        if checkpoint is not None or not _generalist_uses_registry(model_type):
+            return
+        import base_checkpoint_mirror as bcm
+
+        try:
+            out = await self.ensure_base_checkpoint(model_type)
+        except bcm.MirrorVerificationError:
+            # THE ONE FAILURE THAT IS NOT BEST-EFFORT, and it must come before
+            # the broad catch below because it would otherwise be swallowed by
+            # it: `MirrorVerificationError` subclasses `RuntimeError`.
+            #
+            # A review caught exactly that. The mirror served bytes that did not
+            # match a digest pinned in this repository, and this method logged
+            # "the load will use whatever is on disk" and returned normally --
+            # turning a refusal into a warning, on the one path where the whole
+            # point is to stop. `ensure_base_checkpoint` raises here rather than
+            # reporting, deliberately, because an unobtainable part is a
+            # REPORT and a part that arrived WRONG must stop everything.
+            raise
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            logger.warning(
+                "model-finetune: could not seed the base checkpoint for "
+                f"'{model_type}' before loading it ({type(exc).__name__}: "
+                f"{str(exc)[:200]}); the load will use whatever is on disk"
+            )
+            return
+        if out.get("unavailable"):
+            logger.warning(
+                f"model-finetune: base checkpoint parts {out['unavailable']} for "
+                f"'{model_type}' could not be obtained from any route; the load "
+                "will fail if they are not already cached"
+            )
+
     # === composition endpoints (called by EntryApp via the runtime handle) ===
 
     async def auto_segment(
@@ -501,6 +1055,10 @@ class RuntimeApp:
         """AIS masks for a batch of (already-resolved) images → wire-dict list."""
         generate_kwargs = generate_kwargs or {}
         results: List[Dict[str, Any]] = []
+        # OUTSIDE the GPU lock: seeding can download hundreds of megabytes, and
+        # holding the lock for that would block every other request on a
+        # transfer that needs no GPU at all.
+        await self._seed_generalist_base(model_type, checkpoint)
         async with self._gpu_lock:
             for image in images:
                 labels = await asyncio.to_thread(
@@ -521,6 +1079,7 @@ class RuntimeApp:
         """
         generate_kwargs = generate_kwargs or {}
         results: List[Dict[str, Any]] = []
+        await self._seed_generalist_base(model_type, checkpoint)
         async with self._gpu_lock:
             for emb in embeddings:
                 labels = await asyncio.to_thread(
@@ -546,6 +1105,7 @@ class RuntimeApp:
         ``sam_scale``/``mask_threshold`` describe it for the ONNX decoder and for
         running AIS on it later via ``infer(embeddings=...)``.
         """
+        await self._seed_generalist_base(model_type, checkpoint)
         async with self._gpu_lock:
             payload = await asyncio.to_thread(
                 self._encode, model_type, image, checkpoint
@@ -562,6 +1122,7 @@ class RuntimeApp:
         if cache_key in self._onnx_cache:
             return self._onnx_cache[cache_key]
         logger.info(f"📦 Exporting ONNX prompt decoder for '{model_type}'...")
+        await self._seed_generalist_base(model_type)
         async with self._gpu_lock:
             onnx_bytes = await asyncio.to_thread(
                 self._export_onnx, model_type, quantize
@@ -640,6 +1201,22 @@ class RuntimeApp:
         training plus one inference asks for one replica, not two.
         """
         import training
+
+        # THE REPLICA THAT WILL WRITE, asked here. The entry refuses up front
+        # using a verdict from whichever replica its handle routed to, which
+        # need not be this one if a backend ever has more than one replica --
+        # a review named that, and my own design note had admitted the window
+        # between a cached verdict and the write. This closes it: the check
+        # runs in the process that is about to write, BEFORE the GPU lock, so
+        # a refused run neither holds the GPU nor dies mid-epoch. One probe per
+        # training run is nothing next to training.
+        report = await self.store_status(max_age_s=0)
+        if report.get("writable") is False:
+            raise RuntimeError(
+                "This GPU runtime cannot write the training-run store, so the "
+                "run was not started: "
+                + str(report.get("detail") or "the store refuses writes")
+            )
 
         async with self._gpu_lock:
             await asyncio.to_thread(self._release_model)
