@@ -24,6 +24,7 @@ from __future__ import annotations
 import builtins
 import io
 
+import asyncio
 import pytest
 
 import training
@@ -72,6 +73,11 @@ class _Stub:
 
     def __init__(self):
         self._training_tasks = {}
+        # `_run_training` samples the training slot on its FIRST line now, so a stub
+        # that drives it must carry a semaphore; these tests stop early and so never
+        # reached the old, later sample. Unlocked, because with the slot free the run
+        # reports PREPARING -- which is what they assert on.
+        self._training_sem = asyncio.Semaphore(1)
 
     async def _preparing_heartbeat(self, *a, **k):
         # _run_training creates this as a task and cancels it in its own cleanup;

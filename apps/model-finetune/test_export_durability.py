@@ -271,6 +271,11 @@ async def _cancel_during_prepare(stop_requested_first: bool) -> str:
         training.request_stop(session_id)
 
     class _Replica:
+        # `_run_training` samples the training slot on its FIRST line now, so a stub
+        # that drives it must carry a semaphore; these tests stop early and so never
+        # reached the old, later sample. Unlocked, because with the slot free the run
+        # reports PREPARING -- which is what they assert on.
+        _training_sem = asyncio.Semaphore(1)
         _training_tasks: dict = {}
 
         async def _preparing_heartbeat(self, sid, interval=60.0):

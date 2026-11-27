@@ -154,6 +154,11 @@ async def test_run_training_starts_and_cancels_the_heartbeat(monkeypatch) -> Non
 
     class _ColdStart:
         _training_tasks: dict = {}
+        # `_run_training` samples the training slot on its FIRST line now, so a stub
+        # that drives it must carry a semaphore; these tests stop early and so never
+        # reached the old, later sample. Unlocked, because with the slot free the run
+        # reports PREPARING -- which is what they assert on.
+        _training_sem = asyncio.Semaphore(1)
 
         async def _preparing_heartbeat(self, sid, interval=60.0):
             await _heartbeat_of(self)(sid, interval=0.05)

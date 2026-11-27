@@ -26,6 +26,7 @@ the raw string.
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 import ngff_region
@@ -47,6 +48,11 @@ CRED_ROOT = f"https://ov.example/t/{SECRET}/zarr/ds1/"
 
 
 class _Stub:
+    # `_run_training` now samples the training slot on its FIRST line, so
+    # every stub that drives it must carry a semaphore -- these tests stop
+    # early and so never reached the old, later sample. Unlocked: with the
+    # slot free the run reports PREPARING, which is what they assert on.
+    _training_sem = asyncio.Semaphore(1)
     """Enough of the app to reach the failure branch, and nothing else."""
 
     _training_tasks: dict = {}

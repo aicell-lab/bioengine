@@ -2372,9 +2372,26 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per Polygon/MultiPolygon feature, ids from 1 in document order;
-    coordinates are image-pixel (x, y). Ported from cellpose-finetuning's
-    ``_rasterize_geojson_to_tiff`` (the bioimage.io colab polygon convention).
+    **AXIS CONVENTION.** Coordinates are raw IMAGE PIXELS as ``(x, y)`` =
+    ``(column, row)``, with the origin at the TOP-LEFT and y increasing
+    DOWNWARD. There is no CRS, no scaling and no axis flip: a vertex ``[3, 7]``
+    is column 3, row 7. A file written y-UP (the GIS/mathematical convention, as
+    most desktop annotation tools export) therefore rasterises VERTICALLY
+    MIRRORED, and nothing here can detect that — the polygons are still valid and
+    still inside the canvas, so a mirrored mask trains silently. Flip such a file
+    to y-down before passing it, or rasterise it yourself.
+
+    Ids are assigned from 1 in document order, **one per POLYGON, not one per
+    FEATURE**: a MultiPolygon with three parts consumes three ids. (An earlier
+    version of this docstring said one per feature, which the code has never
+    done.)
+
+    **Interior rings are IGNORED.** Only the outer ring of each polygon is
+    drawn, so an annulus rasterises as a filled disc. Subtract holes yourself if
+    they matter.
+
+    Ported from cellpose-finetuning's ``_rasterize_geojson_to_tiff`` (the
+    bioimage.io colab polygon convention).
     """
     from PIL import Image as PILImage, ImageDraw
 
