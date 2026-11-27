@@ -1006,10 +1006,29 @@ def test_a_RE_PROBE_that_RAISES_after_seeding_leaves_the_run_REFUSED_not_crashed
         },
     )
     cls, inst = _entry_instance(runtime)
-    with pytest.raises(Exception) as ei:
+    # PINS THE TYPE AND THE MESSAGE, which is what this arm's docstring claims
+    # and what an earlier version of it did NOT do. It used
+    # `pytest.raises(Exception)` plus "not an AttributeError", and a review
+    # mutant -- a bare `raise` in the except around the re-probe, so a re-probe
+    # failure CRASHES instead of keeping the refusal -- SURVIVED it. That is the
+    # same defect this file exists to prevent: an arm asserting less than it
+    # says. `ValueError` is what the refusal raises (entry.py), and the refusal
+    # text names the model type, so `match` binds to the refusal specifically
+    # rather than to any ValueError that happens by.
+    with pytest.raises(ValueError, match="vit_b_lm") as ei:
         asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
     assert not isinstance(ei.value, AttributeError), (
         "the run was stopped by an AttributeError from a logging call, not by "
         "the refusal: %r" % (ei.value,)
+    )
+    # The phrase is COPIED FROM THE REAL MESSAGE, captured by running this arm,
+    # not guessed. My first attempt asserted the word "refused", which does not
+    # appear: the "neither cached nor reachable" branch says "cannot be trained
+    # at this site: its base checkpoint is unavailable". Writing an assertion
+    # from what I assumed the text said is the same mistake, one level along, as
+    # writing a fixture from what I assumed the class had.
+    assert "base checkpoint is unavailable" in str(ei.value), (
+        "the surviving exception is a ValueError naming the model type but does "
+        "not read as the base-checkpoint refusal: %r" % (ei.value,)
     )
     assert calls["n"] >= 2, "the re-probe was never attempted"
