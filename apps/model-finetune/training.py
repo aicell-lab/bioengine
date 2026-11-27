@@ -2372,9 +2372,24 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per Polygon/MultiPolygon feature, ids from 1 in document order;
-    coordinates are image-pixel (x, y). Ported from cellpose-finetuning's
-    ``_rasterize_geojson_to_tiff`` (the bioimage.io colab polygon convention).
+    One instance per Polygon/MultiPolygon feature, ids from 1 in document order.
+
+    THE AXIS CONVENTION, which GeoJSON itself does not fix and which nothing
+    here can detect a violation of. Coordinates are IMAGE PIXELS as ``[x, y]``
+    with the origin at the TOP-LEFT and **y increasing DOWNWARD** -- the raster
+    convention, so ``y`` is the row index and the pair maps to ``mask[y][x]``.
+    That is what the pairs below mean when they reach PIL, whose drawing origin
+    is the top-left, and it is the bioimage.io colab polygon convention this was
+    ported from (cellpose-finetuning's ``_rasterize_geojson_to_tiff``).
+
+    It is NOT the y-up convention that GIS GeoJSON readers assume. A y-up file
+    rasterises VERTICALLY MIRRORED, and that is silent: every polygon still
+    lands inside the canvas, the instance count is right, the mask is non-empty,
+    so the empty-mask guard in the caller does not fire and training reports
+    success having learnt mirrored cells. A caller reported exactly that risk
+    and rasterised locally to avoid it. There is no way to tell the two apart
+    from one file -- a mirrored annotation is a perfectly plausible annotation
+    -- so the convention has to be stated rather than validated.
     """
     from PIL import Image as PILImage, ImageDraw
 

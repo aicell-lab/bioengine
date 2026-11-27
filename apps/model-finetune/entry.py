@@ -1097,7 +1097,21 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
+        """Presigned S3 PUT URL for staging an input image or embedding.
+
+        THE STAGED FILE ITSELF LASTS ABOUT AN HOUR, which is not the same
+        statement as the URL lasting an hour and is the one that catches people
+        out. The signature below expires in 3600 s, and a fresh download URL is
+        minted on every read, so an expired signature is not what bites: the
+        object is gone. Measured by a caller: a `start_training` submitted 74
+        minutes after staging, and an `infer` on a path staged 80 minutes
+        earlier, both failed with "does not exist or has expired".
+
+        So anything that stages a dataset and then WAITS -- a run queued behind
+        another one, a second evaluation pass after a long training -- must
+        re-stage before it uses these paths. Staging is cheap; discovering this
+        an hour into an experiment is not.
+        """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1207,6 +1221,20 @@ class EntryApp:
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
+            # A staged path gets the lifetime and the repair, because "does not
+            # exist or has expired" leaves a caller unable to tell which, and
+            # the answer decides what they do next. The retry loop above has
+            # already exhausted its backoff on this 404, so a transient miss is
+            # not what this is.
+            if source.startswith("temp/"):
+                raise FileNotFoundError(
+                    f"Staged source '{source}' is gone. A file staged with "
+                    f"get_upload_url lasts about an hour, so a dataset staged "
+                    f"before a long wait -- a run queued behind another one, a "
+                    f"second pass after a training -- has to be re-staged "
+                    f"before it can be used. Stage it again and retry with the "
+                    f"new file_path."
+                )
             raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
@@ -1734,6 +1762,35 @@ class EntryApp:
         import training
 
         preparing_hb = asyncio.create_task(self._preparing_heartbeat(session_id))
+        # WHETHER THE SLOT IS ALREADY HELD, RECORDED BEFORE ANY PREPARATION.
+        #
+        # QUEUED is only written further down, after the whole dataset has been
+        # resolved and materialised, because preparing while another run trains
+        # is deliberate -- it keeps the GPU from idling between runs. The cost
+        # is that for the whole of that phase a contended run is
+        # indistinguishable from an uncontended one, and anything that fails in
+        # it reports whatever error it hit with nothing saying a slot was busy.
+        # Measured end to end by a caller: a second start_training went
+        # PREPARING -> FAILED with a bare `get_service` timed-out message, and
+        # their conclusion was the right one -- a caller cannot tell contention
+        # from a real failure.
+        #
+        # So it is recorded in its own field rather than in `status`. Setting
+        # the status to QUEUED here instead would read better and cost more:
+        # the quiet-run sweep moves a run to STOPPED only from PREPARING or
+        # TRAINING and deliberately exempts QUEUED, so a run marked QUEUED
+        # before it prepares would make every stuck preparation immune to the
+        # sweep -- and preparation is the phase that does the downloading.
+        slot_busy = self._training_sem.locked()
+        if slot_busy:
+            training.write_status(
+                session_id,
+                slot_busy=True,
+                slot_busy_message=(
+                    "another fine-tuning holds the training slot; this run is "
+                    "preparing its data and will train when that one finishes"
+                ),
+            )
         try:
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
@@ -1829,6 +1886,19 @@ class EntryApp:
             # quoting the URL. This catches the paths nobody has thought of,
             # which is the only kind that matters for a credential.
             safe = ngff_region.redact_store_credential(e)
+            # THE CONTENTION IS APPENDED, NOT SUBSTITUTED. The underlying error
+            # is the diagnostic and a caller needs it; what it does not say, and
+            # cannot, is that this run was sharing a worker with another one.
+            # The reported case was a bare `get_service` timed out, which reads
+            # as an unrelated RPC fault. Note this does NOT claim the contention
+            # caused the failure -- it says a slot was busy at the time, which is
+            # the fact the caller was missing.
+            if slot_busy:
+                safe = (
+                    f"{safe} [another fine-tuning held the training slot when "
+                    f"this run started, so it was preparing data alongside a "
+                    f"run in progress; that may or may not be related]"
+                )
             logger.error(f"Training session {session_id} failed: {safe}")
             training.write_status(
                 session_id, status="FAILED", message=safe[:800], terminated_by="entry"
@@ -2452,7 +2522,9 @@ class EntryApp:
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). "
+            "GeoJSON coordinates are image pixels [x, y] with the origin at the TOP-LEFT and y increasing DOWNWARD (so y is the row index); a y-up file rasterises vertically mirrored and nothing can detect it. "
+            "AIS fine-tuning "
             "needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
@@ -2773,7 +2845,8 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). "
+            "GeoJSON coordinates are image pixels [x, y] with the origin at the TOP-LEFT and y increasing DOWNWARD (so y is the row index); a y-up file rasterises vertically mirrored and nothing can detect it.",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."

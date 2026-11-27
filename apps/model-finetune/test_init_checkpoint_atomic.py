@@ -21,6 +21,7 @@ Plain pytest against a temporary HOME — no GPU, no Ray, no live Hypha.
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import io
 
@@ -72,6 +73,10 @@ class _Stub:
 
     def __init__(self):
         self._training_tasks = {}
+    # `_run_training` reads this before it prepares, to record whether
+    # another run already held the training slot. The app sets it in
+    # __init__, so a stub that drives `_run_training` needs one too.
+        self._training_sem = asyncio.Semaphore(1)
 
     async def _preparing_heartbeat(self, *a, **k):
         # _run_training creates this as a task and cancels it in its own cleanup;
