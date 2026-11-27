@@ -146,6 +146,33 @@ def test_the_error_names_where_the_value_must_actually_be_set(captured):
     ), f"it must name the symptom an operator will actually see: {said!r}"
 
 
+def test_the_error_does_not_assert_what_the_pods_cache_size_actually_is(captured):
+    """It must not tell an operator a falsehood about their own cluster.
+
+    This worker can neither read nor set the Ray pods' environment, so it cannot know whether
+    RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB is set there. An operator who HAS set it correctly would
+    otherwise be told flatly that their pods are running on Ray's default — by a message whose
+    entire purpose is to be believed. Ray's default is still worth naming; it has to be named as
+    the consequence of the variable being unset, not as a reading of the pods.
+    """
+    RayCluster(mode="external-cluster", runtime_env_pip_cache_size_gb=PASSED_SIZE)
+
+    said = next(
+        r.getMessage() for r in _ignored_records(captured) if r.levelno >= logging.ERROR
+    )
+    assert "cannot be applied from here" in said, (
+        "it must say the value cannot be applied here rather than describing the pods' state: "
+        f"{said!r}"
+    )
+    assert (
+        "cannot see their environment" in said
+    ), f"it must say the worker cannot see the pods' environment: {said!r}"
+    assert "where that variable is unset" in said, (
+        "Ray's 10 GB default must be conditional on the variable being unset there, not asserted "
+        f"as the size in force: {said!r}"
+    )
+
+
 # --- 2. passed vs defaulted ---------------------------------------------------------------------
 
 

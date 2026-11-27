@@ -302,12 +302,17 @@ class RayCluster:
         # nothing is hidden by staying quiet about a default nobody chose.
         self._runtime_env_pip_cache_applied = mode in SELF_STARTED_MODES
         if not self._runtime_env_pip_cache_applied:
+            # The wording stops short of claiming what the pods' cache size IS. This worker can
+            # neither read nor set their environment, so an operator who HAS set
+            # RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB on the pods would otherwise be told a falsehood
+            # about their own cluster by a message whose whole purpose is to be believed.
             unapplied = (
                 "runtime_env_pip_cache_size_gb=%s is IGNORED in %s mode: the Ray pods are created "
-                "by the cluster operator, so RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB must be set on "
-                "those pods, not here. Until it is, they use Ray's own default (10 GB), and app "
-                "environments larger than half of it evict one another and leave replicas stuck "
-                "in STARTING."
+                "by the cluster operator, so RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB has to be set on "
+                "those pods and cannot be applied from here. This worker cannot see their "
+                "environment, so it cannot report the size in force; where that variable is "
+                "unset, Ray's own default of 10 GB applies, and app environments larger than half "
+                "of it evict one another and leave replicas stuck in STARTING."
             )
             if self._runtime_env_pip_cache_requested is not None:
                 self.logger.error(
@@ -491,8 +496,9 @@ class RayCluster:
                 if self._runtime_env_pip_cache_applied
                 else (
                     f"the Ray pods in {self.mode} mode are created by the cluster operator, so "
-                    "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB must be set on those pods; they otherwise "
-                    "use Ray's own default of 10 GB"
+                    "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB has to be set on those pods and cannot be "
+                    "applied from here; this worker cannot see their environment, and where that "
+                    "variable is unset Ray's own default of 10 GB applies"
                 )
             ),
         }
