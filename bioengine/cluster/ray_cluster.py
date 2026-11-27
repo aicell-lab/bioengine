@@ -41,6 +41,14 @@ from bioengine.utils import (
 # comparison below says WHY 10 is the threshold instead of hiding a bare literal.
 _RAY_DEFAULT_PIP_CACHE_GB = 10
 
+# What a self-started cluster uses when the operator does not ask for a size. This is BioEngine's
+# own preference, not Ray's, and it is deliberately NOT the signature default: the parameter
+# defaults to None so that "the operator passed a value" can be told apart from "nobody said
+# anything". Without that distinction every external-cluster worker reports a dropped setting on
+# every start, including the ones whose operators configured the Ray pods correctly, and an alarm
+# that is always on is an alarm that gets filtered out.
+_SELF_STARTED_PIP_CACHE_DEFAULT_GB = 30
+
 
 class ProxyHandleAbsentError(RuntimeError):
     """The cached ``proxy_actor_handle`` is ``None``, so there is nothing to call.
@@ -119,7 +127,7 @@ class RayCluster:
         head_num_gpus: int = 0,
         head_memory_in_gb: Optional[int] = None,
         head_memory_budget_fraction: float = 0.9,
-        runtime_env_pip_cache_size_gb: int = 30,  # Ray default is 10 GB
+        runtime_env_pip_cache_size_gb: Optional[int] = None,  # None = not asked for
         force_clean_up: bool = True,
         enable_container_runtime: bool = False,
         # SLURM Worker Configuration parameters
@@ -165,7 +173,11 @@ class RayCluster:
                 memory reservation plus the memory already held by other tenants of the
                 host may occupy before a startup warning is logged. Default 0.9. Set to
                 0 to disable the check. Never blocks startup.
-            runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB. Default 30.
+            runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB.
+                Omit it (None) to use this worker's own default of 30 in the modes that start Ray
+                themselves. Only takes effect in those modes: in external-cluster mode Ray reads
+                the limit in a pod this worker did not create, so a value passed here is reported
+                as not applied and the pods keep Ray's 10 GB default.
             force_clean_up: Force cleanup of previous Ray cluster on start. Default True.
             enable_container_runtime: Opt-in container-as-runtime for apps
                 using ``@bioengine.app(container_image=…)`` (single-machine
@@ -273,16 +285,34 @@ class RayCluster:
         # It is reported LOUDLY rather than refused. Refusing would break every external-cluster
         # worker whose config carries the value harmlessly, and the operator's real problem is
         # not knowing the setting was dropped.
-        self._pip_cache_size_gb = int(runtime_env_pip_cache_size_gb)
+        self._pip_cache_requested_gb = runtime_env_pip_cache_size_gb
+        self._pip_cache_size_gb = (
+            _SELF_STARTED_PIP_CACHE_DEFAULT_GB
+            if runtime_env_pip_cache_size_gb is None
+            else int(runtime_env_pip_cache_size_gb)
+        )
         self._pip_cache_applied = False
 
-        # Logged when the configured size differs from Ray's own default, because that is exactly
-        # when something is LOST. At 10 the intent and the effect agree and an error would be
-        # noise. There is no way to distinguish "passed 30" from "defaulted to 30" without a
-        # sentinel default, and changing the signature's default to one would alter the public
-        # API for every mode, so the condition is the behavioural one rather than the syntactic
-        # one. The default IS 30, so an unconfigured external-cluster worker still says so.
-        if mode == "external-cluster" and self._pip_cache_size_gb != _RAY_DEFAULT_PIP_CACHE_GB:
+        # Validated in EVERY mode. This check used to sit inside the single-machine/slurm branch
+        # next to the export, so an external-cluster caller could pass 0 or a negative size and
+        # have it accepted in silence. A nonsense size is a misconfiguration wherever it is set.
+        if self._pip_cache_size_gb <= 0:
+            raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+
+        # Reported only when the operator ASKED for a size this mode cannot deliver, which is the
+        # only case where something the operator wrote is being dropped. Both conditions are
+        # load-bearing:
+        #   requested is not None  - a worker that never mentioned the setting has lost nothing,
+        #                            and on a KubeRay site that is every pod, so firing here
+        #                            would put a permanent error in every healthy worker's log
+        #                            and teach operators to filter out the one that matters.
+        #   != Ray's own default   - asking for exactly what Ray will enforce anyway loses
+        #                            nothing either; at 10 the intent and the effect agree.
+        if (
+            mode == "external-cluster"
+            and self._pip_cache_requested_gb is not None
+            and self._pip_cache_size_gb != _RAY_DEFAULT_PIP_CACHE_GB
+        ):
             self.logger.error(
                 f"runtime_env_pip_cache_size_gb={self._pip_cache_size_gb} is NOT APPLIED in "
                 f"external-cluster mode and has been ignored. Ray reads "
@@ -336,15 +366,13 @@ class RayCluster:
                 }
             )
 
-            # Set runtime environment pip cache size
-            if runtime_env_pip_cache_size_gb <= 0:
-                raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+            # Set runtime environment pip cache size. Validated above, in every mode.
             os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] = str(
-                runtime_env_pip_cache_size_gb
+                self._pip_cache_size_gb
             )
             self._pip_cache_applied = True
             self.logger.debug(
-                f"Setting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB to {runtime_env_pip_cache_size_gb}"
+                f"Setting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB to {self._pip_cache_size_gb}"
             )
 
             # Set SLURM worker configuration if in slurm mode
@@ -422,6 +450,10 @@ class RayCluster:
             # which.
             "runtime_env_pip_cache": {
                 "configured_gb": self._pip_cache_size_gb,
+                # Whether a human asked for that size or it is this worker's own default. An
+                # operator reading "not applied" needs to know whether it was THEIR value that
+                # got dropped.
+                "requested_gb": self._pip_cache_requested_gb,
                 "applied": self._pip_cache_applied,
                 "effective_gb": (
                     self._pip_cache_size_gb

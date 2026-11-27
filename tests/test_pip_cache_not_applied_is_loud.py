@@ -26,6 +26,51 @@ import pytest
 from bioengine.cluster.ray_cluster import _RAY_DEFAULT_PIP_CACHE_GB, RayCluster
 
 
+class _Collector(logging.Handler):
+    """Records every record emitted, at any level."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def ray_log():
+    """Capture the RayCluster logger's own records.
+
+    `caplog` CANNOT see them, and that is the dangerous part: `create_logger` sets
+    `propagate = False` and attaches its own stderr handler, so caplog's root handler never
+    receives anything from this logger. A `caplog`-based absence assertion on this surface
+    therefore passes unconditionally -- it reads "no error was logged" from a channel that could
+    never have carried one. MEASURED here: the not-applied ERROR appears in captured stderr while
+    `caplog.records` is empty.
+
+    So the handler is attached to the logger itself. `create_logger` only removes the handlers it
+    attached (it marks its own), which `test_a_handler_the_caller_attached_is_not_removed` pins,
+    so this one survives a RayCluster construction that reconfigures the logger.
+    """
+    logger = logging.getLogger("RayCluster")
+    collector = _Collector()
+    previous_level = logger.level
+    logger.addHandler(collector)
+    try:
+        yield collector
+    finally:
+        logger.removeHandler(collector)
+        logger.setLevel(previous_level)
+
+
+def _not_applied_errors(collector: _Collector) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in collector.records
+        if r.levelno >= logging.ERROR and "NOT APPLIED" in r.getMessage()
+    ]
+
+
 @pytest.fixture(autouse=True)
 def _no_cache_env_leak(monkeypatch):
     """Constructing a single-machine cluster EXPORTS the variable into this process.
@@ -58,6 +103,10 @@ def test_external_cluster_reports_the_size_as_NOT_APPLIED() -> None:
     cluster = RayCluster(mode="external-cluster")
     reported = cluster.status["runtime_env_pip_cache"]
     assert reported["configured_gb"] == 30
+    assert reported["requested_gb"] is None, (
+        "nobody passed a size here, and status has to say so: an operator reading 'not applied' "
+        "needs to know whether it was their own value that got dropped"
+    )
     assert reported["applied"] is False
     assert reported["effective_gb"] == _RAY_DEFAULT_PIP_CACHE_GB, (
         "effective_gb must be what Ray will actually enforce, or a reader has to know which "
@@ -71,67 +120,132 @@ def test_single_machine_reports_the_size_as_APPLIED_and_exports_it() -> None:
 
     cluster = _single_machine(runtime_env_pip_cache_size_gb=25)
     reported = cluster.status["runtime_env_pip_cache"]
-    assert reported == {"configured_gb": 25, "applied": True, "effective_gb": 25}
-    assert os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] == "25", (
-        "the mode that CAN apply it must still actually export it"
-    )
+    assert reported == {
+        "configured_gb": 25,
+        "requested_gb": 25,
+        "applied": True,
+        "effective_gb": 25,
+    }
+    assert (
+        os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] == "25"
+    ), "the mode that CAN apply it must still actually export it"
 
 
 # ─────────────────────────────────── the error, and its silence ──────────────────────────────
 
 
-def test_external_cluster_logs_an_ERROR_naming_the_value_and_the_remedy(caplog) -> None:
+def test_external_cluster_logs_an_ERROR_naming_the_value_and_the_remedy(
+    ray_log,
+) -> None:
     """A warning buried in a debug log is how this went unnoticed; it must be an ERROR.
 
     The message has to carry three things, because each one is a question the operator would
     otherwise have to ask someone: the value that was dropped, that it was dropped, and where to
     put it instead.
     """
-    with caplog.at_level(logging.ERROR, logger="RayCluster"):
-        RayCluster(mode="external-cluster", runtime_env_pip_cache_size_gb=30)
+    RayCluster(mode="external-cluster", runtime_env_pip_cache_size_gb=30)
 
-    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errors, "no ERROR was logged; a dropped setting stayed silent"
+    assert (
+        ray_log.records
+    ), "the logger emitted nothing at all; the capture channel is wrong"
+    errors = [r for r in ray_log.records if r.levelno >= logging.ERROR]
+    assert errors, (
+        "a dropped setting was not reported at ERROR. Emitted instead: "
+        f"{[(logging.getLevelName(r.levelno), r.getMessage()[:60]) for r in ray_log.records]}"
+    )
     msg = errors[-1].getMessage()
     assert "30" in msg, "the error does not name the value that was dropped"
     assert "NOT APPLIED" in msg, "the error does not say the value was ignored"
     assert "containerEnv" in msg, "the error does not say where to set it instead"
 
 
-def test_at_RAYS_OWN_DEFAULT_there_is_no_error_because_nothing_is_lost(caplog) -> None:
+def test_at_RAYS_OWN_DEFAULT_there_is_no_error_because_nothing_is_lost(ray_log) -> None:
     """The silence half of the contract.
 
     An error on every external-cluster start regardless of value would be noise, and noise is
     what gets filtered out — taking the real signal with it. At 10 the intent and the effect
     agree, so there is nothing to report.
     """
-    with caplog.at_level(logging.ERROR, logger="RayCluster"):
-        cluster = RayCluster(
-            mode="external-cluster",
-            runtime_env_pip_cache_size_gb=_RAY_DEFAULT_PIP_CACHE_GB,
-        )
-
-    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == [], (
-        "an error fired even though the configured size equals what Ray will enforce"
+    cluster = RayCluster(
+        mode="external-cluster",
+        runtime_env_pip_cache_size_gb=_RAY_DEFAULT_PIP_CACHE_GB,
     )
+
+    assert (
+        _not_applied_errors(ray_log) == []
+    ), "an error fired even though the configured size equals what Ray will enforce"
     # Still reported as not applied, because it is not: the value just happens to match.
     assert cluster.status["runtime_env_pip_cache"]["applied"] is False
 
 
-def test_the_single_machine_path_logs_no_such_ERROR(caplog) -> None:
+def test_an_operator_who_never_ASKED_for_a_size_gets_no_error(ray_log) -> None:
+    """The arm that keeps this from becoming an alarm nobody reads.
+
+    `--runtime-env-pip-cache-size-gb` carries no argparse default and the worker drops None
+    arguments, so an operator who never passes the flag lands on this constructor's own default.
+    On a KubeRay site that is EVERY pod. If the error fired on the default too it would be in
+    every healthy worker's log forever, including the pods whose operators set
+    RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB correctly on the RayCluster, and the one occurrence that
+    means something would be indistinguishable from the noise.
+
+    Nothing is lost in this case: no human asked for anything.
+    """
+    cluster = RayCluster(mode="external-cluster")
+
+    dropped = _not_applied_errors(ray_log)
+    assert (
+        dropped == []
+    ), f"an error fired for a size nobody asked for: {[r.getMessage() for r in dropped]}"
+    # Still honestly reported as not applied -- silent is not the same as applied.
+    assert cluster.status["runtime_env_pip_cache"]["applied"] is False
+
+
+def test_a_size_that_cannot_work_is_still_REFUSED_in_every_mode() -> None:
+    """The validation used to live beside the export, so only self-started modes ran it.
+
+    An external-cluster caller could pass 0 and have it accepted in silence. The value is
+    nonsense wherever it is written, so it is rejected in every mode now.
+    """
+    with pytest.raises(ValueError, match="greater than 0"):
+        RayCluster(mode="external-cluster", runtime_env_pip_cache_size_gb=0)
+    with pytest.raises(ValueError, match="greater than 0"):
+        _single_machine(runtime_env_pip_cache_size_gb=-1)
+
+
+def test_the_slurm_path_logs_no_such_ERROR(ray_log) -> None:
+    """The second mode that CAN apply the value, and the one a mode check is easy to get wrong.
+
+    A guard written as `mode != "single-machine"` passes every other arm in this file while
+    telling a SLURM operator their size was dropped when it was in fact exported.
+
+    This host has no SLURM, so the constructor raises once it reaches the SLURM branch. That
+    raise is the point: the branch sits AFTER the not-applied report, so reaching it proves the
+    report site was executed and skipped, rather than this arm passing because construction died
+    before getting there.
+    """
+    with pytest.raises(RuntimeError, match="SLURM is not available"):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temp_dir:
+            RayCluster(
+                mode="slurm",
+                runtime_env_pip_cache_size_gb=25,
+                ray_temp_dir=temp_dir,
+                force_clean_up=False,
+                worker_workspace_dir=temp_dir,
+            )
+
+    dropped = _not_applied_errors(ray_log)
+    assert dropped == [], f"slurm logged a not-applied error: {dropped}"
+
+
+def test_the_single_machine_path_logs_no_such_ERROR(ray_log) -> None:
     """A mode that CAN apply the value must not warn about it.
 
     This is the arm that stops the error being unconditional — a mutant that drops the mode check
     passes every other arm in this file.
     """
-    with caplog.at_level(logging.ERROR, logger="RayCluster"):
-        _single_machine(runtime_env_pip_cache_size_gb=25)
+    _single_machine(runtime_env_pip_cache_size_gb=25)
 
-    dropped = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.ERROR and "NOT APPLIED" in r.getMessage()
-    ]
+    dropped = _not_applied_errors(ray_log)
     assert dropped == [], f"single-machine logged a not-applied error: {dropped}"
 
 

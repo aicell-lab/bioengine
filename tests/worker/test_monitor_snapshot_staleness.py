@@ -196,6 +196,12 @@ def ray_cluster_with_history(history: OrderedDict) -> RayCluster:
     cluster.head_geo_location = None
     cluster.cluster_status_history = history
     cluster._last_slurm_jobs = None
+    # This object skips __init__, so every attribute `status` reads has to be set by hand. The
+    # pip-cache reporting fields are what a slurm cluster would hold: a size nobody asked for,
+    # defaulted, and genuinely applied because this mode starts Ray itself.
+    cluster._pip_cache_size_gb = 30
+    cluster._pip_cache_requested_gb = None
+    cluster._pip_cache_applied = True
     return cluster
 
 
