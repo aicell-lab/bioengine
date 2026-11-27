@@ -134,7 +134,6 @@ separate `expires_in` defaulting to the same hour. So it is an upload deadline
 *and* a file lifetime — and raising `ttl` alone widens neither in a way a caller
 can use, because the signature still dies on the hour.
 
-
 Two consequences. Staging a dataset by minting many URLs up front and uploading
 them in a long sequential loop spends the window on the loop — the first files
 staged are near the end of their life by the time the last lands, so mint each

@@ -454,9 +454,17 @@ class _RecognisedRedeposit(Exception):
 
 
 # Exactly what `get_upload_url` and `_put_temp_embedding` write: a `temp/`
-# segment holding a uuid4, then an extension. Anchored to a segment boundary so
-# `datasets/temp/<uuid>.npy` cannot match on the right of a longer path, and
-# requiring the UUID so a foreign `/temp/scan_001.tif` cannot match at all.
+# segment holding a uuid4, then an extension.
+#
+# THE UUID IS THE DISCRIMINATOR, NOT THE BOUNDARY, and an earlier version of
+# this comment got that backwards -- it claimed `datasets/temp/<uuid>.npy`
+# "cannot match on the right of a longer path". It does match: `(?:^|/)` has to
+# accept a leading path, because the real download URL is
+# `.../s3/<bucket>/<workspace>/temp/<uuid>.npy` and the segment is never at the
+# start. What keeps a foreign source out is the UUID: `/temp/scan_001.tif` and
+# `datasets/temp/a.npy` both fail on it. An artifact file literally named
+# `temp/<uuid4>.<ext>` would be taken for a staged one, which is accepted --
+# nothing in this app writes one, and the alternative is losing the proxy form.
 _STAGED_PATH_RE = re.compile(
     r"(?:^|/)temp/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
     r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.[A-Za-z0-9]+$"
