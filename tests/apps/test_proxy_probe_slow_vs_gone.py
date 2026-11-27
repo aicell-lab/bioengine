@@ -271,4 +271,87 @@ def test_the_in_place_reassert_passes_overwrite() -> None:
     client's own earlier registration.
     """
     src = inspect.getsource(_ProxyCls._register_services)
-    assert "overwrite=reuse_connection" in src
+    assert '{"overwrite": True} if reuse_connection else {}' in src
+
+
+# --------------------------------------------------------------------------
+# Round-1 review findings. Each of these is a case the first version of this
+# fix got WRONG, so they are controls against repeating it, not decoration.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_closed_transport_still_rebuilds() -> None:
+    """A transport that says it is CLOSED is not a slow server.
+
+    Round-1 regression, caught in review. Narrowing the rebuild to "definitive
+    absence only" left ``_connection_lost`` with no setter but token renewal,
+    so once hypha_rpc marks its connection closed — every call then raising
+    ``ConnectionError("Connection is closed")`` IMMEDIATELY, which is how it
+    reports a refused reconnection — the proxy sat in the do-nothing branch
+    for the life of the replica, logging "did not answer within 5.0s" about an
+    error that came back in 0 s.
+
+    Only ``asyncio.TimeoutError`` earns the do-nothing branch. Everything that
+    is neither a timeout nor a definitive absence keeps the behaviour it had
+    before #1061: rebuild.
+    """
+    server = _RecordingServer(ConnectionError("Connection is closed"))
+    register = _RecordingRegister()
+    inst = _bare_proxy(server=server, websocket_service_id="ws")
+    inst._register_services = register
+
+    await inst._maintenance_tick()  # probe fails, fast and definitively
+    assert inst._connection_lost is True
+    assert inst._registration_absent is False
+    assert inst._probe_timeouts == 0, "a closed transport is not a timeout"
+
+    await inst._maintenance_tick()  # and the rebuild actually happens
+    assert register.calls == [False], "a full rebuild, not an in-place re-assert"
+
+
+@pytest.mark.asyncio
+async def test_repeated_in_place_failures_escalate_to_a_rebuild() -> None:
+    """The in-place path assumes the transport is fine. When that assumption is
+    wrong there is no other way back, because the rebuild branch is reached
+    through ``_connection_lost``, which this path never sets. So it gives up."""
+    server = _RecordingServer()
+    register = _RecordingRegister(RuntimeError("hypha said no"))
+    inst = _bare_proxy(
+        server=server, websocket_service_id="ws", _registration_absent=True
+    )
+    inst._register_services = register
+
+    for _ in range(pd_module._INPLACE_FAILURES_BEFORE_REBUILD):
+        inst._next_register_at = 0.0  # make each attempt due
+        await inst._maintenance_tick()
+
+    assert inst._connection_lost is True, "must stop insisting the socket is fine"
+    assert inst._registration_absent is False
+    assert len(register.calls) == pd_module._INPLACE_FAILURES_BEFORE_REBUILD
+    assert all(c is True for c in register.calls)
+
+
+def test_the_in_place_path_clears_the_rtc_registration_first() -> None:
+    """``register_rtc_service(server, service_id, config)`` takes no overwrite
+    and calls ``register_service`` without one, so on the reuse path the
+    client's own ``_services`` dict refuses the id.
+
+    Measured 2026-11-27 on the throwaway hypha-server (production image,
+    hypha_rpc 0.21.40): re-asserting the RTC id on a live connection raises
+    "Service already exists: <id>-rtc ... or overwrite=True". That exception is
+    swallowed by the warn-only handler, because WebRTC must never fail the
+    deployment — so without clearing it first, an in-place repair leaves -rtc
+    unregistered permanently and nothing retries it, since the probe only ever
+    asks about the main id. After ``unregister_service`` the re-register
+    succeeds and both ids resolve.
+    """
+    src = inspect.getsource(_ProxyCls._register_services)
+    # Anchor on the CALLS, not on any mention: the source comment next to them
+    # names register_rtc_service(...) too, and matching that instead silently
+    # compares a comment's position with a call's.
+    rtc_at = src.index("await register_rtc_service(")
+    clear_at = src.index("await self.server.unregister_service(")
+    assert clear_at < rtc_at, "the -rtc entry must be dropped BEFORE re-registering"
+    head = src[:rtc_at]
+    assert "if reuse_connection:" in head

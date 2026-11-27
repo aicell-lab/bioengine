@@ -37,6 +37,7 @@ class ProxyDouble(PROXY_CLS):
     _registration_absent = False
     _probe_timeouts = 0
     _probe_timeouts_consecutive = 0
+    _inplace_failures = 0
 
     def _start_background_workers(self) -> None:
         """Drop the Serve-only background startup.

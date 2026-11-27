@@ -73,6 +73,13 @@ _REACHABILITY_PROBE_INTERVAL_S = 60
 # and a server slower than that is by definition the SLOW case below — which is
 # now handled without touching the connection, so classifying it early is safe.
 _PROBE_TIMEOUT_S = 5.0
+# How many in-place re-assert attempts may fail before we stop insisting the
+# connection is usable and fall back to a full rebuild. The in-place repair
+# assumes the transport is fine and only the registration was lost; if that
+# assumption is wrong there is no other path back, because the rebuild branch
+# is reached through _connection_lost, which this path deliberately does not
+# set. Three attempts at _REREGISTER_BACKOFF_S apart is ~90 s of insisting.
+_INPLACE_FAILURES_BEFORE_REBUILD = 3
 # Backoff between re-registration attempts, so a Hypha outage costs a retry per
 # interval rather than a reconnect storm. It is NOT what clears a stale client:
 # Hypha's check_client pings the existing client and reaps it on the spot if it
@@ -413,6 +420,7 @@ class ProxyDeployment:
         # get_usage_stats so an operator can see it without the replica log.
         self._probe_timeouts = 0
         self._probe_timeouts_consecutive = 0
+        self._inplace_failures = 0
         self._registration_failure: Optional[BaseException] = None
         self._probe_due_at = 0.0
         self._next_register_at = 0.0
@@ -1540,6 +1548,14 @@ class ProxyDeployment:
             # flag: the id is namespaced by client_id, which means the only
             # thing ``overwrite`` can ever replace here is this client's own
             # earlier registration.
+            # Passed ONLY on the reuse path, rather than always with a boolean:
+            # the fresh path's call then stays exactly what it was, so nothing
+            # that already speaks to this signature — including test doubles
+            # standing in for a Hypha server — has to learn a keyword it never
+            # needs. Found in review: the always-pass form broke
+            # tests/apps/test_usage_ledger.py's _FakeServer with
+            # "unexpected keyword argument 'overwrite'".
+            overwrite_kwargs = {"overwrite": True} if reuse_connection else {}
             websocket_service_info = await self.server.register_service(
                 {
                     "id": self.application_id,
@@ -1549,7 +1565,7 @@ class ProxyDeployment:
                     "config": {"visibility": "public", "require_context": True},
                     **service_functions,
                 },
-                overwrite=reuse_connection,
+                **overwrite_kwargs,
             )
             self.websocket_service_id = (
                 f"{self.workspace}/{self.client_id}:{self.application_id}"
@@ -1594,6 +1610,36 @@ class ProxyDeployment:
             # dict via partial(...), so a mutation here is picked up by
             # every subsequent WebRTC connection request.
             self._rtc_config = rtc_config
+
+            # On the reuse path the WebRTC service needs the local entry
+            # dropped first, and unlike the main service there is no other way
+            # to do it: ``register_rtc_service(server, service_id, config)``
+            # takes no ``overwrite``, and underneath it calls
+            # ``register_service`` without one, so the client's own
+            # ``_services`` dict refuses the id.
+            #
+            # Measured 2026-11-27 on the throwaway hypha-server (production
+            # image, hypha_rpc 0.21.40): re-asserting the RTC id on a live
+            # connection raises "Service already exists: <id>-rtc ... or
+            # overwrite=True". That exception is swallowed by the warn-only
+            # handler below — WebRTC is optional and must not fail the
+            # deployment — so without this the in-place repair would leave the
+            # ``-rtc`` service unregistered for the life of the replica, with
+            # nothing to retry it: the probe only ever asks about the main id.
+            # After the unregister, re-registering succeeds and BOTH ids
+            # resolve. Found in review; the first version of this repair
+            # restored only the main service.
+            if reuse_connection:
+                try:
+                    await self.server.unregister_service(f"{self.application_id}-rtc")
+                except Exception as e:
+                    # Nothing to drop is the normal case the first time, and a
+                    # failure here only costs us the re-registration below,
+                    # which is already optional.
+                    logger.info(
+                        f"ℹ️ No prior WebRTC registration to clear for "
+                        f"'{self.application_id}': {e}"
+                    )
 
             # Register WebRTC service
             rtc_service_info = await register_rtc_service(
@@ -1876,6 +1922,7 @@ class ProxyDeployment:
                     # flag would stay set and every later tick would
                     # re-register for the life of the replica.
                     self._registration_absent = False
+                    self._inplace_failures = 0
                     self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
                     self._next_register_at = 0.0
                     self._report_service_registration(True)
@@ -1884,11 +1931,33 @@ class ProxyDeployment:
                         f"in place, without dropping the connection"
                     )
                 except Exception as e:
-                    # Flag intentionally LEFT SET so the next tick retries.
-                    logger.warning(
-                        f"⚠️ In-place re-registration for '{self.application_id}' "
-                        f"failed; retrying in {_REREGISTER_BACKOFF_S}s: {e}"
-                    )
+                    # Flag intentionally LEFT SET so the next tick retries —
+                    # but NOT forever. If the cause is a connection Hypha has
+                    # actually reaped, re-asserting on it can never succeed and
+                    # retrying in place every _REREGISTER_BACKOFF_S would be an
+                    # unrecoverable state with no path back to the full
+                    # rebuild. After _INPLACE_FAILURES_BEFORE_REBUILD attempts
+                    # we stop insisting the connection is fine and let the
+                    # rebuild branch have it.
+                    self._inplace_failures += 1
+                    if self._inplace_failures >= _INPLACE_FAILURES_BEFORE_REBUILD:
+                        logger.warning(
+                            f"⚠️ In-place re-registration for "
+                            f"'{self.application_id}' failed "
+                            f"{self._inplace_failures} times; escalating to a "
+                            f"full client rebuild: {e}"
+                        )
+                        self._registration_absent = False
+                        self._inplace_failures = 0
+                        self._connection_lost = True
+                    else:
+                        logger.warning(
+                            f"⚠️ In-place re-registration for "
+                            f"'{self.application_id}' failed "
+                            f"({self._inplace_failures}/"
+                            f"{_INPLACE_FAILURES_BEFORE_REBUILD}); retrying in "
+                            f"{_REREGISTER_BACKOFF_S}s: {e}"
+                        )
             return
 
         if time.time() < self._probe_due_at:
@@ -1932,7 +2001,7 @@ class ProxyDeployment:
                     f"registered; re-asserting it on the existing connection: {e}"
                 )
                 self._registration_absent = True
-            else:
+            elif isinstance(e, asyncio.TimeoutError):
                 self._probe_timeouts += 1
                 self._probe_timeouts_consecutive += 1
                 # Loud, and counted: this is the branch that does NOTHING, so
@@ -1946,6 +2015,29 @@ class ProxyDeployment:
                     f"server is not a lost registration. {type(e).__name__}: {e}"
                 )
                 self._probe_due_at = time.time() + _REACHABILITY_PROBE_INTERVAL_S
+            else:
+                # ONLY a timeout earns the do-nothing branch. Anything else that
+                # is not a definitive absence is a transport that answered
+                # FAST and badly — and the commonest of those is a connection
+                # hypha_rpc has already given up on: once it marks the socket
+                # closed, every call raises ConnectionError("Connection is
+                # closed") immediately, which is not a slow server and will
+                # never recover on its own.
+                #
+                # Narrowing the previous behaviour to only the timeout case was
+                # the point of #1061; widening it to swallow everything would
+                # have left _connection_lost with no setter but token renewal,
+                # so a dead transport would be retried in place for the life of
+                # the replica while this logged "did not answer within 5.0s"
+                # about an error that came back in 0 s. The rebuild stays
+                # exactly where it was for every case except the one that was
+                # shown to be harmful.
+                logger.warning(
+                    f"⚠️ Reachability probe for '{self.websocket_service_id}' "
+                    f"failed without answering and without timing out; "
+                    f"rebuilding the client: {type(e).__name__}: {e}"
+                )
+                self._connection_lost = True
 
     async def _maintenance_loop(self) -> None:
         # Started here rather than from the constructor, and deliberately:
