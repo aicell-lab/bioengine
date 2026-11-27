@@ -162,6 +162,13 @@ _GPU_FRACTION_DECIMALS = 2
 _GPU_FRACTION_GRACE = 0.1
 
 
+# How long to wait for a cancelled build task to actually finish. ``ray.cancel``
+# only REQUESTS cancellation, so the ref becoming ready is the first evidence the
+# task has stopped. Bounded so a task wedged in a runtime_env install cannot hold
+# an undeploy open; a timeout is reported as "not confirmed", never as success.
+_BUILD_CANCEL_WAIT_SECONDS = 30.0
+
+
 class AppBuilder:
     """Build BioEngine apps from artifact storage for Ray Serve.
 
@@ -1129,16 +1136,38 @@ class AppBuilder:
                 f"Deployment of '{application_id}' was cancelled; cancelling the "
                 "in-flight build task so it cannot re-create the application."
             )
+            cancelled_cleanly = False
             try:
                 ray.cancel(ref, force=True)
+                # ``ray.cancel`` RETURNING is not the task ENDING. Wait for the ref to
+                # become ready — the task is then genuinely finished (it raises
+                # TaskCancelledError on the cancelled path, which ``ray.get`` would
+                # surface and which is exactly the outcome wanted here).
+                #
+                # Bounded, because a task wedged inside a runtime_env install must not
+                # hold the undeploy open. If the wait times out the task is still alive
+                # and may yet call serve.run, so that is reported as NOT cancelled
+                # rather than assumed away: a fixed post-delete poll window cannot cover
+                # a multi-minute pip install, which is how the orphan is created.
+                done, _pending = await asyncio.to_thread(
+                    ray.wait, [ref], timeout=_BUILD_CANCEL_WAIT_SECONDS
+                )
+                cancelled_cleanly = bool(done)
             except Exception as cancel_error:
-                # Reported, never swallowed: if the task outlives this, the
-                # caller's own post-delete check is what catches it, and that
-                # check needs to know this failed.
                 self.logger.warning(
                     f"Could not cancel the build task for '{application_id}': "
-                    f"{cancel_error}. The application may be re-created after "
-                    "deletion; the undeploy re-checks Ray Serve for exactly this."
+                    f"{cancel_error}."
+                )
+            if not cancelled_cleanly:
+                # Reported LOUDLY and attributed, never swallowed: this is the state in
+                # which an application can still appear in Ray Serve after the worker
+                # has deleted it and stopped tracking it.
+                self.logger.error(
+                    f"The build task for '{application_id}' was NOT confirmed finished "
+                    f"within {_BUILD_CANCEL_WAIT_SECONDS}s of cancelling it. It may still "
+                    "call serve.run and re-create the application after the undeploy has "
+                    "deleted it, which would leave an application Ray Serve holds and "
+                    "this worker does not list."
                 )
             raise
         except ray.exceptions.RayTaskError as exc:

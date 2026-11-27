@@ -1288,7 +1288,11 @@ class AppsManager:
             serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
             return set(serve_status.applications or {})
         except Exception as status_error:
-            self.logger.warning(
+            # DEBUG, not WARNING: an unreadable Serve list here is not an operator-actionable
+            # event. The controller-loss path below reports a genuinely missing controller with
+            # its own verdict; this sweep going quiet for one cooldown is diagnostic only, and
+            # at WARNING it would fire on every tick of an unhealthy cluster.
+            self.logger.debug(
                 f"Could not read Ray Serve's application list: {status_error}"
             )
             return None
@@ -1317,6 +1321,14 @@ class AppsManager:
 
         An unreadable Serve status yields an empty list rather than claiming
         every tracked application is orphaned.
+
+        **Only this worker's own applications count.** Several workers from different Hypha
+        workspaces can share one Ray cluster, and ``serve.status()`` returns every workspace's
+        apps — the same reason ``recover_deployed_applications`` filters before adopting. Without
+        the filter, "names minus the ones I track" reports a SIBLING's healthy application as an
+        orphan, at ERROR, every cooldown, for ever. A candidate whose ``app_data`` cannot be read
+        is NOT reported: on a shared cluster "I could not tell whose it is" must not become "it is
+        unmanaged", which is the direction that produces the permanent false alarm.
         """
         names = (
             serve_application_names
@@ -1325,7 +1337,9 @@ class AppsManager:
         )
         if names is None:
             return []
-        orphans = sorted(names - set(self._deployed_applications))
+
+        candidates = sorted(names - set(self._deployed_applications))
+        orphans = [c for c in candidates if await self._is_this_workers_app(c)]
         if orphans:
             self.logger.error(
                 "Ray Serve is holding application(s) this worker does not track: "
@@ -1333,6 +1347,58 @@ class AppsManager:
                 "stop_app, and they still hold their resources."
             )
         return orphans
+
+    async def _is_this_workers_app(self, application_id: str) -> bool:
+        """Whether an untracked Serve application was deployed by THIS worker's workspace.
+
+        Reads the app's own ``app_data`` the same way the adoption path does. Anything that
+        cannot be established — no handle, no data, a timeout, a sibling's marker — answers
+        False, because the caller turns True into an ERROR naming the app as unmanaged.
+        """
+        try:
+            handle = await self.ray_cluster.call_with_reconnect(
+                serve.get_app_handle, application_id
+            )
+            app_data = await asyncio.wait_for(
+                handle.get_app_data.remote(), timeout=10.0
+            )
+        except Exception as exc:
+            self.logger.debug(
+                f"Not reporting '{application_id}' as an orphan: its app_data could not be "
+                f"read ({type(exc).__name__}), so whose it is cannot be established."
+            )
+            return False
+        if not isinstance(app_data, dict):
+            return False
+        return _belongs_to_worker_workspace(
+            application_id=application_id,
+            app_data=app_data,
+            current_workspace=self.server.config.workspace,
+            logger=self.logger,
+        )
+
+    async def _report_orphans_if_due(
+        self, serve_application_names: Optional[Set[str]] = None
+    ) -> bool:
+        """Run the orphan sweep, at most once per cooldown. Returns whether it ran.
+
+        Separated from ``monitor_applications`` so it can be called BEFORE that method's
+        ``if not apps_to_redeploy: ... return``. It used to sit after it, which meant the sweep
+        never ran in precisely the state this row is about: after a stop, the worker can be
+        tracking nothing at all, or only apps with ``auto_redeploy`` off, and on both paths the
+        tick returned before reaching it. A watcher that is skipped exactly when an orphan is
+        most likely is not a watcher.
+        """
+        if (
+            time.time() - getattr(self, "_last_orphan_report", 0.0)
+            < _ORPHAN_REPORT_COOLDOWN_SECONDS
+        ):
+            return False
+        if await self.get_orphaned_applications(
+            serve_application_names=serve_application_names
+        ):
+            self._last_orphan_report = time.time()
+        return True
 
     async def _delete_and_confirm_absent(
         self,
@@ -1373,6 +1439,21 @@ class AppsManager:
         consecutive_absent = 0
         rounds = 0
         while consecutive_absent < polls:
+            # A NEW deploy may legitimately reuse this id while the window is open. It
+            # re-tracks the id and puts the app back in Ray Serve — which from inside this loop
+            # is indistinguishable from the re-creation it is hunting. Without this check the
+            # loop deletes the user's brand-new application up to max_rounds times and then the
+            # caller's delete_failed path OVERWRITES its tracking entry with the stopped one,
+            # auto_redeploy off. Tracking is the signal: the id being back in
+            # _deployed_applications means somebody deployed it on purpose, and this undeploy
+            # is done.
+            if application_id in self._deployed_applications:
+                self.logger.info(
+                    f"Application '{application_id}' is tracked again, so it was redeployed "
+                    "while this undeploy was confirming its removal. Leaving the new "
+                    "deployment alone."
+                )
+                return True
             rounds += 1
             if rounds > max_rounds:
                 self.logger.error(
@@ -2660,6 +2741,12 @@ class AppsManager:
             for app_id, app_info in self._deployed_applications.items()
             if app_info["auto_redeploy"]
         ]
+        # BEFORE the early return below. An orphan is most likely exactly when this worker
+        # tracks nothing — which is the state a stop leaves — and the return skips everything
+        # after it. The sweep makes its own serve.status call at most once per cooldown, so the
+        # hot path pays nothing on the ticks in between.
+        await self._report_orphans_if_due()
+
         if not apps_to_redeploy:
             # Noticing is not redeploying. A worker tracking only opted-out apps
             # used to return here and never read Serve's state at all, which made
@@ -2726,24 +2813,6 @@ class AppsManager:
                 # trigger a sweep.
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
-
-        # Report applications Ray Serve holds that this worker does not track. Reuses the
-        # status just fetched rather than making its own call, so the sweep costs nothing
-        # extra per tick, and is rate-limited because an orphan persists: without the
-        # cooldown this would repeat the same error every monitoring interval, and an
-        # error repeated every ten seconds is one an operator filters out.
-        # getattr default: monitor_applications is also driven against AppsManager
-        # instances built without __init__, which carry none of its attributes. Reading
-        # this one directly turned 35 unrelated monitor tests into AttributeErrors. Same
-        # idiom as _co_tenancy_warnings in status().
-        if (
-            time.time() - getattr(self, "_last_orphan_report", 0.0)
-            >= _ORPHAN_REPORT_COOLDOWN_SECONDS
-        ):
-            if await self.get_orphaned_applications(
-                serve_application_names=set(serve_status.applications or {})
-            ):
-                self._last_orphan_report = time.time()
 
         if not serve_status.applications and await _controller_is_missing_off_loop():
             # Controller lost, but serve.status reported it as an empty status

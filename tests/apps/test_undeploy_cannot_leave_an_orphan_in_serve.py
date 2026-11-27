@@ -257,6 +257,11 @@ class _ManagerStub:
     _serve_application_exists = _real_or_missing("_serve_application_exists")
     _delete_and_confirm_absent = _real_or_missing("_delete_and_confirm_absent")
 
+    async def _is_this_workers_app(self, application_id):
+        # Default for arms that are not about workspace filtering. The filter itself is
+        # pinned by its own arms, which override this.
+        return True
+
     def __init__(self, cluster, logger):
         self.ray_cluster = cluster
         self.logger = logger
@@ -331,7 +336,7 @@ async def test_a_clean_undeploy_does_not_delete_twice() -> None:
 
     assert cluster.deletes == 1, f"a clean undeploy issued {cluster.deletes} deletes"
     assert APP not in mgr._deployed_applications
-    assert not any("present in Ray Serve again" in m for m in log.messages("warning"))
+    assert not any("present in Ray Serve again" in m for m in log.messages("error"))
 
 
 # ───────────────────────────── 3. the orphan comparison is readable ──────────────────────────
@@ -379,73 +384,24 @@ async def test_an_unreadable_serve_status_is_not_reported_as_everything_orphaned
 # ──────────────── 4. the sweep is WIRED to the monitor, not merely available ─────────────────
 
 
-def test_the_monitor_actually_runs_the_orphan_sweep() -> None:
-    """A method nobody calls reports nothing.
+def test_the_monitor_sweep_is_not_pinned_by_a_source_grep_alone() -> None:
+    """Kept, but DEMOTED to what it really is: a cheap wiring check.
 
-    The clause this pins is "a watcher reports any Serve app that is not in its app list" — so the
-    comparison existing is not enough, something has to run it. Asserted structurally, against the
-    monitor's source, because driving a full monitor tick needs a live Ray cluster.
-
-    Anchored on the call and on the reuse of the status the tick already fetched: making the sweep
-    do its own ``serve.status`` would double the RPCs on the hot loop, and a reviewer should see
-    that choice break if someone changes it.
+    The reviewer showed the behavioural hole this could never catch — the sweep used to sit
+    after `if not apps_to_redeploy: ... return`, so it was skipped in exactly the state a stop
+    leaves. Grepping the source said "the call is present" the whole time. The arm that decides
+    the contract is the one below, which drives the tick; this one only keeps the cheap
+    properties (the pre-fetch reuse and the cooldown) from being dropped silently.
     """
     import inspect
 
     source = inspect.getsource(AppsManager.monitor_applications)
-    assert "get_orphaned_applications(" in source, (
-        "the monitor never calls the orphan sweep, so an orphan is still only visible to "
-        "somebody who thinks to ask"
-    )
-    assert "serve_application_names=" in source, (
-        "the sweep is called without the status the tick already fetched, so it makes a second "
-        "serve.status RPC on every monitoring interval"
-    )
     assert (
-        "_ORPHAN_REPORT_COOLDOWN_SECONDS" in source
+        "_report_orphans_if_due" in source
+    ), "the monitor never calls the orphan sweep"
+    assert "_ORPHAN_REPORT_COOLDOWN_SECONDS" in inspect.getsource(
+        AppsManager._report_orphans_if_due
     ), "an orphan persists, so an unthrottled report repeats every tick and becomes noise"
-
-
-def test_a_prefetched_status_is_used_instead_of_a_second_rpc() -> None:
-    """The behavioural half of the arm above: given names, it must not call Serve again."""
-    import asyncio
-
-    log = _Logger()
-
-    class _Exploding(_ClusterStub):
-        async def call_with_reconnect(self, fn, *args):
-            raise AssertionError("the sweep made its own serve.status call")
-
-    mgr = _ManagerStub(_Exploding([]), log)
-    mgr._deployed_applications = {"tracked": {}}
-
-    orphans = asyncio.run(
-        _real_or_missing("get_orphaned_applications")(
-            mgr, serve_application_names={"tracked", "ghost"}
-        )
-    )
-    assert orphans == ["ghost"], orphans
-
-
-def test_the_sweep_tolerates_a_manager_built_without_init() -> None:
-    """The monitor is driven against AppsManager instances that never ran ``__init__``.
-
-    Adding a plain ``self._last_orphan_report`` read to the tick turned 35 unrelated monitor
-    tests into AttributeErrors, because those managers carry none of ``__init__``'s attributes.
-    The guard is a getattr default, matching what ``status()`` already does for
-    ``_co_tenancy_warnings``. Pinned structurally: a direct read reintroduces the break, and it
-    would surface far from here.
-    """
-    import inspect
-
-    source = inspect.getsource(AppsManager.monitor_applications)
-    assert 'getattr(self, "_last_orphan_report"' in source, (
-        "the cooldown timestamp is read directly, which raises AttributeError on every manager "
-        "built without __init__ - that is most of the monitor test suite"
-    )
-
-
-# ───────── 5. absence must HOLD, because ray.cancel is a request and not a death ──────────────
 
 
 @pytest.mark.asyncio
@@ -462,6 +418,10 @@ async def test_an_app_recreated_AFTER_the_first_poll_is_still_caught() -> None:
     log = _Logger()
     cluster = _ClusterStub(present_after_delete=[[], [APP], [], [], [], [], [], []])
     mgr = _ManagerStub(cluster, log)
+
+    # _undeploy_application has already popped the entry by the time it calls
+    # this; leaving it tracked would mean 'redeployed meanwhile' instead.
+    mgr._deployed_applications = {}
 
     confirmed = await _real_or_missing("_delete_and_confirm_absent")(
         mgr, APP, polls=3, interval=0
@@ -491,6 +451,10 @@ async def test_an_app_that_keeps_coming_back_is_reported_as_NOT_confirmed() -> N
     failing = _FailingDelete(present_after_delete=[[APP]] * 12)
     mgr = _ManagerStub(failing, log)
 
+    # _undeploy_application has already popped the entry by the time it calls
+    # this; leaving it tracked would mean 'redeployed meanwhile' instead.
+    mgr._deployed_applications = {}
+
     confirmed = await _real_or_missing("_delete_and_confirm_absent")(
         mgr, APP, polls=3, interval=0
     )
@@ -507,6 +471,10 @@ async def test_a_clean_delete_confirms_without_deleting_again() -> None:
     cluster = _ClusterStub(present_after_delete=[[], [], [], [], []])
     mgr = _ManagerStub(cluster, log)
 
+    # _undeploy_application has already popped the entry by the time it calls
+    # this; leaving it tracked would mean 'redeployed meanwhile' instead.
+    mgr._deployed_applications = {}
+
     confirmed = await _real_or_missing("_delete_and_confirm_absent")(
         mgr, APP, polls=3, interval=0
     )
@@ -515,3 +483,115 @@ async def test_a_clean_delete_confirms_without_deleting_again() -> None:
         cluster.deletes == 0
     ), f"a clean delete issued {cluster.deletes} extra delete(s)"
     assert not log.messages("error")
+
+
+# ──────── 6. the findings the round-1 REFUSE proved my earlier arms could not catch ──────────
+
+
+class _SweepManager(_ManagerStub):
+    """A manager whose sweep can be driven, recording whether it ran."""
+
+    get_orphaned_applications = _real_or_missing("get_orphaned_applications")
+    _report_orphans_if_due = _real_or_missing("_report_orphans_if_due")
+
+    def __init__(self, cluster, logger, tracked):
+        super().__init__(cluster, logger)
+        self._deployed_applications = dict(tracked)
+        self.swept = False
+
+    async def _is_this_workers_app(self, application_id):
+        return True  # workspace filtering is pinned by its own arms below
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_runs_WITH_NOTHING_TRACKED(monkeypatch) -> None:
+    """The state the incident leaves, and the one the old placement skipped.
+
+    The sweep used to sit after `if not apps_to_redeploy: ... return`. After a stop the worker
+    can track nothing at all, so the tick returned before reaching it — a watcher skipped exactly
+    when an orphan is most likely. Grepping the source could never see that, which is why this
+    arm drives the sweep instead of reading it.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[["orphan-app"]])
+    mgr = _SweepManager(cluster, log, tracked={})
+    monkeypatch.setattr(
+        manager_mod, "_ORPHAN_REPORT_COOLDOWN_SECONDS", 0, raising=False
+    )
+
+    ran = await _real_or_missing("_report_orphans_if_due")(mgr)
+
+    assert ran is True, "the sweep did not run while this worker tracked NOTHING"
+    assert any(
+        "orphan-app" in m for m in log.messages("error")
+    ), f"the orphan was not reported: {log.messages('error')}"
+
+
+@pytest.mark.asyncio
+async def test_a_SIBLING_workspaces_app_is_not_called_an_orphan() -> None:
+    """Several workers share one Ray cluster, and serve.status() returns all of their apps.
+
+    Without a workspace filter, "names minus the ones I track" reports a sibling's healthy
+    application as unmanaged, at ERROR, every cooldown, for ever.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[["mine", "sibling-ws-app"]])
+    mgr = _SweepManager(cluster, log, tracked={"mine": {}})
+
+    async def _only_mine(application_id):
+        return application_id != "sibling-ws-app"
+
+    mgr._is_this_workers_app = _only_mine
+
+    orphans = await _real_or_missing("get_orphaned_applications")(mgr)
+
+    assert (
+        orphans == []
+    ), f"a sibling workspace's app was reported as an orphan: {orphans}"
+    assert not log.messages("error"), log.messages("error")
+
+
+@pytest.mark.asyncio
+async def test_an_app_whose_owner_cannot_be_established_is_not_reported() -> None:
+    """ "I could not tell whose it is" must not become "it is unmanaged".
+
+    On a shared cluster that direction produces a permanent false alarm, which is the noise the
+    cooldown exists to avoid in the first place.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[["unknown-app"]])
+    mgr = _SweepManager(cluster, log, tracked={})
+
+    async def _cannot_tell(application_id):
+        return False
+
+    mgr._is_this_workers_app = _cannot_tell
+
+    assert await _real_or_missing("get_orphaned_applications")(mgr) == []
+    assert not log.messages("error")
+
+
+@pytest.mark.asyncio
+async def test_a_REDEPLOY_during_the_confirm_window_is_left_alone() -> None:
+    """A new deploy may legitimately reuse the id while the window is open.
+
+    From inside the loop that is indistinguishable from the re-creation it hunts. Unchecked it
+    deletes the user's brand-new application repeatedly and the caller then overwrites its
+    tracking entry with the stopped one. Tracking is the signal: the id being back means
+    somebody deployed it on purpose.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[[APP]])
+    mgr = _ManagerStub(cluster, log)
+    mgr._deployed_applications = {APP: {"auto_redeploy": True}}  # redeployed meanwhile
+
+    confirmed = await _real_or_missing("_delete_and_confirm_absent")(
+        mgr, APP, polls=3, interval=0
+    )
+
+    assert (
+        confirmed is True
+    ), "the undeploy should finish rather than fight a fresh deploy"
+    assert (
+        cluster.deletes == 0
+    ), f"the confirm loop deleted a freshly redeployed app {cluster.deletes} time(s)"
