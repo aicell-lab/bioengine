@@ -289,11 +289,17 @@ def _acquire_claim(app_dir: Path, logger: logging.Logger) -> Tuple[Path, bool]:
 
     A byte-range lock cannot do this job. The app directory may be an NFS mount with no
     lock manager, where ``fcntl.flock(LOCK_EX)`` raises
-    ``OSError: [Errno 37] No locks available``. Raised from here that error escapes
-    ``setup_replica_environment`` before it has set ``HOME``, is swallowed by the
-    bootstrap finder, and leaves the replica serving with ``HOME`` still pointing at the
-    image's ``/home/ray``, which is read-only — so the app's first write under
-    ``Path.home()`` fails with ``Errno 30`` and the cause is two steps from the symptom.
+    ``OSError: [Errno 37] No locks available``.
+
+    HISTORICAL, and corrected here because this paragraph outlived the defect it described
+    and was then read as a live diagnosis. It used to say that such an error "escapes
+    ``setup_replica_environment`` before it has set ``HOME``", leaving the replica on the
+    image's read-only ``/home/ray``. That was true while the source sync ran BEFORE the
+    ``HOME`` assignment. It no longer is: ``setup_replica_environment`` sets ``HOME`` and
+    ``TMPDIR`` first and only then calls :func:`_ensure_source`, so a sync that raises —
+    for this reason or any other — leaves a replica with a writable ``HOME``. Both changes
+    landed together, and only the code half was updated, so a reader comparing the two
+    found a mechanism the file no longer has.
 
     ``mkdir`` is atomic on NFS (it is a single namespace operation, not a byte-range
     lock), so exactly one of N racing replicas creates the directory and the rest see
@@ -502,15 +508,49 @@ def setup_replica_environment() -> None:
     os.environ["TMP"] = str(tmp)
     os.environ["TEMP"] = str(tmp)
 
+    # VERIFY the applied environment instead of assuming the assignment took. Until now the
+    # only evidence a replica emitted was the log line at the end of this function, and that
+    # printed the LOCAL `home`/`tmp` variables — the values we intended — not what
+    # `Path.home()` actually resolves to. So a replica serving with HOME still at the image's
+    # read-only `/home/ray` printed a cheerful "replica environment ready" naming the correct
+    # path, and the first symptom was an `Errno 30` from the app's first write, two steps away.
+    #
+    # Checking the resolved path is not enough on its own: the property the app needs is that
+    # HOME is WRITABLE, and an NFS mount can resolve correctly and still refuse writes. Both
+    # are checked, and a failure raises HERE, naming the cause, rather than leaving a replica
+    # to serve and refuse every request later for a reason that points elsewhere.
+    applied_home = Path(os.path.expanduser("~"))
+    if applied_home.resolve() != home.resolve():
+        raise RuntimeError(
+            f"replica HOME was not applied: set HOME={home} but Path.home() resolves to "
+            f"{applied_home}. A replica in this state serves normally and then fails every "
+            f"write under Path.home(), so it is refused at startup instead."
+        )
+    probe = home / f".bioengine-home-probe-{os.getpid()}"
+    try:
+        probe.write_text("ok")
+    except OSError as exc:
+        raise RuntimeError(
+            f"replica HOME {home} is not writable ({exc.__class__.__name__}: {exc}). The app's "
+            f"first write under Path.home() would fail with this, far from the cause."
+        ) from exc
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
     source = _ensure_source(app_dir, version, logger)
 
     src_str = str(source)
     if src_str not in sys.path:
         sys.path.insert(0, src_str)
 
+    # Report the READ-BACK, not the intent: these are what the replica will actually use.
     logger.info(
         f"BioEngine: replica environment ready "
-        f"(source={source}, HOME={home}, TMPDIR={tmp})"
+        f"(source={source}, HOME={os.environ.get('HOME')}, "
+        f"TMPDIR={os.environ.get('TMPDIR')}, home_resolves_to={applied_home})"
     )
 
 
