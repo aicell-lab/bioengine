@@ -221,7 +221,7 @@ class RuntimeApp:
         )
         # Whether THIS replica's run store accepts a write, and when that was
         # last established. A runtime replica has its own HOME and therefore
-        # its own store: #0931 measured one replica writing the share while
+        # its own store: one replica was measured writing the share while
         # another, in the same pod image, could not write anything, because
         # the redirect that points HOME at the share had not run. So this is a
         # fact about the process, not about the cluster, and it cannot be

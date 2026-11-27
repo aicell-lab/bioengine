@@ -1,11 +1,11 @@
-"""#0982 branch A: a MIRRORED generalist loads through micro-sam's registry.
+"""A MIRRORED generalist loads through micro-sam's registry.
 
-WHAT THE ROW IS ABOUT. Generalist annotation -- no fine-tuned checkpoint --
+WHAT THIS IS ABOUT. Generalist annotation -- no fine-tuned checkpoint --
 fetched its weights from the bioimage.io zoo over a host this deployment cannot
 reach, with `known_hash=None` on both files. The training path already resolves
-base weights through micro-sam's registry, which #0961 seeds from a verified
-mirror and fences with a pinned sha256. Branch A puts the generalist on that
-same path.
+base weights through micro-sam's registry, which is seeded from a verified
+mirror and fences with a pinned sha256. Routing the generalist through that
+registry puts it on the same path.
 
 SCOPED, AND THE SCOPE IS ASKED OF THE MIRROR. Only the model types the mirror
 holds move; the rest keep the zoo path untouched. The predicate asks
@@ -16,8 +16,8 @@ THE OBSERVABLE THAT MATTERS IS *WHICH SEGMENTATION MODE COMES OUT*, not which
 function got called. Today's code pre-loads the two zoo files and hands
 micro-sam an assembled state, and its comment says that is necessary because
 `get_predictor_and_segmenter` takes no `decoder_path`. If the registry path
-produced no decoder, branch A would silently downgrade annotation from AIS to
-AMG. Measured in the PINNED micro-sam 1.8.11 instead of assumed:
+produced no decoder, the registry route would silently downgrade annotation
+from AIS to AMG. Measured in the PINNED micro-sam 1.8.11 instead of assumed:
 
     _download_sam_model:  decoder_name = f"{model_type}_decoder"
                           fetched when the registry holds that key
@@ -65,8 +65,8 @@ def stubbed(monkeypatch):
     path -- supplied by the caller, or resolved from the registry when the
     caller passed no checkpoint. `get_predictor_and_segmenter` then picks AIS
     on that key. Both halves are the pinned 1.8.11 behaviour, read from the
-    wheel; a stub that always produced a decoder could not tell branch A's
-    path from a silent downgrade.
+    wheel; a stub that always produced a decoder could not tell the registry
+    route from a silent downgrade.
     """
     calls = _Calls()
     registry = {"vit_b_lm", "vit_b_lm_decoder", "vit_t_lm", "vit_t_lm_decoder"}
@@ -197,7 +197,7 @@ def test_a_FINETUNED_checkpoint_is_untouched_by_this(stubbed, monkeypatch):
 
 
 def test_the_MIRRORED_route_STILL_SELECTS_AIS(stubbed, monkeypatch):
-    """The whole risk of branch A in one assertion.
+    """The whole risk of the registry route in one assertion.
 
     If the registry path produced no decoder, the mode would come out "amg"
     and annotation quality would change with nothing reporting it.
@@ -208,7 +208,7 @@ def test_the_MIRRORED_route_STILL_SELECTS_AIS(stubbed, monkeypatch):
 
     assert segmenter.mode == "ais", (
         "the mirrored generalist came back in AMG mode, so the registry resolve "
-        "produced no decoder and branch A is a silent downgrade"
+        "produced no decoder and the registry route is a silent downgrade"
     )
 
 
