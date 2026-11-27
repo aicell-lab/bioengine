@@ -397,6 +397,54 @@ def test_the_module_still_agrees_about_which_modes_apply_the_value():
     )
 
 
+# --- 6. the head-only claim, tied to the thing that makes it true -------------------------------
+
+
+def test_the_cap_is_not_forwarded_into_the_slurm_container(tmp_path):
+    """`status` claims the compute nodes are on Ray's default. This is why.
+
+    Nothing else connects that claim to the job script. If someone adds
+    `--env=RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB=...` to the apptainer arguments in
+    `slurm_workers.py`, the compute nodes WOULD get the cap and `status` would go on reporting
+    "applied on the head node only" -- the same defect this row fixed, turned around, with no arm
+    going red. This reads the generated batch script and asserts the cap is absent from it.
+
+    It deliberately asserts the ABSENCE of a forward, alongside the presence of `--cleanenv`: the
+    absence alone would also hold if the apptainer invocation disappeared entirely, which would
+    mean something quite different.
+    """
+    from bioengine.cluster.slurm_workers import SlurmWorkers
+
+    class _RayCluster:
+        address = "ray://head.example:10001"
+
+    workers = SlurmWorkers(
+        ray_cluster=_RayCluster(),
+        worker_workspace_dir=str(tmp_path),
+        image="ghcr.io/aicell-lab/bioengine-worker:test",
+    )
+    script = open(
+        workers._create_sbatch_script(
+            num_gpus=1,
+            num_cpus=4,
+            mem_in_gb_per_cpu=8,
+            time_limit="1:00:00",
+            further_slurm_args=[],
+        ),
+        encoding="utf-8",
+    ).read()
+
+    assert "--cleanenv" in script, (
+        "the container no longer starts from a cleaned environment, so the head-only claim in "
+        "`status` may no longer hold for the reason it gives"
+    )
+    assert ENV_VAR not in script, (
+        f"{ENV_VAR} is now forwarded into the SLURM container, so the compute nodes DO get the "
+        "cap -- but `status` still reports 'applied on the head node only'. Update the scope "
+        "reporting as well as the job script."
+    )
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _cache_variable_is_left_as_it_was_found():
     """The leak detector, as a module-scoped teardown rather than as a test.

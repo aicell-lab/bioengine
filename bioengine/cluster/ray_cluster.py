@@ -199,13 +199,22 @@ class RayCluster:
                 host may occupy before a startup warning is logged. Default 0.9. Set to
                 0 to disable the check. Never blocks startup.
             runtime_env_pip_cache_size_gb: Size of pip cache for runtime environments in GB.
-                Applied by exporting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB, which only reaches the
-                Ray processes THIS worker starts — so it applies in single-machine and slurm
-                mode and is IGNORED in external-cluster mode, where the Ray pods are created by
-                the cluster operator and the value has to be set on those pods instead. Passing
-                it in a mode that ignores it logs an error at startup, and the `status` property reports it
-                as "not applied" in either case. None (the default) means not passed, and
-                DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB is used.
+                Applied by exporting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB, which Ray reads PER NODE
+                out of each runtime_env agent's own environment. So which nodes it reaches depends
+                on the mode, and `status`'s `runtime_env_pip_cache.scope` reports which:
+                  - single-machine: the whole cluster ("cluster", state "applied").
+                  - slurm: THE HEAD NODE ONLY ("head-only", state "applied on the head node
+                    only"). The compute-node raylets are launched under
+                    `apptainer exec --cleanenv`, which is not given this variable, so they keep
+                    Ray's own default of 10 GB — the figure to size compute-node scratch from.
+                    Passing the variable yourself through `further_apptainer_args` would change
+                    that, and `status` would not know: it reports what this worker exports, not
+                    what the job script was told to forward.
+                  - external-cluster: nowhere ("none", state "not applied"), because the Ray pods
+                    are created by the cluster operator and the value has to be set on those pods
+                    instead. Passing it in that mode logs an error at startup.
+                None (the default) means not passed, and DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB is
+                used.
             force_clean_up: Force cleanup of previous Ray cluster on start. Default True.
             enable_container_runtime: Opt-in container-as-runtime for apps
                 using ``@bioengine.app(container_image=…)`` (single-machine
