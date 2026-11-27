@@ -58,12 +58,6 @@ IGNORED = "is IGNORED in"
 ENV_VAR = "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"
 PASSED_SIZE = 42
 
-# What the variable looked like BEFORE any test in this file ran. pytest imports test modules at
-# collection, so this is the pre-run state. The leak check at the end of the file compares against
-# it rather than against absence: a session that legitimately has the variable set in its own
-# environment must not make this file fail, and "absent" is only the usual case, not the invariant.
-ENV_VAR_BEFORE_ANY_TEST = os.environ.get(ENV_VAR)
-
 
 @pytest.fixture
 def captured(monkeypatch):
@@ -336,23 +330,31 @@ def test_the_module_still_agrees_about_which_modes_apply_the_value():
     )
 
 
-def test_no_test_in_this_file_leaves_the_cache_variable_behind():
-    """The leak detector, and it is declared LAST on purpose.
+@pytest.fixture(scope="module", autouse=True)
+def _cache_variable_is_left_as_it_was_found():
+    """The leak detector, as a module-scoped teardown rather than as a test.
 
-    The arms above construct self-started clusters, which really export
-    ``RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB`` into this process. If their cleanup does not work, the
-    value is still here by the time this runs, and every test in the rest of the session inherits
-    it -- which can turn an unrelated test green or red for a reason nobody will find.
+    The arms here construct self-started clusters, which really export
+    ``RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB`` into this process. If their cleanup does not work the
+    value is still set afterwards, and every later test in the session inherits it -- which can
+    turn an unrelated test green or red for a reason nobody will find.
 
-    This file's own arms cannot see that: each of them sets the variable up the way it wants.
-    Only a test that looks at the environment WITHOUT touching it can, which is why this one takes
-    no fixtures at all. It reads what the file left.
+    This was a test declared last in the file, which the review rightly flagged: ordering holds
+    under this repo's ``--dist=no -n1`` addopts, but under ``-n>1`` load distribution the detector
+    could be handed to a worker that ran none of the exporting arms, and then it checks nothing
+    while reporting green. A module-scoped teardown cannot be separated from the arms that way:
+    whichever worker runs any of them runs this, for exactly the subset it ran.
+
+    It compares against the value captured at setup, not against absence, so a session that
+    legitimately has the variable set in its own environment does not fail spuriously.
     """
-    now = os.environ.get(ENV_VAR)
-    assert now == ENV_VAR_BEFORE_ANY_TEST, (
-        f"{ENV_VAR} is {now!r} but was {ENV_VAR_BEFORE_ANY_TEST!r} before this file ran, so the "
-        "tests above leak it into every later test in the session. The no_cache_env_leak fixture "
-        "is meant to restore the pre-test state; note that monkeypatch.delenv on an ABSENT "
-        "variable records nothing to undo, which is how this leak existed while a fixture claimed "
-        "to prevent it."
+    before = os.environ.get(ENV_VAR)
+    yield
+    after = os.environ.get(ENV_VAR)
+    assert after == before, (
+        f"{ENV_VAR} is {after!r} but was {before!r} when this module's tests began, so the tests "
+        "in it -- or, under parallel distribution, the subset of them that ran on this worker -- "
+        "leak it into every later test here. The no_cache_env_leak fixture is meant to restore "
+        "the pre-test state; note that monkeypatch.delenv on an ABSENT variable records nothing "
+        "to undo, which is how this leak existed while a fixture claimed to prevent it."
     )
