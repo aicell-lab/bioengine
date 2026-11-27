@@ -1,30 +1,33 @@
-"""An upload that could not remove its stale files must not publish the mixture.
+"""Two separate things an upload must not do, and only one of them is the field report.
 
-MEASURED IN THE FIELD. An `upload_app` that failed left "a committed, mixed artifact", and the
-next attempt met `must be in staging mode` — the staged-mode error being the first thing the user
-actually saw, two steps from the cause.
+THE FIELD REPORT (the `em-mito-quant-app` skill report, section 1) is an ID COLLISION, not a
+removal failure. The reporter's id was being uploaded CONCURRENTLY by another client; that client
+committed it mid-upload; this client's `put_file` calls then failed per file with
+`AssertionError: Artifact must be in staging mode`, and `am.read` afterwards showed the artifact
+**committed at 1.0.0** holding a mix of the other client's files and this client's manifest.yaml.
+The report's own words: "the server-side error named staging rather than the collision".
 
-THE MECHANISM. `create_application_from_files` stages the artifact, uploads the new files, removes
-the files the new set no longer contains, and commits. The removal loop used to swallow its
-failures::
+So that error means the artifact is NOT staged — it means somebody else committed the id. An
+earlier version of this file said the opposite, and an earlier version of the failure message
+asserted "left STAGED and UNCOMMITTED, no published version changed, re-run the upload", which is
+false in all three parts for exactly the case that was reported. That is why the message now
+RE-READS the artifact instead of describing a state it never checked.
 
-    except Exception as e:
-        logger.warning(f"Failed to remove old file '{file_name}': {e}. Continuing anyway...")
+THE SECOND THING is a latent defect found while reading this path, and it is not what the field
+hit: the removal loop swallowed its failures with `logger.warning(... "Continuing anyway...")` and
+committed regardless, which would publish an immutable version mixing this upload's files with
+stale ones. Real, worth fixing, and separate.
 
-and then committed anyway. A committed artifact version is IMMUTABLE and is exactly what a deploy
-runs, so that published a version holding this upload's files PLUS leftovers from the previous
-one, permanently, under a version string that can never mean anything else. The only thing
-standing between a partial removal and a permanently wrong published version was a log line at
-WARNING.
+WHAT IS PINNED HERE:
+  1. a removal failure does not commit, and the message reports the re-read state;
+  2. an id collision is reported as a COLLISION, with the artifact's real (committed) state —
+     not as a staged artifact;
+  3. the happy path still commits, so "never commit" cannot pass as the fix;
+  4. a failed upload followed by a successful one works, which is what the "re-stage" advice
+     claims and what nothing previously tested.
 
-WHAT IS PINNED HERE, as the two outcomes an upload is allowed to have:
-
-  1. a removal failure does NOT commit — the artifact is left staged, which is recoverable,
-     and the error says so;
-  2. the happy path still commits, so "never commit" cannot pass as the fix.
-
-The fake artifact manager is the Hypha surface these helpers actually call — `read`, `put_file`,
-`remove_file`, `commit` — so the arms drive the shipped function rather than a restatement of it.
+The fake artifact manager is the Hypha surface these helpers call — `read`, `put_file`,
+`remove_file`, `commit` — plus the httpx PUT the uploader makes to the URL `put_file` returns.
 """
 
 from __future__ import annotations
@@ -200,7 +203,14 @@ async def test_a_removal_failure_is_NOT_committed() -> None:
     assert (
         "stale.py" in text
     ), f"the error does not name the file that survived: {text!r}"
-    assert "STAGED" in text and "UNCOMMITTED" in text, (
+    # Asserted on the RE-READ, not on a fixed phrase. The contract is that the message reports a
+    # state it actually looked at: describing it from memory is how the old message came to be
+    # false in all three of its parts for the case the field actually hit.
+    assert "Re-read of" in text, (
+        "the message describes the artifact's state without re-reading it, which is the defect "
+        f"review refused this branch for: {text!r}"
+    )
+    assert "STAGED" in text and "no committed version" in text, (
         "the error must say what state the artifact was LEFT in — staged and recoverable is a "
         f"different situation from published and not, and wants a different action: {text!r}"
     )
@@ -258,5 +268,122 @@ async def test_an_upload_failure_also_names_the_state_it_left() -> None:
         "deployment.py" in text
     ), f"the error does not name the file that failed: {text!r}"
     assert (
-        "STAGED" in text and "UNCOMMITTED" in text
-    ), f"the error does not say what state the artifact was left in: {text!r}"
+        "Re-read of" in text and "STAGED" in text
+    ), f"the error does not report a RE-READ state for the artifact: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_an_ID_COLLISION_is_reported_as_one_with_the_artifacts_REAL_state() -> (
+    None
+):
+    """The case the field report actually describes, which no arm covered before.
+
+    Another client commits the id mid-upload. Our `put_file` then fails with the server's
+    staging assertion, and the artifact is COMMITTED — by them, holding their files plus
+    whatever of ours landed first.
+
+    The old message claimed the artifact was "left STAGED and UNCOMMITTED, so no published
+    version was changed" and advised re-running the upload. Measured against this case, all
+    three were false: it is committed, a published version did change, and a re-run under the
+    same id meets the strictly-greater-version refusal the reporter met.
+    """
+
+    class _CommittedByOther(_FakeArtifactManager):
+        """The other client commits MID-upload, so the state CHANGES under this one.
+
+        Modelling the timing correctly matters, and getting it wrong is what told me so. With
+        1.0.0 already present at STAGE time, `stage_artifact` refuses up front with its own very
+        clear message and there is no defect to fix at all — measured:
+
+            ValueError: Cannot upload 'ws/my-app' at version '1.0.0': must be strictly greater
+            than the highest existing version '1.0.0' … the id collided with someone else's
+            artifact, so choose a different id instead …
+
+        So the version list is EMPTY when we stage and holds 1.0.0 by the time the failure is
+        re-read. That gap is the entire argument for re-reading rather than describing the state
+        from memory: the state at stage time is not the state at failure time.
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.staged = False
+
+        async def read(self, artifact_id=None, **kw):
+            versions = [{"version": "1.0.0"}] if self.staged else []
+            return _Artifact(
+                artifact_id, parent_id="ws/applications", versions=versions
+            )
+
+        async def edit(self, *a, **kw):
+            self.staged = True  # from here on, the other client's commit is visible
+            return await super().edit(*a, **kw)
+
+        async def put_file(self, artifact_id=None, file_path=None, **kw):
+            raise RuntimeError(
+                "Failed to get upload URL for "
+                f"'{file_path}': AssertionError: Artifact must be in staging mode."
+            )
+
+    mgr = _CommittedByOther()
+
+    raised = None
+    try:
+        await _upload(mgr)
+    except RuntimeError as exc:
+        raised = exc
+
+    assert (
+        mgr.commits == []
+    ), f"this client must not add a commit of its own: {mgr.commits}"
+    assert raised is not None, "a wholly failed upload reported nothing"
+    text = str(raised)
+
+    assert "STAGED" not in text, (
+        "the message claims the artifact is STAGED while the server's own error says it is not "
+        f"and the re-read says it is committed: {text!r}"
+    )
+    assert (
+        "COMMITTED" in text and "1.0.0" in text
+    ), f"the message must report the artifact's real state, re-read: {text!r}"
+    assert "concurrent upload of the same id" in text, (
+        "the staging assertion must be explained as an id collision — the report's whole point "
+        f"was that the server error named staging rather than the collision: {text!r}"
+    )
+    assert (
+        "different id" in text
+    ), f"the message must say what to actually do about a collision: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_upload_can_be_FOLLOWED_by_a_successful_one() -> None:
+    """Backs the "re-running re-stages it" advice, which was an inference until now.
+
+    Review's F3: nothing modelled a second upload after a failure, so the message's own remedy
+    was untested. The fake keeps its staged state between calls, as a real artifact would.
+    """
+    calls = {"n": 0}
+
+    class _FailsFirstTime(_FakeArtifactManager):
+        async def put_file(self, artifact_id=None, file_path=None, **kw):
+            if calls["n"] == 0 and file_path == "deployment.py":
+                raise RuntimeError("upload stream reset")
+            return await super().put_file(
+                artifact_id=artifact_id, file_path=file_path, **kw
+            )
+
+    mgr = _FailsFirstTime(existing=[])
+
+    with pytest.raises(RuntimeError):
+        await _upload(mgr)
+    assert mgr.commits == [], "the failed attempt must not have committed"
+
+    calls["n"] = 1
+    artifact_id = await _upload(mgr)
+
+    assert mgr.commits == [
+        "1.0.0"
+    ], f"the retry after a failure did not publish its version: {mgr.commits}"
+    assert artifact_id
+    assert (
+        "deployment.py" in mgr.put_files
+    ), f"the retry did not re-upload the file that failed: {mgr.put_files}"

@@ -769,6 +769,73 @@ def get_static_site_url(artifact_id: str, server_url: str) -> str:
     return f"{server_url}/{workspace}/view/{alias}/"
 
 
+_STAGING_ASSERTION = "must be in staging mode"
+
+
+def _collision_hint(upload_errors) -> str:
+    """Name the ID COLLISION when the server's own error is the staging assertion.
+
+    `AssertionError: Artifact must be in staging mode` is the error a put_file gets after
+    SOMETHING ELSE committed the id mid-upload. It reads like a staging mistake on this side and
+    it is not one — that misreading is precisely what the field report flagged: "the server-side
+    error named staging rather than the collision".
+
+    Note the direction: this error means the artifact is NOT staged. An earlier comment here had
+    it backwards.
+    """
+    if any(_STAGING_ASSERTION in str(err) for _, err in upload_errors):
+        return (
+            " At least one upload was refused with 'must be in staging mode', which means this "
+            "artifact id was COMMITTED BY SOMETHING ELSE while this upload was in progress — a "
+            "concurrent upload of the same id, not a staging mistake on this side. Pick a "
+            "different id and inspect what the artifact now contains; re-running under the same "
+            "id will meet the strictly-greater-version refusal."
+        )
+    return ""
+
+
+async def describe_artifact_state(
+    artifact_manager: ObjectProxy,
+    artifact_id: str,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    """Re-READ the artifact and describe what is actually there, for a failure message.
+
+    The point is to assert nothing that was not read. A failed upload can leave the artifact
+    staged (recoverable, nothing published changed) or committed by a concurrent uploader
+    (published, not recoverable under the same id), and those want opposite actions from the
+    caller. Guessing produced a message that was false in every part for the case that was
+    actually reported.
+
+    A read that itself fails is reported as UNKNOWN rather than as either outcome.
+    """
+    if logger is None:
+        logger = create_logger("ArtifactUtils")
+    try:
+        info = await artifact_manager.read(artifact_id)
+    except Exception as exc:
+        return (
+            f"The artifact's state could NOT be re-read ({exc}), so whether anything was "
+            f"published under '{artifact_id}' is UNKNOWN from here — inspect it before retrying."
+        )
+    try:
+        versions = [v["version"] for v in (getattr(info, "versions", None) or [])]
+    except Exception:
+        versions = []
+    if versions:
+        return (
+            f"Re-read of '{artifact_id}': it is COMMITTED, with version(s) "
+            f"{', '.join(map(str, versions))}. A published version therefore DID change and a "
+            f"committed version is immutable, so this is not recoverable by re-uploading the "
+            f"same version — inspect what the artifact now contains."
+        )
+    return (
+        f"Re-read of '{artifact_id}': no committed version, so it is left STAGED and nothing is "
+        f"published from this attempt. Re-running the upload with the complete file set "
+        f"re-stages it."
+    )
+
+
 async def create_application_from_files(
     artifact_manager: ObjectProxy,
     files: List[Dict[str, Any]],
@@ -892,18 +959,21 @@ async def create_application_from_files(
 
     # If any uploads failed, raise an error before removing old files.
     #
-    # The message names the state the artifact is LEFT IN, not just what went wrong. It is
-    # staged and uncommitted here, which is the recoverable outcome — but a caller who is only
-    # told "failed to upload" cannot tell that from the unrecoverable one, and the two want
-    # different actions. The staged version is also what the NEXT attempt meets, which is where
-    # a later "must be in staging mode" comes from.
+    # The state is RE-READ, never assumed. An earlier version of this message asserted "left
+    # STAGED and UNCOMMITTED, so no published version was changed" on every failure path, and
+    # in the case actually reported from the field all three parts of that were false: the id
+    # had been committed by a CONCURRENT uploader, a published version had changed, and the
+    # suggested re-run met the strictly-greater-version refusal. A message that states a state
+    # it never checked is worse than one that says less.
     if upload_errors:
         error_details = "; ".join([f"{name}: {err}" for name, err in upload_errors])
+        state = await describe_artifact_state(
+            artifact_manager=artifact_manager, artifact_id=artifact.id, logger=logger
+        )
         raise RuntimeError(
             f"Failed to upload {len(upload_errors)} file(s) to '{artifact.id}': "
-            f"{error_details}. The artifact is left STAGED and UNCOMMITTED, so no published "
-            f"version was changed; {len(new_files)} file(s) did upload into that staged "
-            f"version. Re-run the upload with the complete file set."
+            f"{error_details}. {len(new_files)} file(s) did upload. {state}"
+            f"{_collision_hint(upload_errors)}"
         )
 
     # Only remove old files if all new files were successfully uploaded
@@ -942,14 +1012,15 @@ async def create_application_from_files(
     # message says so, because a caller who is not told the state cannot act on it.
     if removal_errors:
         details = "; ".join(f"{name}: {err}" for name, err in removal_errors)
+        state = await describe_artifact_state(
+            artifact_manager=artifact_manager, artifact_id=artifact.id, logger=logger
+        )
         raise RuntimeError(
             f"Upload of '{artifact.id}' did NOT complete: {len(removal_errors)} stale "
-            f"file(s) could not be removed ({details}). The artifact is left STAGED and "
-            f"UNCOMMITTED, so no published version was changed and nothing is serving this "
-            f"content. Committing it would have published a version mixing the "
-            f"{len(new_files)} file(s) just uploaded with the stale one(s) above, and a "
-            f"committed version cannot be corrected afterwards. Re-run the upload with the "
-            f"complete file set once the removal failure is resolved."
+            f"file(s) could not be removed ({details}). Committing would have published a "
+            f"version mixing the {len(new_files)} file(s) just uploaded with the stale one(s) "
+            f"above, and a committed version cannot be corrected afterwards, so this upload "
+            f"does not commit. {state}"
         )
 
     # Commit the artifact under the manifest version tag (always a new tag —
