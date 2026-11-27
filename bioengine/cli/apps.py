@@ -181,7 +181,10 @@ def validate(app_dir):
         f"there, `bioengine apps upload` refuses the bundle unless the manifest version is "
         f"higher than every version that id already carries — and if the lineage is not "
         f"yours, the id itself is what has to change.\n"
-        f"To see which ids exist: bioengine apps list"
+        f"To see which ids exist: bioengine apps list — those are ARTIFACT ids, which is "
+        f"the set '{app_id}' has to be free in. The ids from `bioengine apps status` are "
+        f"APPLICATION ids of running deployments, a different namespace: an id absent there "
+        f"can still be taken as an artifact."
     )
 
 
