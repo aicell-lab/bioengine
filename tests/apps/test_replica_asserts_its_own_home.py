@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,39 @@ class _Recorder(logging.Logger):
         self.records.append(("WARNING", str(msg) % args if args else str(msg)))
 
 
+@pytest.fixture(autouse=True)
+def _no_tmpdir_leak():
+    """Put TMPDIR *and* tempfile's cache back, whatever an arm or the code under test did.
+
+    The function under test writes ``os.environ["TMPDIR"]`` directly and clears
+    ``tempfile.tempdir``; neither goes through ``monkeypatch``, so neither is undone by it.
+    Found by review: an arm that never touches TMPDIR was reading a PREVIOUS arm's
+    ``ws-app/tmp`` as its "before" value, inside the same xdist worker.
+
+    Deliberately NOT ``monkeypatch.delenv("TMPDIR", raising=False)``, which is the obvious
+    form and does not work: ``delenv`` on a variable that is ABSENT registers nothing to undo,
+    so whatever runs afterwards still leaks. That is measured — the identical fixture shape
+    passed locally and failed in CI on an earlier row, because the bug is conditional on the
+    variable starting unset, which is the usual case here.
+
+    Autouse and WITHOUT a monkeypatch dependency, so it is set up first and therefore torn
+    down last: after monkeypatch has replayed its own undo, not before it.
+
+    The invariant is "unchanged", not "absent": a session that legitimately has TMPDIR set must
+    not be disturbed either.
+    """
+    tmpdir_before = os.environ.get("TMPDIR")
+    cache_before = tempfile.tempdir
+    try:
+        yield
+    finally:
+        if tmpdir_before is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = tmpdir_before
+        tempfile.tempdir = cache_before
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     app_dir = tmp_path / "ws-app"
@@ -73,9 +107,9 @@ def test_a_bad_home_is_repaired_to_the_per_app_home(env, monkeypatch):
     monkeypatch.setenv("HOME", "/home/ray")
     log = _Recorder()
     _ensure_working_directory(log)
-    assert Path(os.environ["HOME"]).resolve() == (env / "home").resolve(), (
-        f"HOME was left at {os.environ['HOME']!r}"
-    )
+    assert (
+        Path(os.environ["HOME"]).resolve() == (env / "home").resolve()
+    ), f"HOME was left at {os.environ['HOME']!r}"
 
 
 def test_b_the_repair_is_reported_at_error_level(env, monkeypatch):
@@ -125,9 +159,15 @@ def test_d_an_unrepairable_home_is_reported_as_unrepairable(env, monkeypatch):
     log = _Recorder()
     _ensure_working_directory(log)
     errs = " ".join(_errors(log))
-    assert "could NOT repair HOME" in errs, f"an unrepairable HOME must say so, got: {errs!r}"
-    assert "HOME repaired to" not in errs, "it must not claim a repair that did not happen"
-    assert os.environ["HOME"] == "/home/ray", "HOME must be left alone when it cannot be repaired"
+    assert (
+        "could NOT repair HOME" in errs
+    ), f"an unrepairable HOME must say so, got: {errs!r}"
+    assert (
+        "HOME repaired to" not in errs
+    ), "it must not claim a repair that did not happen"
+    assert (
+        os.environ["HOME"] == "/home/ray"
+    ), "HOME must be left alone when it cannot be repaired"
 
 
 def test_f_a_tmpdir_failure_does_not_slander_a_home_that_was_repaired(env, monkeypatch):
@@ -143,17 +183,21 @@ def test_f_a_tmpdir_failure_does_not_slander_a_home_that_was_repaired(env, monke
     log = _Recorder()
     _ensure_working_directory(log)
     errs = " ".join(_errors(log))
-    assert Path(os.environ["HOME"]).resolve() == (env / "home").resolve(), "HOME should be repaired"
-    assert "HOME repaired to" in errs, "a HOME that WAS repaired must be reported as repaired"
-    assert "could NOT repair HOME" not in errs, (
-        f"a tmp failure must not be reported as a HOME failure, got: {errs!r}"
-    )
+    assert (
+        Path(os.environ["HOME"]).resolve() == (env / "home").resolve()
+    ), "HOME should be repaired"
+    assert (
+        "HOME repaired to" in errs
+    ), "a HOME that WAS repaired must be reported as repaired"
+    assert (
+        "could NOT repair HOME" not in errs
+    ), f"a tmp failure must not be reported as a HOME failure, got: {errs!r}"
     assert "could NOT repair TMPDIR" in errs, "the tmp failure itself must be reported"
     # And TMPDIR must not be left naming a directory that does not exist.
     tmp_env = os.environ.get("TMPDIR")
-    assert tmp_env is None or Path(tmp_env).exists(), (
-        f"TMPDIR={tmp_env!r} names a directory that does not exist"
-    )
+    assert (
+        tmp_env is None or Path(tmp_env).exists()
+    ), f"TMPDIR={tmp_env!r} names a directory that does not exist"
 
 
 def test_g_a_bad_preexisting_tmpdir_is_repaired_not_left_alone(env, monkeypatch):
@@ -163,13 +207,15 @@ def test_g_a_bad_preexisting_tmpdir_is_repaired_not_left_alone(env, monkeypatch)
     monkeypatch.setenv("TMPDIR", "/nonexistent-ro")
     log = _Recorder()
     _ensure_working_directory(log)
-    assert Path(os.environ["TMPDIR"]).resolve() == (env / "tmp").resolve(), (
-        f"TMPDIR was left at {os.environ['TMPDIR']!r}"
-    )
+    assert (
+        Path(os.environ["TMPDIR"]).resolve() == (env / "tmp").resolve()
+    ), f"TMPDIR was left at {os.environ['TMPDIR']!r}"
     assert "TMPDIR repaired to" in " ".join(_errors(log))
 
 
-def test_h_a_bootstrap_that_fails_before_home_is_set_is_loud_and_then_repaired(env, monkeypatch, capsys):
+def test_h_a_bootstrap_that_fails_before_home_is_set_is_loud_and_then_repaired(
+    env, monkeypatch, capsys
+):
     """The path DONE WHEN 4 actually names, exercised rather than simulated.
 
     Earlier arms set HOME=/home/ray by hand. This one drives the real sequence: the import-time
@@ -196,16 +242,19 @@ def test_h_a_bootstrap_that_fails_before_home_is_set_is_loud_and_then_repaired(e
     import sys as _sys
 
     bioengine._install_replica_bootstrap_finder()
-    installed = [f for f in _sys.meta_path
-                 if type(f).__name__ == "_BioEngineImportBootstrap"]
-    assert installed, "the bootstrap finder did not install even with BIOENGINE_APP_DIR set"
+    installed = [
+        f for f in _sys.meta_path if type(f).__name__ == "_BioEngineImportBootstrap"
+    ]
+    assert (
+        installed
+    ), "the bootstrap finder did not install even with BIOENGINE_APP_DIR set"
     finder = installed[-1]
     finder._fired = False
     finder.find_spec("some_user_module_that_does_not_exist", None, None)
     out = capsys.readouterr().out
-    assert "replica source bootstrap failed" in out, (
-        f"the swallowed bootstrap failure must be loud, got: {out[:300]!r}"
-    )
+    assert (
+        "replica source bootstrap failed" in out
+    ), f"the swallowed bootstrap failure must be loud, got: {out[:300]!r}"
     assert "/home/ray" in out, "the loud line must name the HOME it was left with"
     _sys.meta_path.remove(finder)
 
@@ -243,8 +292,106 @@ def test_i_a_repair_that_does_not_take_is_reported_as_a_failure(env, monkeypatch
     log = _Recorder()
     _ensure_working_directory(log)
     errs = " ".join(_errors(log))
-    assert "could NOT repair HOME" in errs, f"a repair that did not take must be reported: {errs!r}"
-    assert "HOME repaired to" not in errs, "it must not claim a repair that did not take"
-    assert "/home/ray" in errs and str(env / "home") in errs, (
-        "the message must name both the observed and the expected value"
+    assert (
+        "could NOT repair HOME" in errs
+    ), f"a repair that did not take must be reported: {errs!r}"
+    assert (
+        "HOME repaired to" not in errs
+    ), "it must not claim a repair that did not take"
+    assert (
+        "/home/ray" in errs and str(env / "home") in errs
+    ), "the message must name both the observed and the expected value"
+
+
+def test_j_a_tmpdir_repair_is_verified_through_tempfile_not_its_own_write(
+    env, monkeypatch
+):
+    """Found by review (N1): the re-read must ask what the process will USE.
+
+    ``tempfile`` resolves its directory once, on first use, and caches it in
+    ``tempfile.tempdir``. Every ``mkstemp``/``mkdtemp``/``NamedTemporaryFile`` afterwards goes
+    there regardless of what the environment says — and any library that touched a temporary
+    file at import time has already triggered that resolution, so the cache being warm is the
+    ordinary case in a replica, not a corner.
+
+    Re-reading ``os.environ`` reads back the value written one line earlier and therefore
+    always agrees. Measured by review before this fix: the function logged "TMPDIR repaired to
+    <app>/tmp" while ``tempfile.gettempdir()`` stayed ``/tmp`` and ``mkdtemp()`` returned
+    ``/tmp/tmp…``. A reported repair that did not happen is the exact failure the verify step
+    was added to prevent, so the verify step had to be able to see it.
+
+    This arm WARMS the cache first, which is what makes it bite.
+    """
+    monkeypatch.setenv("HOME", str(env / "home"))
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    tempfile.tempdir = None
+    warmed = tempfile.gettempdir()
+    assert (
+        warmed == "/tmp"
+    ), f"premise failed: the cache should start at /tmp, got {warmed!r}"
+
+    log = _Recorder()
+    _ensure_working_directory(log)
+
+    effective = Path(tempfile.gettempdir())
+    assert effective.resolve() == (env / "tmp").resolve(), (
+        f"tempfile still hands out {effective}, so every temporary file this replica creates "
+        f"lands outside the per-app tmp while the log says: {_errors(log)!r}"
     )
+    # The consequence itself, not just the reading that predicts it.
+    made = Path(tempfile.mkdtemp())
+    try:
+        assert made.resolve().is_relative_to(
+            (env / "tmp").resolve()
+        ), f"mkdtemp created {made}, outside the per-app tmp"
+    finally:
+        made.rmdir()
+    assert "TMPDIR repaired to" in " ".join(_errors(log))
+
+
+def test_k_a_repair_that_did_not_take_is_not_called_unchanged(env, monkeypatch):
+    """Found by review (N2): the failure message has to be TRUE about what changed.
+
+    When the re-read disagrees, the variable WAS written — something else did not follow. The
+    old message said "HOME is unchanged", and review measured the opposite with ``Path.home``
+    pinned: ``os.environ["HOME"]`` held the new value. The other failure mode, a directory that
+    could not be created, leaves the variable genuinely untouched, so one fixed sentence could
+    not be true for both.
+    """
+    monkeypatch.setenv("HOME", "/home/ray")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/home/ray")))
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+
+    assert "could NOT repair HOME" in errs
+    assert "unchanged" not in errs, (
+        f"the variable WAS changed; calling it unchanged sends the reader after the wrong "
+        f"thing. message: {errs!r}"
+    )
+    assert os.environ["HOME"] == str(
+        env / "home"
+    ), "premise: the assignment really did happen, which is why 'unchanged' was false"
+    assert "/home/ray" in errs and str(env / "home") in errs
+
+
+def test_l_an_uncreatable_directory_IS_reported_as_unchanged(env, monkeypatch):
+    """The companion of the arm above, and the reason it is not just a word filter.
+
+    Here the variable really is untouched: the assignment sits after the ``mkdir``, so a
+    failure to create leaves the old value in place and the reader should be told so. Without
+    this arm, deleting the word "unchanged" everywhere would satisfy the previous arm while
+    making THIS message less informative.
+    """
+    monkeypatch.setenv("HOME", "/home/ray")
+    _fail_mkdir_for(monkeypatch, "home")
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+
+    assert "could NOT repair HOME" in errs
+    assert "unchanged" in errs, (
+        f"a directory that could not be created leaves HOME untouched, and the message should "
+        f"say so: {errs!r}"
+    )
+    assert os.environ["HOME"] == "/home/ray", "premise: the assignment never ran"

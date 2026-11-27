@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import logging
 import os
+import tempfile
 import time
 from functools import wraps
 from pathlib import Path
@@ -223,6 +224,36 @@ def _ensure_working_directory(logger: logging.Logger) -> None:
         _ensure_home_under_app_dir(workdir, logger)
 
 
+def _effective_value(var: str) -> Path:
+    """What this process will ACTUALLY use for ``var``, not what was just written to it.
+
+    The difference is the whole point of the verify step, and it is real for one of the two
+    variables:
+
+    * ``TMPDIR`` — ``tempfile`` resolves its directory ONCE, on first use, and caches it in
+      ``tempfile.tempdir``. Every ``mkstemp``/``mkdtemp``/``NamedTemporaryFile`` in the process
+      then goes there, whatever the environment says afterwards; and any library that touched a
+      temporary file at import time has already triggered that resolution. So the cache is
+      CLEARED here before asking — which both makes the repair take effect and makes the answer
+      describe the process rather than the variable. Re-reading ``os.environ`` instead reads
+      back the value written one line earlier and therefore always agrees: measured by review,
+      the function logged "TMPDIR repaired to <app>/tmp" while ``tempfile.gettempdir()`` stayed
+      ``/tmp`` and ``mkdtemp()`` kept returning ``/tmp/tmp…``. A reported repair that did not
+      happen is exactly what this step exists to prevent.
+
+    * ``HOME`` — ``Path.home()`` reads ``os.environ["HOME"]`` and only consults the password
+      database when it is UNSET, which it cannot be one line after the assignment. So for HOME
+      this cannot fail in production, and the check is a REGRESSION GUARD rather than a runtime
+      check: it holds the contract "a repair is verified, never assumed" in place for whoever
+      edits this next, and its arm has to monkeypatch ``Path.home`` to fire it. Labelled as
+      such rather than justified by a fallback that does not apply.
+    """
+    if var == "HOME":
+        return Path.home()
+    tempfile.tempdir = None
+    return Path(tempfile.gettempdir())
+
+
 def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
     """Check, IN THE SERVING PROCESS, that ``HOME`` and ``TMPDIR`` point under the per-app
     directory — and say so loudly and repair them if not.
@@ -269,6 +300,13 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
     ``tmp``; when the ``tmp`` creation failed it logged "could NOT repair HOME" — while ``HOME`` had
     in fact already been repaired, and ``TMPDIR`` had been pointed at a directory that did not
     exist. The message contradicted the state.
+
+    AND THE FAILURE MESSAGE CARRIES THE STATE, for the same reason. The two ways this can fail
+    leave different state behind — a directory that could not be created leaves the variable
+    untouched, a re-read that disagrees means the variable was written and something else did not
+    follow — so a single "<var> is unchanged" sentence was false in the second case. See
+    :func:`_effective_value` for what "re-read" asks, and why it is a real runtime check for
+    ``TMPDIR`` and only a regression guard for ``HOME``.
     """
     repaired, failed = [], []
 
@@ -290,35 +328,60 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
             current if current else "<unset>",
             target,
         )
+        # Create first, assign second. Assigning a variable to a directory that does not exist
+        # replaces one failure with a less obvious one.
         try:
-            # Create first, assign second. Assigning a variable to a directory that does not exist
-            # replaces one failure with a less obvious one.
             target.mkdir(parents=True, exist_ok=True)
-            os.environ[var] = str(target)
-            # VERIFY, do not assume. `Path.home()` does not simply read `os.environ["HOME"]` — on
-            # POSIX it consults the password database when HOME is unset, and a caller may read the
-            # variable through something that caches. So re-read what the process will actually see
-            # and compare it to the target; a repair that silently did not take would otherwise be
-            # reported as a success and put us back where this function started.
-            observed = Path.home() if var == "HOME" else Path(os.environ.get(var, ""))
-            if observed.resolve() != target.resolve():
-                failed.append((var, f"re-read gave {observed}, expected {target}"))
-            else:
-                repaired.append(var)
         except OSError as exc:
-            failed.append((var, exc))
+            # The assignment below never ran, so the variable really IS unchanged here. This is
+            # the only one of the two failure modes where that wording is true.
+            failed.append(
+                (
+                    var,
+                    f"the directory {target} could not be created ({exc}), so {var} is "
+                    f"unchanged and this replica will fail on its first write under it",
+                )
+            )
+            continue
+
+        try:
+            os.environ[var] = str(target)
+            observed = _effective_value(var)
+            match = observed.resolve() == target.resolve()
+        except OSError as exc:
+            failed.append(
+                (
+                    var,
+                    f"{var} was set to {target}, but reading back what this process will "
+                    f"actually use raised {exc}",
+                )
+            )
+            continue
+
+        if match:
+            repaired.append(var)
+        else:
+            # Truthful about what did and did not change. The variable WAS written; what reads
+            # it did not follow. Saying "<var> is unchanged" here was false — measured by
+            # review, with Path.home pinned: the log said HOME was unchanged while
+            # os.environ["HOME"] held the new value.
+            failed.append(
+                (
+                    var,
+                    f"{var} was set to {target}, but the value this process will actually use "
+                    f"is still {observed}. The variable changed; what reads it did not, so a "
+                    "write under it still lands in the wrong place",
+                )
+            )
 
     for var in repaired:
         logger.error("BioEngine: %s repaired to %s", var, os.environ[var])
-    for var, exc in failed:
-        logger.error(
-            "BioEngine: could NOT repair %s to %s (%s). %s is unchanged and this replica will "
-            "fail on its first write under it.",
-            var,
-            app_dir / ("home" if var == "HOME" else "tmp"),
-            exc,
-            var,
-        )
+    for var, detail in failed:
+        # The detail carries the state, because the two failure modes leave DIFFERENT state: a
+        # directory that could not be created leaves the variable untouched, while a re-read
+        # that disagrees means the variable was written and something else did not follow. One
+        # fixed sentence for both was false in the second case.
+        logger.error("BioEngine: could NOT repair %s. %s.", var, detail)
 
 
 def _install_secret_env_vars(instance: Any, logger: logging.Logger) -> None:
