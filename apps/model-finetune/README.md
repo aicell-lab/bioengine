@@ -183,7 +183,11 @@ launch instead of OOMing mid-train.
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
-  `.geojson` FeatureCollection of polygons (rasterized to instances).
+  `.geojson` FeatureCollection of polygons (rasterized to instances). Polygon
+  coordinates are **image pixels in `(x, y)` order** — x horizontal, y vertical,
+  origin at the top-left pixel — one instance per `Polygon`/`MultiPolygon`
+  feature, numbered from 1 in document order. A FeatureCollection that carries
+  polygons but rasterizes to nothing is rejected rather than trained on.
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).

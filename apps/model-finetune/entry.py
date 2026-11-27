@@ -1207,7 +1207,19 @@ class EntryApp:
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
-            raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
+            # A 404 here cannot tell three different situations apart, so the message
+            # names all three rather than asserting one. S3 answers 404 for an object
+            # that was never written just as it does for one that is gone, and the
+            # staging handout from `get_upload_url` is a presigned PUT valid for one
+            # hour -- so a caller who held that URL longer than the window never
+            # uploaded at all, and arrives here indistinguishable from a typo.
+            raise FileNotFoundError(
+                f"Source '{source}' could not be read (HTTP 404). It may never have "
+                f"been uploaded, may have been removed, or the upload may have been "
+                f"attempted after its staging URL expired -- `get_upload_url` returns "
+                f"a presigned PUT valid for 1 hour, and a 404 cannot distinguish "
+                f"these. Re-request an upload URL and re-upload before training."
+            )
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
         if ext == ".npy":
