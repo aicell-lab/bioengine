@@ -219,6 +219,86 @@ def _ensure_working_directory(logger: logging.Logger) -> None:
     except OSError:
         pass
     logger.info(f"📁 Working directory: {workdir}/")
+    if app_dir_env:
+        _ensure_home_under_app_dir(workdir, logger)
+
+
+def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
+    """Check, IN THE SERVING PROCESS, that ``HOME`` and ``TMPDIR`` point under the per-app
+    directory — and say so loudly and repair them if not.
+
+    WHAT WAS MEASURED, and only that. On a live external-cluster site, eight of eight
+    ``ray::ServeReplica:*`` processes for a freshly deployed app served with ``HOME=/home/ray``, the
+    image default, which is read-only. The app then refused every model type with
+    ``[Errno 30] Read-only file system: '/home/ray/.bioengine'``, two steps from the cause. The
+    identical scan on another site showed six of six under the per-app home.
+
+    WHY THE TWO SITES DIFFERED — the cause, read out of the versions they actually run rather than
+    out of ``main``. The broken site ran worker 0.16.130, the healthy one 0.16.131:
+
+    * at 0.16.130 ``bioengine/apps/builder.py`` composes **no** ``env_vars["HOME"]`` at all, so the
+      per-actor leg does not exist there; and
+    * at 0.16.130 ``replica_init`` assigns ``HOME`` *after* ``_ensure_source``, so a sync that
+      raises leaves ``HOME`` at the image default — the ordering hazard that version's own
+      docstring warns about.
+
+    So on that site there was exactly ONE leg and it was order-dependent. Rolling the worker to
+    0.16.131 or later is the remedy for the cause; this function is defence in depth, not that
+    remedy. It is useful because it runs in the process that will do the writing, so it also covers
+    a future delivery path failing silently — but it does not pretend to explain anything beyond
+    what is written above.
+
+    CHECK AND REPAIR, not refuse: an app that can be made to work should work, and raising here
+    would turn a recoverable environment into a dead deployment. ERROR-level because a silent
+    repair would hide a real bootstrap defect; the repair keeps the site serving, the log is what
+    gets the delivery fixed.
+
+    ORDER MATTERS INSIDE HERE TOO. Each directory is created *before* its variable is assigned, and
+    each is reported separately. An earlier version assigned ``HOME`` first and then created
+    ``tmp``; when the ``tmp`` creation failed it logged "could NOT repair HOME" — while ``HOME`` had
+    in fact already been repaired, and ``TMPDIR`` had been pointed at a directory that did not
+    exist. The message contradicted the state.
+    """
+    repaired, failed = [], []
+
+    for var, target in (("HOME", app_dir / "home"), ("TMPDIR", app_dir / "tmp")):
+        current = os.environ.get(var)
+        try:
+            ok = current is not None and Path(current).resolve() == target.resolve()
+        except OSError:
+            ok = False
+        if ok:
+            continue
+        # `setdefault` is deliberately NOT used: a TMPDIR that is present but points somewhere
+        # unwritable is exactly the case worth repairing, and setdefault would leave it alone.
+        logger.error(
+            "BioEngine: %s was %s, not %s, in the process that serves this replica. Repairing it "
+            "now; a write under it would otherwise have failed against a path this process cannot "
+            "write, and the cause would have looked like an application bug.",
+            var,
+            current if current else "<unset>",
+            target,
+        )
+        try:
+            # Create first, assign second. Assigning a variable to a directory that does not exist
+            # replaces one failure with a less obvious one.
+            target.mkdir(parents=True, exist_ok=True)
+            os.environ[var] = str(target)
+            repaired.append(var)
+        except OSError as exc:
+            failed.append((var, exc))
+
+    for var in repaired:
+        logger.error("BioEngine: %s repaired to %s", var, os.environ[var])
+    for var, exc in failed:
+        logger.error(
+            "BioEngine: could NOT repair %s to %s (%s). %s is unchanged and this replica will "
+            "fail on its first write under it.",
+            var,
+            app_dir / ("home" if var == "HOME" else "tmp"),
+            exc,
+            var,
+        )
 
 
 def _install_secret_env_vars(instance: Any, logger: logging.Logger) -> None:
