@@ -382,10 +382,19 @@ def test_a_FENCE_FAILURE_PROPAGATES_rather_than_becoming_a_warning():
     `MirrorVerificationError` means the mirror served bytes that did not match a
     digest pinned in this repository. `ensure_base_checkpoint` raises for it --
     rather than reporting it like an unobtainable part -- precisely because it
-    must stop everything. Swallowing it here turned a refusal into a warning
+    must stop everything. Swallowing it here turned that refusal into a warning
     reading "the load will use whatever is on disk", on the single path whose
-    whole purpose is to stop, and the load would then proceed on unverified
-    weights.
+    whole purpose is to stop.
+
+    WHAT WAS LOST WAS THE REPORT, NOT THE FENCE, and an earlier version of this
+    docstring overstated it as "the load would then proceed on unverified
+    weights". A review corrected that and the correction matters: the bytes are
+    never installed -- `install_verified` hashes into a temp file and only
+    `os.replace`s it after `check_digest` passes -- and pooch re-checks
+    upstream's xxh128 on every use of a cached file. So the load does not run on
+    bad weights. What is lost is that nobody is TOLD the mirror served bytes
+    that failed a pinned digest: the run continues as though the seed had merely
+    been unnecessary, and a substituted or corrupted mirror stays invisible.
 
     It subclasses `RuntimeError`, which is why the broad `except Exception`
     caught it and why the re-raise has to come FIRST.
