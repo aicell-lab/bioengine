@@ -62,14 +62,26 @@ _MAX_CONCURRENT_TRAINING = max(
 )
 
 # How much of a failure message is kept in a session's status document. Named
-# because the failure path now has to fit two things inside it -- the underlying
-# error and the contention note -- and a bare literal at the truncation site is
-# a bare literal at the truncation site hides a limit two strings must
-# share. `train_worker.py` and
+# because the failure path has to fit two things inside it -- the underlying
+# error and the contention note -- and a bare literal at the truncation site
+# hides a limit that two strings have to share. `train_worker.py` and
 # `train_worker_cellpose.py` clip to the same 800 with their own literals; they
 # run as separate processes and write a single string, so they are left alone
 # rather than made to import this, but the number is the same by intent.
 _STATUS_MESSAGE_LIMIT = 800
+
+# THE CONTENTION WORDING, DEFINED ONCE. It is read in three places -- the
+# `slot_busy_message` field, the note appended to a failure message, and the
+# tests -- and it drifted the moment there were two copies: a review caught the
+# field saying "every training slot" while both notes still said "the training
+# slot", which is true only at the default cap of 1. Deriving the note from the
+# message makes the two unable to disagree, and the tests assert against these
+# names rather than against a repeated sentence.
+_SLOT_BUSY_MESSAGE = (
+    "all training slots were held when this run started, so it prepared its "
+    "data alongside a run already in progress"
+)
+_SLOT_BUSY_NOTE = f" [{_SLOT_BUSY_MESSAGE}; that may or may not be related]"
 
 RuntimeApp = None
 CellposeRuntime = None
@@ -1807,10 +1819,7 @@ class EntryApp:
                     # answer to "is it waiting?" is `status`, which reaches
                     # QUEUED further down; a present-tense sentence here reads as
                     # that on a finished run and contradicts it.
-                    slot_busy_message=(
-                        "another fine-tuning held the training slot when this run "
-                        "started, so it prepared its data alongside that run"
-                    ),
+                    slot_busy_message=_SLOT_BUSY_MESSAGE,
                 )
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
@@ -1929,11 +1938,7 @@ class EntryApp:
             # are, and the note is always whole -- reversing which half is
             # sacrificed, because a truncated diagnostic is still a diagnostic
             # and a truncated note is nothing.
-            note = (
-                " [another fine-tuning held the training slot when this run "
-                "started, so it was preparing data alongside a run in progress; "
-                "that may or may not be related]"
-            )
+            note = _SLOT_BUSY_NOTE
             logged = f"{safe}{note}" if slot_busy else safe
             logger.error(f"Training session {session_id} failed: {logged}")
             if slot_busy and len(note) < _STATUS_MESSAGE_LIMIT:
@@ -3035,7 +3040,7 @@ class EntryApp:
         means every training slot is held by another fine-tuning (one slot by
         default; MODEL_FINETUNE_MAX_CONCURRENT_TRAINING raises it).
 
-        `slot_busy` is true when another run held that slot at the moment this
+        `slot_busy` is true when all of them were held at the moment this
         one started, with `slot_busy_message` saying so in words. It is the
         answer to "was my run sharing a worker?", which `status` cannot give
         during preparation: a contended run and an uncontended one both read

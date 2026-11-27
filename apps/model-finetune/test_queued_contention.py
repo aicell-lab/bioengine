@@ -144,8 +144,8 @@ async def test_a_contended_run_says_the_slot_is_busy_WHILE_it_prepares():
         f"contention, so a caller cannot attribute a failure: {seen!r}"
     )
     assert (
-        "another" in str(seen.get("slot_busy_message", "")).lower()
-    ), f"contention is flagged but not explained: {seen!r}"
+        seen.get("slot_busy_message") == _slot_busy_message()
+    ), f"the flag is set but not explained in the module's own words: {seen!r}"
 
 
 @pytest.mark.asyncio
@@ -418,7 +418,15 @@ async def test_the_contention_note_survives_however_long_the_error_is(n):
     st = training.get_status(BUSY)
     assert st["status"] == "FAILED"
     msg = st["message"]
-    assert "held the training slot" in msg, (
+    # A WORDING-STABLE FRAGMENT, NOT THE CONSTANT, and that is deliberate.
+    # This arm's whole value is being RED against the pre-fix code, which
+    # carried a differently worded note ("held the training slot"). Asserting
+    # the current constant made all five lengths fail there on wording instead
+    # of on truncation -- uniform red, which says nothing about WHICH length
+    # loses the note. "training slot" is in both wordings, so the arm measures
+    # presence across the boundary. Exact wording is pinned separately, by the
+    # field test, where drift is the thing under test.
+    assert "training slot" in msg, (
         f"a {n}-character error lost the contention note entirely; the note is "
         f"what the README and get_training_status promise is there "
         f"(message was {len(msg)} chars)"
@@ -430,6 +438,27 @@ async def test_the_contention_note_survives_however_long_the_error_is(n):
     ), f"the message is {len(msg)} chars, over the limit"
     # And the error itself still leads, so the diagnostic is not sacrificed.
     assert msg.startswith("EEE"), f"the underlying error no longer leads: {msg[:60]!r}"
+
+
+def _slot_busy_message():
+    """The module's own contention sentence, asserted by reference.
+
+    A duplicated sentence is what drifted in the first place: the status field
+    said "every training slot" while both notes still said "the training slot",
+    and no test could see the disagreement because each one quoted whichever
+    copy it was written against.
+    """
+    import entry
+
+    return entry._SLOT_BUSY_MESSAGE
+
+
+def _slot_busy_note():
+    """The bracketed form appended to a failure message, derived from the
+    sentence above so the two cannot disagree."""
+    import entry
+
+    return entry._SLOT_BUSY_NOTE
 
 
 def _status_limit():
@@ -458,5 +487,5 @@ async def test_an_uncontended_long_error_is_clipped_and_carries_no_note():
     await _run(_Stub(prepare), FREE)
     st = training.get_status(FREE)
     msg = st["message"]
-    assert "held the training slot" not in msg
+    assert "training slot" not in msg
     assert len(msg) == _status_limit()
