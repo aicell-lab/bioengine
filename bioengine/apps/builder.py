@@ -179,6 +179,12 @@ class AppBuilder:
         elastic_gpu_cluster: bool = False,
         debug: bool = False,
     ) -> None:
+        # ObjectRefs of build_and_run_application tasks that are still running, keyed by
+        # application_id. Needed because cancelling the asyncio task that awaits one does NOT stop
+        # the Ray task: the await is abandoned, the worker thread keeps blocking in ray.get, and
+        # the remote task runs to completion and calls serve.run. Measured: a stop at 03:07:17
+        # deleted the Serve app, and the build task re-created it at 03:07:21.
+        self._inflight_builds: Dict[str, Any] = {}
         self.logger = create_logger(
             name="AppBuilder",
             level=logging.DEBUG if debug else logging.INFO,
@@ -1080,34 +1086,101 @@ class AppBuilder:
         # module top-level imports ``hypha_rpc`` crashes the unpickle.
         # Sanitising dict args to primitives here keeps the
         # worker↔cluster RPC contract pure-data and cluster-env-agnostic.
+        # BIND the ref rather than passing it inline. An inline ObjectRef cannot be cancelled,
+        # because nothing holds it: `ray.cancel` needs the handle. That is the whole defect.
+        build_ref = ray.remote(
+            # max_calls=1: same reason as the introspect task — a fresh
+            # process guarantees the deployment class is imported from the
+            # refreshed source, not a stale sys.modules entry cached on a
+            # reused worker (the class is cloudpickled by value to the
+            # replicas, so the build worker's import is what they run).
+            num_cpus=0,
+            max_calls=1,
+            runtime_env=built_app.runtime_env,
+        )(build_and_run_application).remote(
+            _ensure_jsonable(built_app.spec),
+            _ensure_jsonable(built_app.translated_kwargs),
+            _ensure_jsonable(built_app.proxy_args),
+            application_id,
+            f"/{application_id}",
+            built_app.bioengine_uri,
+            built_app.proxy_pip,
+            built_app.user_replica_framework_pip,
+            _ensure_jsonable(built_app.replica_env_vars),
+            built_app.proxy_memory_in_gb,
+            _ensure_jsonable(built_app.scaling),
+        )
+        # Tolerate an instance that never ran __init__: tests (and recovery paths) build
+        # AppBuilder via __new__, which carries none of the __init__ attributes. The same
+        # shape broke two unrelated submit tests the moment this registry was added, and a
+        # sibling row hit it in `status()` the same day.
+        inflight = getattr(self, "_inflight_builds", None)
+        if inflight is None:
+            inflight = self._inflight_builds = {}
+        inflight[application_id] = build_ref
         try:
-            await asyncio.to_thread(
-                ray.get,
-                # max_calls=1: same reason as the introspect task — a fresh
-                # process guarantees the deployment class is imported from the
-                # refreshed source, not a stale sys.modules entry cached on a
-                # reused worker (the class is cloudpickled by value to the
-                # replicas, so the build worker's import is what they run).
-                ray.remote(num_cpus=0, max_calls=1, runtime_env=built_app.runtime_env)(
-                    build_and_run_application
-                ).remote(
-                    _ensure_jsonable(built_app.spec),
-                    _ensure_jsonable(built_app.translated_kwargs),
-                    _ensure_jsonable(built_app.proxy_args),
-                    application_id,
-                    f"/{application_id}",
-                    built_app.bioengine_uri,
-                    built_app.proxy_pip,
-                    built_app.user_replica_framework_pip,
-                    _ensure_jsonable(built_app.replica_env_vars),
-                    built_app.proxy_memory_in_gb,
-                    _ensure_jsonable(built_app.scaling),
-                ),
-            )
+            await asyncio.to_thread(ray.get, build_ref)
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc
+        finally:
+            # Always drop it: a finished task must not be cancellable later, and a stale ref would
+            # make a future stop cancel someone else's build.
+            # Pop only if the entry is still OURS. `_fire_redeploy` starts a new deploy
+            # task without cancelling the old one, so two submits can overlap on one id:
+            # the second ref overwrites the first, and without this check the first
+            # build's `finally` would pop the SECOND build's ref — leaving a later stop
+            # with nothing to cancel and the orphan back.
+            _inflight = getattr(self, "_inflight_builds", {})
+            if _inflight.get(application_id) is build_ref:
+                _inflight.pop(application_id, None)
         self.logger.info(f"Submitted '{application_id}' to Ray Serve")
+
+    def cancel_inflight_build(self, application_id: str) -> bool:
+        """Make sure no build task can still re-create *application_id*.
+
+        Returns **True when nothing can re-create the application** — either there was no build
+        registered, or the cancel succeeded. Returns **False only when a cancel was attempted and
+        failed**, which means a build may still be running and the caller must keep the
+        application visible rather than dropping its tracking entry.
+
+        The two "nothing happened" cases are deliberately NOT the same value: a caller needs to
+        distinguish "safe to tear down" from "a build may re-create this", and an earlier version
+        returned False for both, which made the safe case look dangerous and the dangerous case
+        look ordinary.
+
+        WHY THIS EXISTS SEPARATELY FROM THE ASYNCIO CANCEL. ``_cancel_deployment_process`` calls
+        ``deployment_task.cancel()``, which cancels the *coroutine* awaiting this build. That
+        coroutine is blocked in ``asyncio.to_thread(ray.get, ref)``; cancelling it abandons the
+        await, but the worker thread keeps blocking and — the part that matters — the **Ray task
+        on the cluster keeps running** and goes on to call ``serve.run``. Measured on a live site:
+        a stop at 03:07:17 deleted the Serve app and dropped its tracking entry, and the build
+        task re-created it at 03:07:21, leaving an application no worker knew about holding two
+        GPUs.
+
+        ``force=True`` because a graceful cancel only interrupts a task between calls; this one
+        spends its life inside ``serve.run``, so a non-forced cancel would not stop it in time.
+        """
+        build_ref = getattr(self, "_inflight_builds", {}).pop(application_id, None)
+        if build_ref is None:
+            # Nothing registered: no build can re-create it, so teardown is safe.
+            return True
+        try:
+            ray.cancel(build_ref, force=True)
+        except Exception as exc:  # noqa: BLE001
+            # Report rather than raise: the caller is tearing an app down, and a failure to
+            # cancel must not stop the rest of the teardown. But say it, because the app may
+            # come back.
+            self.logger.error(
+                f"Could not cancel the in-flight build task for '{application_id}': {exc}. "
+                "The application may be re-created by that task after this stop completes."
+            )
+            return False
+        self.logger.info(
+            f"Cancelled the in-flight build task for '{application_id}' so it cannot re-create "
+            "the application after teardown."
+        )
+        return True
 
 
 class BuiltApp:

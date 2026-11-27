@@ -1234,9 +1234,22 @@ class AppsManager:
             If no deployment task is active, this method does nothing.
             Uses a 60-second timeout for cancellation to complete.
         """
+        # Cancel the RAY task first, and unconditionally: it is the one that can re-create the
+        # application after teardown. `deployment_task.cancel()` below only cancels the coroutine
+        # awaiting it, which leaves the remote task running inside serve.run.
+        #
+        # The result is RECORDED rather than discarded. `ray.cancel` is fire-and-forget, so a
+        # build that reaches `serve.run` before it dies re-creates the application after
+        # `serve.delete` — the incident shape with a smaller window. A caller that could not
+        # cancel must not then drop the tracking entry, or the app becomes invisible again.
+        self._build_cancelled_cleanly = self.app_builder.cancel_inflight_build(
+            application_id
+        )
+
         deployment_task = self._deployed_applications[application_id]["deployment_task"]
         if not deployment_task:
-            # No active deployment task to cancel
+            # No active deployment task to cancel -- but the Ray task above may still have been
+            # in flight, which is why that call is not inside this guard.
             return
 
         self.logger.info(
@@ -1298,6 +1311,18 @@ class AppsManager:
         # if the entry survived the serve.delete window, a monitor tick could
         # re-adopt the app mid-stop and re-deploy it, racing the stop. Popping
         # first makes the app invisible to the monitor for the rest of teardown.
+        # If the build task could NOT be cancelled, keep the application visible. A build that
+        # survives this teardown can re-create the Serve app, and an app nobody tracks is exactly
+        # the fault being fixed: it keeps its GPUs and no operator can reach it. Visible-and-
+        # stoppable beats tidy-and-invisible.
+        if not getattr(self, "_build_cancelled_cleanly", True):
+            self.logger.error(
+                f"Keeping '{application_id}' in the application list: its build task could not be "
+                "cancelled, so it may re-create the Serve application after this teardown. The "
+                "entry is retained so the app stays visible and can be stopped again."
+            )
+            return
+
         application_info = self._deployed_applications.pop(application_id, None)
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
