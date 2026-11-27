@@ -348,3 +348,54 @@ async def test_an_unreadable_serve_status_is_not_reported_as_everything_orphaned
         "conclude an application is gone because the status call broke"
     )
     assert await _real_or_missing("_serve_application_exists")(mgr, APP) is False
+
+
+# ──────────────── 4. the sweep is WIRED to the monitor, not merely available ─────────────────
+
+
+def test_the_monitor_actually_runs_the_orphan_sweep() -> None:
+    """A method nobody calls reports nothing.
+
+    The clause this pins is "a watcher reports any Serve app that is not in its app list" — so the
+    comparison existing is not enough, something has to run it. Asserted structurally, against the
+    monitor's source, because driving a full monitor tick needs a live Ray cluster.
+
+    Anchored on the call and on the reuse of the status the tick already fetched: making the sweep
+    do its own ``serve.status`` would double the RPCs on the hot loop, and a reviewer should see
+    that choice break if someone changes it.
+    """
+    import inspect
+
+    source = inspect.getsource(AppsManager.monitor_applications)
+    assert "get_orphaned_applications(" in source, (
+        "the monitor never calls the orphan sweep, so an orphan is still only visible to "
+        "somebody who thinks to ask"
+    )
+    assert "serve_application_names=" in source, (
+        "the sweep is called without the status the tick already fetched, so it makes a second "
+        "serve.status RPC on every monitoring interval"
+    )
+    assert (
+        "_ORPHAN_REPORT_COOLDOWN_SECONDS" in source
+    ), "an orphan persists, so an unthrottled report repeats every tick and becomes noise"
+
+
+def test_a_prefetched_status_is_used_instead_of_a_second_rpc() -> None:
+    """The behavioural half of the arm above: given names, it must not call Serve again."""
+    import asyncio
+
+    log = _Logger()
+
+    class _Exploding(_ClusterStub):
+        async def call_with_reconnect(self, fn, *args):
+            raise AssertionError("the sweep made its own serve.status call")
+
+    mgr = _ManagerStub(_Exploding([]), log)
+    mgr._deployed_applications = {"tracked": {}}
+
+    orphans = asyncio.run(
+        _real_or_missing("get_orphaned_applications")(
+            mgr, serve_application_names={"tracked", "ghost"}
+        )
+    )
+    assert orphans == ["ghost"], orphans

@@ -389,6 +389,11 @@ _MISSING_FROM_STATUS_TOLERANCE = 3
 # consider re-firing.
 _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 
+# An orphan does not clear itself, so the monitor would report the same one on every tick.
+# At the default 10s interval that is six identical error lines a minute, which is how a real
+# signal becomes noise an operator filters. Long enough to stay visible, rare enough to read.
+_ORPHAN_REPORT_COOLDOWN_SECONDS = 300.0
+
 # How long one monitor tick waits for the controller actor lookup. Measured
 # 0.10-0.12 s against a live head and 27.4 s against an unreachable one, so
 # this is ~100x the healthy case and still far inside the worker's 120 s
@@ -762,6 +767,7 @@ class AppsManager:
         # used to rate-limit re-firing while a redeploy's serve.run is still
         # bootstrapping the controller. See _recover_from_controller_loss.
         self._last_controller_recovery = 0.0
+        self._last_orphan_report = 0.0
 
         # Cache the result of the one-time FS-topology probe across Ray
         # nodes. None until the first list/clear-cache call from the
@@ -1290,7 +1296,9 @@ class AppsManager:
         names = await self._serve_application_names()
         return bool(names and application_id in names)
 
-    async def get_orphaned_applications(self) -> List[str]:
+    async def get_orphaned_applications(
+        self, serve_application_names: Optional[Set[str]] = None
+    ) -> List[str]:
         """Applications Ray Serve holds that this worker does not list.
 
         An orphan is invisible to ``get_app_status`` and cannot be reached by
@@ -1302,7 +1310,11 @@ class AppsManager:
         An unreadable Serve status yields an empty list rather than claiming
         every tracked application is orphaned.
         """
-        names = await self._serve_application_names()
+        names = (
+            serve_application_names
+            if serve_application_names is not None
+            else await self._serve_application_names()
+        )
         if names is None:
             return []
         orphans = sorted(names - set(self._deployed_applications))
@@ -2649,6 +2661,17 @@ class AppsManager:
                 # trigger a sweep.
                 await self._recover_from_controller_loss(apps_to_redeploy)
             raise
+
+        # Report applications Ray Serve holds that this worker does not track. Reuses the
+        # status just fetched rather than making its own call, so the sweep costs nothing
+        # extra per tick, and is rate-limited because an orphan persists: without the
+        # cooldown this would repeat the same error every monitoring interval, and an
+        # error repeated every ten seconds is one an operator filters out.
+        if time.time() - self._last_orphan_report >= _ORPHAN_REPORT_COOLDOWN_SECONDS:
+            if await self.get_orphaned_applications(
+                serve_application_names=set(serve_status.applications or {})
+            ):
+                self._last_orphan_report = time.time()
 
         if not serve_status.applications and await _controller_is_missing_off_loop():
             # Controller lost, but serve.status reported it as an empty status
