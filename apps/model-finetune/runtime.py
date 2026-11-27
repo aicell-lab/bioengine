@@ -561,9 +561,16 @@ class RuntimeApp:
             return out
 
         # RE-CHECK THE DISK before fetching. The probe's answer is a moment
-        # old, and another run on this same replica may have seeded the file
-        # since -- the cache is shared by every run in the app, so two
-        # admissions racing would otherwise both download 375 MB.
+        # old and another run on this same replica may have seeded the file
+        # since -- the cache is shared by every run in the app.
+        #
+        # THIS NARROWS THE WINDOW; IT DOES NOT CLOSE IT, and an earlier version
+        # of this comment claimed it did. Two admissions that both probe while
+        # the first 375 MB download is still in flight will both download,
+        # because the `.part` temp file is deliberately not visible at the real
+        # name. The RESULT stays correct -- unique temp names and an atomic
+        # os.replace -- so what is wasted is bandwidth, not correctness. A
+        # per-name lock would fix that and is not here.
         still_missing = set(bcm.missing_parts(root, model_type))
         # Only now is the mirror involved, and only for these names.
         mirrored = [

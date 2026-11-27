@@ -18,9 +18,14 @@ TWO DIGESTS, TWO DIFFERENT JOBS, and conflating them is the trap:
 
 * ``xxh128`` is UPSTREAM's, copied from `micro_sam/v1/util.py`'s registry
   literals. It is *provenance*: evidence that the bytes we mirrored are the
-  bytes micro-sam publishes. It is recorded, not enforced here -- enforcing it
-  would mean depending on micro-sam's internals at read time, and `pooch` will
-  check it itself whenever it is the one fetching.
+  bytes micro-sam publishes. It is   recorded here, and enforced by POOCH rather than by this module. pooch
+  hash-checks a file ALREADY IN THE CACHE, so upstream's digest gates every USE
+  of a seeded file and not merely the fetches pooch performs itself -- measured
+  four ways, including that a wrong cached file with the origin DOWN makes pooch
+  RAISE rather than hand the bytes over. An earlier version of this comment said
+  pooch checks it "whenever it is the one fetching", which implied a seeded file
+  sails past until pooch happens to download. The opposite is true, and it is
+  what makes the sha256 below a genuine SECOND line rather than the only one.
 * ``sha256`` is OURS, measured over the mirrored bytes. It is *integrity*: it
   catches a truncated transfer, a corrupted object, or a substituted file. This
   is what the fence enforces.

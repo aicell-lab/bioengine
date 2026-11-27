@@ -799,3 +799,73 @@ def test_an_UPSTREAM_REACHABLE_run_never_reaches_the_fallback_AT_THE_CALL_SITE()
     cls, inst = _entry_instance(rt)
     asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
     assert "ensure_base_checkpoint" not in rt.calls, rt.calls
+
+
+def test_a_fallback_with_NOTHING_TO_DO_still_RE_PROBES_and_admits():
+    """The round-2 defect: `installed: []` with no error is the GOOD outcome.
+
+    `ensure_base_checkpoint` legitimately returns nothing installed when the
+    state changed under the probe -- the file arrived between the probe and the
+    fetch, or its own re-probe found the part cached after all. Keying the
+    re-probe on `installed` kept the STALE refusal in exactly those cases, so a
+    run whose weights ARE cached was refused saying "not cached here".
+    """
+    seq = {"n": 0}
+
+    def _status(model_type):
+        seq["n"] += 1
+        # First answer refuses; by the second the file is there.
+        return (
+            _unreachable_parts(model_type)
+            if seq["n"] == 1
+            else _cached_parts(model_type)
+        )
+
+    def _ensure(model_type, **kw):
+        # Nothing installed, no error: the disk re-check found the file had
+        # arrived while we were asking.
+        return {
+            "model_type": model_type,
+            "source": "cache",
+            "parts": {},
+            "installed": [],
+            "unavailable": [],
+            "error": None,
+        }
+
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={"base_checkpoint_status": _status, "ensure_base_checkpoint": _ensure},
+    )
+    cls, inst = _entry_instance(rt)
+    # Must NOT raise: the weights are cached by the time we ask again.
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert rt.calls.count("base_checkpoint_status") >= 2, rt.calls
+
+
+def test_a_fallback_that_reports_an_ERROR_does_NOT_re_probe():
+    """The other side of the same condition. An error means the fallback could
+    not establish anything, so the original refusal is the honest answer and a
+    second probe would just be noise on the admission path."""
+
+    def _ensure(model_type, **kw):
+        return {
+            "model_type": model_type,
+            "source": "unavailable",
+            "parts": {},
+            "installed": [],
+            "unavailable": [model_type],
+            "error": "could not resolve mirror urls: ConnectionError: nope",
+        }
+
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={
+            "base_checkpoint_status": _unreachable_parts,
+            "ensure_base_checkpoint": _ensure,
+        },
+    )
+    cls, inst = _entry_instance(rt)
+    with pytest.raises(ValueError):
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert rt.calls.count("base_checkpoint_status") == 1, rt.calls

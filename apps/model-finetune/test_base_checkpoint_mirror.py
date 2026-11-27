@@ -335,3 +335,34 @@ def test_a_PROBE_that_failed_does_NOT_trigger_a_mirror_download(monkeypatch, tmp
     assert out["source"] == "unavailable", out
     assert "probe failed" in (out["error"] or ""), out
     assert opened == {}, opened
+
+
+def test_a_failed_URL_RESOLVE_NAMES_the_parts_it_could_not_get(monkeypatch, tmp_path):
+    """A refusal worded from `unavailable` must not print an empty list.
+
+    The review measured this by probe and asked for it pinned: when the URL
+    resolve raises, the mirrored names have to land in `unavailable`, or a
+    caller that words its message from that list refuses while saying nothing
+    about what was missing.
+    """
+    import asyncio as aio
+
+    opened = {}
+    parts = {
+        "encoder": {"cached": False, "reachable": False, "url": "https://up/e"},
+        "decoder": {"cached": False, "reachable": False, "url": "https://up/d"},
+    }
+    _, inst, _, _resolve, opener = _runtime_with(monkeypatch, tmp_path, parts, opened)
+
+    async def _boom(names):
+        raise ConnectionError("the artifact manager is unreachable")
+
+    out = aio.run(
+        inst.ensure_base_checkpoint(
+            "vit_t_lm", resolve_mirror_urls=_boom, open_url=opener
+        )
+    )
+    assert out["error"] and "could not resolve mirror urls" in out["error"], out
+    assert out["unavailable"] == ["vit_t_lm", "vit_t_lm_decoder"], out["unavailable"]
+    assert out["installed"] == [], out
+    assert opened.get("opened") is None, "nothing should have been downloaded"

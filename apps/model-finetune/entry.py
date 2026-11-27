@@ -893,11 +893,26 @@ class EntryApp:
                             for r in seeded["installed"]
                         ),
                     )
-                    # RE-PROBE rather than trusting the seeding result. The
-                    # question is what the CACHE now holds, and the only
-                    # authority on that is the same probe that refused -- this
-                    # is the artifact-versus-our-own-account distinction, on a
-                    # filesystem instead of an artifact.
+                # RE-PROBE WHENEVER THE FALLBACK RETURNED CLEANLY, not only
+                # when it installed something.
+                #
+                # A review caught this: `ensure_base_checkpoint` legitimately
+                # returns `installed: []` with no error when the state changed
+                # under the probe -- the file arrived between the probe and the
+                # fetch (which is the race the disk re-check closes), or its own
+                # re-probe found the part cached or upstream reachable after all.
+                # Keying the re-probe on `installed` kept the STALE refusal in
+                # exactly those cases, so a run whose weights ARE cached was
+                # refused with the message "not cached here and not reachable
+                # from here". The fallback having nothing to do is the GOOD
+                # outcome, and it was the one treated as failure.
+                #
+                # RE-PROBE rather than trusting the seeding result either way.
+                # The question is what the CACHE now holds, and the only
+                # authority on that is the same probe that refused -- this is
+                # the artifact-versus-our-own-account distinction, on a
+                # filesystem instead of an artifact.
+                if seeded.get("error") is None:
                     try:
                         status = await asyncio.wait_for(
                             runtime.base_checkpoint_status(model_type),
