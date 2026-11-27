@@ -18,6 +18,7 @@ set.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import pytest
@@ -104,6 +105,17 @@ class FakeAM:
         #: the concurrency BOUND rather than hoping.
         self.in_flight = 0
         self.max_in_flight = 0
+        #: How many times `list_files` has been called, and two levers indexed
+        #: on it. `fail_list` above is unconditional, so it also breaks the
+        #: FIRST read-back's listing -- which is a different failure from the
+        #: repair's re-listing going wrong, and the repair pass is only reached
+        #: when the first read-back worked.
+        self.list_calls = 0
+        #: From this call onward (1-based), `list_files` RAISES.
+        self.fail_list_from_call = None
+        #: From this call onward (1-based), the server ignores `offset`, which
+        #: is how a listing ends up provably INCOMPLETE rather than absent.
+        self.ignores_offset_from_call = None
 
     def store(self, path, text):
         self.files[path] = text
@@ -153,7 +165,11 @@ class FakeAM:
         the one outcome it could not report. The ceiling turns that mutant into
         a loud error.
         """
-        if self.fail_list:
+        self.list_calls += 1
+        if self.fail_list or (
+            self.fail_list_from_call is not None
+            and self.list_calls >= self.fail_list_from_call
+        ):
             raise RuntimeError("the artifact could not be listed")
         self.list_asks.append((dir_path, limit, offset))
         if len(self.list_asks) > self.max_asks:
@@ -175,7 +191,11 @@ class FakeAM:
             if p.startswith(prefix)
         ]
         served = min(limit, self.page_size) if self.page_size else limit
-        start = 0 if self.ignores_offset else offset
+        blind = self.ignores_offset or (
+            self.ignores_offset_from_call is not None
+            and self.list_calls >= self.ignores_offset_from_call
+        )
+        start = 0 if blind else offset
         return rows[start : start + served]
 
     async def get_file(self, artifact_id=None, file_path=None, **kw):
@@ -194,6 +214,12 @@ class FakeHTTP:
 
     def __init__(self, am):
         self.am = am
+        # sid -> how many GETs of that record succeed before the rest raise a
+        # TRANSPORT error. Distinct from a 404: the record is there and the read
+        # failed, which is an absence of knowledge about the record rather than
+        # knowledge that the record is absent.
+        self.get_raises_after = {}
+        self.get_counts = {}
 
     @staticmethod
     def _path(url):
@@ -214,6 +240,14 @@ class FakeHTTP:
 
     async def get(self, url, **kw):
         path = self._path(url)
+        sid = path.rsplit("/", 1)[-1][: -len(".json")]
+        n = self.get_counts.get(sid, 0) + 1
+        self.get_counts[sid] = n
+        limit = self.get_raises_after.get(sid)
+        if limit is not None and n > limit:
+            # A transport failure, NOT an HTTP status. The record may well be
+            # present and correct; this read simply did not happen.
+            raise ConnectionError(f"connection reset reading {sid}")
         if path not in self.am.files:
             return self._Resp(404)
         return self._Resp(200, self.am.files[path])
@@ -1097,3 +1131,173 @@ def test_the_pushed_bookkeeping_follows_the_ARTIFACT_not_the_PUT_verdicts(store)
     assert plan["repaired"] == [ids[3]], plan["repaired"]
     # every id the ARTIFACT holds is recorded, including the raised one and the repaired one
     assert sorted(inst._runs_pushed) == sorted(ids), sorted(inst._runs_pushed)
+
+
+def test_a_RECORD_THE_REPAIR_LANDED_is_not_blamed_when_its_RE_READ_fails(store):
+    """A read that could not run is not evidence that the record is absent.
+
+    The repair re-reads the records it just re-uploaded. If that read fails for
+    any reason OTHER than the record being absent -- a dropped connection, a
+    timeout, a 5xx -- then nothing was learnt about the record, and reporting it
+    in `mismatched`/`failed` blames the record for the read. A caller acting on
+    that re-uploads a record the artifact already holds, correctly.
+
+    This is the record-blamed-for-the-read pattern the FIRST read-back's own
+    comment forbids, reproduced inside the repair's reporting.
+    """
+    ids = []
+    for i in range(1, 4):
+        sid = f"2026-01-01-0000{i:02d}-f33d000{i}"
+        store(sid)
+        ids.append(sid)
+    victim = ids[0]
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(victim,))
+    # The FIRST read-back's GET of the victim succeeds (and sees the tampered
+    # bytes, so the record is condemned and the repair re-uploads it). The
+    # repair's RE-READ is the second GET of that id, and it fails at transport.
+    inst._http.get_raises_after[victim] = 1
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    # The artifact DOES hold the record, correctly -- the repair landed it.
+    # Asserted against the PLAN's own hash rather than against a guess at the
+    # record's shape: that is the same comparison the read-back makes, so it
+    # says exactly "the bytes the artifact serves are the bytes planned".
+    stored_text = am.files[f"{training.run_record_dir('an-app')}/{victim}.json"]
+    assert (
+        hashlib.sha256(stored_text.encode("utf-8")).hexdigest()
+        == plan["hashes"][victim]
+    ), "the repair did not land the correct record, so this arm tests nothing"
+    assert json.loads(stored_text).get("tampered") is None, stored_text
+
+    # So the record must NOT be blamed.
+    assert victim not in plan["mismatched"], plan["mismatched"]
+    assert victim not in plan["failed"], plan["failed"]
+    # It is reported under its own key: the state could not be established.
+    assert plan["reread_errors"] == [victim], plan.get("reread_errors")
+    # And it is not claimed as repaired either, because nothing confirmed it.
+    assert victim not in plan["repaired"], plan["repaired"]
+    # An unknown is never a pass.
+    assert plan["complete"] is False, plan
+    # `repair_error` stays reserved for a failed stage/commit: the stage and the
+    # commit both succeeded here, and one record's read is not the pass failing.
+    assert plan.get("repair_error") is None, plan.get("repair_error")
+
+
+def test_a_GENUINELY_ABSENT_record_is_STILL_reported_missing(store):
+    """The control. The cheap way to pass the test above is to swallow every
+    fetch error, which would also hide a record that is really not there.
+
+    A record whose upload fails permanently is absent from the artifact after
+    the repair, and must still be reported in `mismatched`/`failed` -- not under
+    the could-not-read key.
+    """
+    ids = []
+    for i in range(1, 4):
+        sid = f"2026-01-01-0000{i:02d}-f44d000{i}"
+        store(sid)
+        ids.append(sid)
+    gone = ids[1]
+    am = FakeAM()
+    cls, inst = _app(am=am, fail=(gone,))
+
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    assert (
+        f"{training.run_record_dir('an-app')}/{gone}.json" not in am.files
+    ), "the record should be absent"
+    assert plan["mismatched"] == [gone], plan["mismatched"]
+    assert plan["failed"] == [gone], plan["failed"]
+    assert plan.get("reread_errors") == [], plan.get("reread_errors")
+    assert plan["complete"] is False, plan
+
+
+def test_a_RE_LISTING_that_RAISES_still_returns_a_REPORT(store):
+    """The backfill reports; it does not raise.
+
+    The per-id fetches use `return_exceptions=True`, so before the repair grew a
+    re-listing no read failure inside the repair could propagate. An unwrapped
+    `list_files` there handed the caller a traceback and NO report -- the one
+    outcome this operation exists to prevent, and the opposite of the rule the
+    function states about itself.
+    """
+    ids = []
+    for i in range(1, 4):
+        sid = f"2026-01-01-0000{i:02d}-aa11000{i}"
+        store(sid)
+        ids.append(sid)
+    victim = ids[0]
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(victim,))
+    # The plan's listing and the first read-back's must work: the repair pass is
+    # only reached when the first read-back condemned something. Only the
+    # re-listing fails.
+    plan_calls = 0
+
+    cls0, inst0 = _app(am=FakeAM(), tamper_once=(victim,))
+    probe = _run(cls0, inst0, apply=True, confirm="3")
+    assert probe["complete"] is True, probe  # the same scenario, undisturbed
+    plan_calls = inst0._am.list_calls
+    assert (
+        plan_calls >= 2
+    ), f"expected a re-listing to exist, saw {plan_calls} list calls"
+
+    am.fail_list_from_call = plan_calls  # the LAST listing of that run: the re-listing
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    # A report came back at all -- this is the assertion the arm exists for.
+    assert isinstance(plan, dict), plan
+    assert plan["complete"] is False, plan
+    # ...with the cause recorded rather than thrown.
+    assert plan.get("repair_error"), plan.get("repair_error")
+    assert "could not be read" in plan["repair_error"], plan["repair_error"]
+    # ...and the condemned record is NOT blamed: the repair may well have landed
+    # it, and nothing here established otherwise.
+    assert victim not in plan["mismatched"], plan["mismatched"]
+    assert victim not in plan["failed"], plan["failed"]
+    assert victim in plan["reread_errors"], plan["reread_errors"]
+
+
+def test_an_INCOMPLETE_RE_LISTING_does_not_blame_the_records_it_cannot_see(store):
+    """A listing that cannot be proven whole cannot say which records are absent.
+
+    The code said exactly that in a comment and then put every condemned id in
+    `mismatched` anyway -- telling the caller to re-upload records the artifact
+    holds, which is the pattern this row is about, one layer up from where it
+    was fixed.
+    """
+    ids = []
+    for i in range(1, 4):
+        sid = f"2026-01-01-0000{i:02d}-bb22000{i}"
+        store(sid)
+        ids.append(sid)
+    victim = ids[0]
+    am = FakeAM()
+    cls, inst = _app(am=am, tamper_once=(victim,))
+
+    cls0, inst0 = _app(am=FakeAM(), tamper_once=(victim,))
+    probe = _run(cls0, inst0, apply=True, confirm="3")
+    assert probe["complete"] is True, probe
+    last_list = inst0._am.list_calls
+    assert last_list >= 2, f"expected a re-listing to exist, saw {last_list} list calls"
+
+    # The server starts ignoring `offset` at the re-listing, which is how a
+    # listing becomes provably INCOMPLETE rather than absent.
+    am.ignores_offset_from_call = last_list
+    plan = _run(cls, inst, apply=True, confirm="3")
+
+    # The repair DID land the right bytes.
+    stored_text = am.files[f"{training.run_record_dir('an-app')}/{victim}.json"]
+    assert (
+        hashlib.sha256(stored_text.encode("utf-8")).hexdigest()
+        == plan["hashes"][victim]
+    ), "the repair did not land the correct record, so this arm tests nothing"
+
+    assert plan["complete"] is False, plan
+    assert plan.get("repair_error"), plan.get("repair_error")
+    assert "could not be proven" in plan["repair_error"], plan["repair_error"]
+    # The record the listing could not vouch for is UNESTABLISHED, not wrong.
+    assert victim not in plan["mismatched"], plan["mismatched"]
+    assert victim not in plan["failed"], plan["failed"]
+    assert victim in plan["reread_errors"], plan["reread_errors"]

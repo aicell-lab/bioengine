@@ -3189,6 +3189,12 @@ class EntryApp:
             sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
         )
         plan["put_unknown"] = sorted(put_unknown)
+        # Always present, so a caller can read it without knowing whether a
+        # repair pass ran. An absent key and an empty one are indistinguishable
+        # through `.get()`, and a caller that cannot tell them apart will read
+        # "no read failures" out of a report that never looked.
+        plan["reread_errors"] = []
+        plan["reread_error_detail"] = {}
 
         # REPAIR PASS: re-upload ONLY what the read-back condemns.
         #
@@ -3233,40 +3239,134 @@ class EntryApp:
             # no more authoritative than the first pass's were.
             #
             # PER ID, and an ABSENT record is "still missing" rather than a read
-            # failure. A review measured the difference: one record that stays
-            # missing 404s on its fetch, and a single `gather` then raised and
-            # discarded EVERY digest in the batch -- including those of records
-            # the repair had just landed correctly. With 2 transient and 1
-            # permanent failure the report read `repaired: []` and condemned all
-            # three, when the truth was two repaired and one unresolved. That is
-            # the same misreport this whole row exists to remove, so it cannot be
+            # failure. A review measured the difference: a single `gather` over
+            # every condemned id raised on the first failure and discarded
+            # EVERY digest in the batch -- including those of records the repair
+            # had just landed correctly. With 2 transient and 1 permanent
+            # failure the report read `repaired: []` and condemned all three,
+            # when the truth was two repaired and one unresolved. That is the
+            # same misreport this whole row exists to remove, so it cannot be
             # allowed to live in the repair's own reporting.
             #
-            # `repair_error` is reserved for a failed stage or commit, or a read
-            # that could not run at all. An individual record that is not there
-            # is not an error -- it is the answer.
+            # WHICH IDS ARE ABSENT IS DECIDED BY THE LISTING BELOW, not by a
+            # 404 on the fetch. An earlier version of this comment said a
+            # missing record "404s on its fetch", which stopped being how this
+            # works: a record the listing contains and the fetch then fails on
+            # -- 404 included, since it can only mean the record went away
+            # mid-pass -- is an absence of KNOWLEDGE and goes to
+            # `reread_errors`, not to `mismatched`.
+            #
+            # `repair_error` is reserved for exactly three things, and the code
+            # sets it for exactly those: a failed stage, a failed commit, and a
+            # listing that could not be proven complete -- a read that could not
+            # run AT ALL. Two things it is deliberately NOT used for:
+            #   * an individual record that is not there. That is not an error,
+            #     it is the answer, and it belongs in `mismatched`.
+            #   * an individual record that could not be READ. That is an
+            #     absence of knowledge about one record, not a failure of the
+            #     pass, and it belongs in `reread_errors`.
+            # The earlier wording of this comment claimed the wider "or a read
+            # that could not run", which read as covering a single failed fetch
+            # and did not match what the code did with one.
+            # ABSENCE IS DECIDED BY THE LISTING, NOT BY A FAILING FETCH, which
+            # is how the first read-back already does it. Treating every raised
+            # fetch as "the record is missing" blames the record for the read: a
+            # record the repair DID land, whose re-read then fails on the
+            # connection, was reported in `mismatched`/`failed` while the
+            # artifact held it correctly, and a caller acting on that re-uploads
+            # a record that is already right.
+            #
+            # Deciding it from the listing also keeps this honest across
+            # environments: an absent file surfaces as a different exception type
+            # depending on the HTTP client, so anything that sniffed the
+            # exception would behave differently in a test than in production.
+            # The listing answers the same way everywhere.
+            reread_errors: Dict[str, str] = {}
             if repair_error is None:
-                results = await asyncio.gather(
-                    *(_fetch_one(f"{sid}.json") for sid in bad),
-                    return_exceptions=True,
-                )
-                for sid, outcome in zip(bad, results):
-                    if isinstance(outcome, BaseException):
+                # WRAPPED, because this function REPORTS rather than raises.
+                # The per-id gather uses `return_exceptions=True`, so before
+                # this re-listing existed no read failure in the repair could
+                # propagate. Adding an unwrapped await put the caller back to
+                # receiving a traceback and NO report -- the one outcome this
+                # whole operation exists to prevent, and a direct contradiction
+                # of the rule stated further down ("Reported as False rather
+                # than raised: the caller needs a verdict").
+                relist_unusable = None
+                relisting, relisting_complete = [], False
+                try:
+                    relisting, relisting_complete = await self._list_run_record_files(
+                        am, store
+                    )
+                except Exception as exc:
+                    relist_unusable = (
+                        "the repair's re-read listing could not be read: %s: %s"
+                        % (type(exc).__name__, str(exc)[:200])
+                    )
+                if relist_unusable is None and not relisting_complete:
+                    relist_unusable = (
+                        "the repair's re-read listing could not be proven "
+                        "complete, so which records are absent cannot be said"
+                    )
+                if relist_unusable is not None:
+                    # A listing that cannot be proven whole cannot say which
+                    # records are absent, and GUESSING WOULD BLAME THEM -- so
+                    # not one of the condemned ids is reported as mismatched
+                    # here. Every one is unestablished, which is the true
+                    # statement: the repair may well have landed them, and an
+                    # earlier version of this code said exactly that in a
+                    # comment and then blamed them anyway.
+                    repair_error = relist_unusable
+                    plan["repair_error"] = repair_error
+                    for sid in bad:
+                        reread_errors[sid] = relist_unusable
+                else:
+                    present = {f[: -len(".json")] for f in relisting}
+                    missing = [sid for sid in bad if sid not in present]
+                    for sid in missing:
                         # Left out of `verified`, so the comparison below reports
                         # it as still mismatched -- which is exactly true.
                         logger.info(
-                            f"model-finetune: record '{sid}' is still not "
-                            f"readable after the repair: "
-                            f"{type(outcome).__name__}: {outcome}"
+                            f"model-finetune: record '{sid}' is still absent "
+                            f"from the artifact after the repair"
                         )
-                        continue
-                    got_sid, digest = outcome
-                    verified[got_sid] = digest
+                    to_fetch = [sid for sid in bad if sid in present]
+                    results = await asyncio.gather(
+                        *(_fetch_one(f"{sid}.json") for sid in to_fetch),
+                        return_exceptions=True,
+                    )
+                    for sid, outcome in zip(to_fetch, results):
+                        if isinstance(outcome, BaseException):
+                            # The listing said this record IS there, so a failed
+                            # read is an absence of KNOWLEDGE about it, not
+                            # knowledge that it is absent. A 404 here means it
+                            # went away between the listing and the fetch, which
+                            # also cannot be called established.
+                            reread_errors[sid] = "%s: %s" % (
+                                type(outcome).__name__,
+                                str(outcome)[:200],
+                            )
+                            logger.warning(
+                                f"model-finetune: record '{sid}' was listed but "
+                                f"could not be read back, so its state is not "
+                                f"established: {type(outcome).__name__}: "
+                                f"{outcome}"
+                            )
+                            continue
+                        got_sid, digest = outcome
+                        verified[got_sid] = digest
+            plan["reread_errors"] = sorted(reread_errors)
+            plan["reread_error_detail"] = dict(sorted(reread_errors.items()))
             plan["verified"] = len(verified)
+            # An id whose state could not be established is NOT mismatched and
+            # NOT repaired. It is neither claim, and reporting it as either one
+            # is the misreport this row exists to remove.
+            unknown = set(reread_errors)
             plan["mismatched"] = sorted(
-                sid for sid, h in plan["hashes"].items() if verified.get(sid) != h
+                sid
+                for sid, h in plan["hashes"].items()
+                if verified.get(sid) != h and sid not in unknown
             )
-            plan["repaired"] = sorted(set(bad) - set(plan["mismatched"]))
+            plan["repaired"] = sorted(set(bad) - set(plan["mismatched"]) - unknown)
 
         # THE PUSHED BOOKKEEPING FOLLOWS THE READ-BACK, so it belongs here --
         # after the repair pass -- not next to the uploads. Keying it on what the
@@ -3334,6 +3434,11 @@ class EntryApp:
         plan["failed"] = sorted(plan["mismatched"])
         plan["complete"] = (
             not plan["mismatched"]
+            # A record whose state could not be ESTABLISHED is not a pass. It is
+            # excluded from `mismatched` on purpose -- it is not known to be
+            # wrong -- so without this term narrowing the blame would have
+            # quietly turned an unknown into a success.
+            and not plan.get("reread_errors")
             and verify_error is None
             and plan.get("repair_error") is None
             # A stage or commit that failed after its retry means the artifact
