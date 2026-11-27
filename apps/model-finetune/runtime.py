@@ -51,6 +51,27 @@ ZOO_MODELS = {
 }
 _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 
+
+def _generalist_uses_registry(model_type: str) -> bool:
+    """Does this generalist resolve through micro-sam's registry rather than the zoo?
+
+    TRUE for exactly the model types the verified mirror holds, and the set is
+    ASKED OF THE MIRROR rather than written down a second time. A separate list
+    here would go stale the moment the mirror gains a type -- which is the same
+    argument this app already makes against a hard-coded model-type list in the
+    base-checkpoint preflight.
+
+    The other generalists keep the zoo path unchanged. That is deliberate and
+    narrow: moving a type with no mirrored copy would swap one unreachable host
+    for another while changing which code path a user's annotation runs through,
+    for no gain. Extending the mirror is what makes them movable, and it is its
+    own piece of work.
+    """
+    import base_checkpoint_mirror as bcm
+
+    return model_type in ZOO_MODELS and bool(bcm.parts_for(model_type))
+
+
 # How long the base-checkpoint reachability probe may take PER FILE. Short on
 # purpose: this runs on the admission path, and the thing it protects against
 # is a run that claims the GPU and then discovers the weights minutes later.
@@ -754,7 +775,31 @@ class RuntimeApp:
                 f" (finetuned: {checkpoint})" if checkpoint else ""
             )
             logger.info(f"🔄 Loading μSAM model '{label}' on {device}...")
-            if checkpoint is None and model_type in ZOO_MODELS:
+            if checkpoint is None and _generalist_uses_registry(model_type):
+                # MIRRORED GENERALIST: let micro-sam resolve the model from its
+                # OWN registry, which `ensure_base_checkpoint` has already
+                # seeded from the verified mirror when upstream is unreachable.
+                # One weight path, one cache root, one fence -- and generalist
+                # annotation inherits the offline behaviour for free.
+                #
+                # AND IT STILL GETS AIS, which is the thing that made this
+                # worth measuring rather than assuming. In the pinned
+                # micro-sam 1.8.11, `get_sam_model` with no `checkpoint_path`
+                # calls `_download_sam_model`, which fetches
+                # `f"{model_type}_decoder"` whenever the registry holds that
+                # key, and `get_sam_model` then puts it in
+                # `state["decoder_state"]`; `get_predictor_and_segmenter`
+                # selects AIS on exactly that key being present. So handing
+                # over pre-loaded files is unnecessary here -- the comment
+                # below, which says it is, is true only of the ZOO files,
+                # whose paths micro-sam does not know.
+                predictor, segmenter = get_predictor_and_segmenter(
+                    model_type=model_type,
+                    device=device,
+                    # None → μSAM auto-selects AIS when a decoder is present.
+                    segmentation_mode=None,
+                )
+            elif checkpoint is None and model_type in ZOO_MODELS:
                 # get_predictor_and_segmenter has no decoder_path, so pre-load the
                 # two pinned files via get_sam_model and hand it the assembled state.
                 from micro_sam.util import get_sam_model
@@ -943,6 +988,61 @@ class RuntimeApp:
             finally:
                 sam.to(device)
 
+    async def _seed_generalist_base(self, model_type: str, checkpoint=None) -> None:
+        """Make a MIRRORED generalist's weights obtainable before the GPU thread.
+
+        `_ensure_model` runs in a worker thread under the GPU lock and resolves
+        a mirrored generalist through micro-sam's registry. That resolve can
+        only use what is already on disk or what it can fetch from upstream --
+        it knows nothing about the mirror. So the mirror has to be consulted
+        from the ASYNC side, which is where `ensure_base_checkpoint` lives,
+        before the thread starts.
+
+        Deliberately a NO-OP for anything else: a fine-tuned checkpoint brings
+        its own weights, and an unmirrored generalist still takes the zoo path,
+        where this would seed a cache nobody reads.
+
+        BEST-EFFORT, and that is not laziness. `ensure_base_checkpoint` already
+        REPORTS an unobtainable part rather than raising, and the refusal a
+        caller deserves is the admission check's, with the part named. Raising
+        here would turn "the mirror is briefly unreachable" into a failed
+        annotation even on a site whose cache already holds the weights -- the
+        resolve in the thread is what decides, and it is the honest place for
+        the error.
+        """
+        if checkpoint is not None or not _generalist_uses_registry(model_type):
+            return
+        import base_checkpoint_mirror as bcm
+
+        try:
+            out = await self.ensure_base_checkpoint(model_type)
+        except bcm.MirrorVerificationError:
+            # THE ONE FAILURE THAT IS NOT BEST-EFFORT, and it must come before
+            # the broad catch below because it would otherwise be swallowed by
+            # it: `MirrorVerificationError` subclasses `RuntimeError`.
+            #
+            # A review caught exactly that. The mirror served bytes that did not
+            # match a digest pinned in this repository, and this method logged
+            # "the load will use whatever is on disk" and returned normally --
+            # turning a refusal into a warning, on the one path where the whole
+            # point is to stop. `ensure_base_checkpoint` raises here rather than
+            # reporting, deliberately, because an unobtainable part is a
+            # REPORT and a part that arrived WRONG must stop everything.
+            raise
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            logger.warning(
+                "model-finetune: could not seed the base checkpoint for "
+                f"'{model_type}' before loading it ({type(exc).__name__}: "
+                f"{str(exc)[:200]}); the load will use whatever is on disk"
+            )
+            return
+        if out.get("unavailable"):
+            logger.warning(
+                f"model-finetune: base checkpoint parts {out['unavailable']} for "
+                f"'{model_type}' could not be obtained from any route; the load "
+                "will fail if they are not already cached"
+            )
+
     # === composition endpoints (called by EntryApp via the runtime handle) ===
 
     async def auto_segment(
@@ -955,6 +1055,10 @@ class RuntimeApp:
         """AIS masks for a batch of (already-resolved) images → wire-dict list."""
         generate_kwargs = generate_kwargs or {}
         results: List[Dict[str, Any]] = []
+        # OUTSIDE the GPU lock: seeding can download hundreds of megabytes, and
+        # holding the lock for that would block every other request on a
+        # transfer that needs no GPU at all.
+        await self._seed_generalist_base(model_type, checkpoint)
         async with self._gpu_lock:
             for image in images:
                 labels = await asyncio.to_thread(
@@ -975,6 +1079,7 @@ class RuntimeApp:
         """
         generate_kwargs = generate_kwargs or {}
         results: List[Dict[str, Any]] = []
+        await self._seed_generalist_base(model_type, checkpoint)
         async with self._gpu_lock:
             for emb in embeddings:
                 labels = await asyncio.to_thread(
@@ -1000,6 +1105,7 @@ class RuntimeApp:
         ``sam_scale``/``mask_threshold`` describe it for the ONNX decoder and for
         running AIS on it later via ``infer(embeddings=...)``.
         """
+        await self._seed_generalist_base(model_type, checkpoint)
         async with self._gpu_lock:
             payload = await asyncio.to_thread(
                 self._encode, model_type, image, checkpoint
@@ -1016,6 +1122,7 @@ class RuntimeApp:
         if cache_key in self._onnx_cache:
             return self._onnx_cache[cache_key]
         logger.info(f"📦 Exporting ONNX prompt decoder for '{model_type}'...")
+        await self._seed_generalist_base(model_type)
         async with self._gpu_lock:
             onnx_bytes = await asyncio.to_thread(
                 self._export_onnx, model_type, quantize
