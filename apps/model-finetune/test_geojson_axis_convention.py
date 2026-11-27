@@ -127,3 +127,56 @@ def test_the_convention_is_stated_where_the_API_is_described():
         assert (
             "downward" in text.lower()
         ), f"{name}'s train_labels does not state the y direction: {text}"
+
+
+# ── what the ids actually count, and where the convention is written ────────
+
+
+def test_a_two_part_MultiPolygon_yields_TWO_instances():
+    """The docstring said "one instance per Polygon/MultiPolygon feature". It is
+    one per PART: the counter advances inside the part loop. A caller comparing
+    their feature count against `n_instances` would read the difference as data
+    loss, and a caller relying on one-id-per-feature gets two."""
+    import numpy as np
+
+    payload = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[1, 1], [4, 1], [4, 4], [1, 4], [1, 1]]],
+                        [[[6, 6], [9, 6], [9, 9], [6, 9], [6, 6]]],
+                    ],
+                },
+            }
+        ],
+    }
+    mask = training.rasterize_geojson(payload, width=12, height=12)
+    ids = sorted(int(v) for v in np.unique(mask) if v)
+    assert ids == [1, 2], f"a two-part MultiPolygon produced ids {ids}"
+
+
+def test_the_rasteriser_docstring_agrees_with_what_the_ids_count():
+    """Prose, so nothing else would catch it drifting back."""
+    import inspect
+
+    doc = inspect.getdoc(training.rasterize_geojson) or ""
+    assert (
+        "per POLYGON PART" in doc or "per polygon part" in doc.lower()
+    ), f"the docstring does not say ids are per part: {doc[:200]!r}"
+    assert "feature" in doc.lower(), "the docstring does not contrast part with feature"
+
+
+def test_the_convention_is_also_in_the_README_api_section():
+    """A caller reading the README's `start_training` entry — not the RPC schema
+    — is the one who was bitten."""
+    from pathlib import Path
+
+    text = (Path(__file__).with_name("README.md")).read_text(encoding="utf-8")
+    assert len(text) > 5000, f"README read implausibly short ({len(text)})"
+    lowered = text.lower()
+    assert "top-left" in lowered, "the README does not state the origin"
+    assert "downward" in lowered, "the README does not state the y direction"

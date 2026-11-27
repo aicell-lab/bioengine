@@ -1099,11 +1099,15 @@ class EntryApp:
     ) -> Dict[str, str]:
         """Presigned S3 PUT URL for staging an input image or embedding.
 
-        THE STAGED FILE ITSELF LASTS ABOUT AN HOUR, which is not the same
-        statement as the URL lasting an hour and is the one that catches people
-        out. The signature below expires in 3600 s, and a fresh download URL is
-        minted on every read, so an expired signature is not what bites: the
-        object is gone. Measured by a caller: a `start_training` submitted 74
+        THE STAGED FILE ITSELF LASTS ABOUT AN HOUR FROM THIS CALL, which is not
+        the same statement as the URL lasting an hour and is the one that catches
+        people out. The clock starts when this method mints the URL, not when
+        your PUT lands: `ttl=3600` below is passed to `put_file`, which schedules
+        the object's deletion at mint time. So minting many URLs up front and
+        then uploading -- the natural way to stage a dataset -- spends part of
+        the hour before the first byte moves. A fresh download URL is minted on
+        every read, so an expired signature is not what bites: the object is
+        gone. Measured by a caller: a `start_training` submitted 74
         minutes after staging, and an `infer` on a path staged 80 minutes
         earlier, both failed with "does not exist or has expired".
 
@@ -1795,6 +1799,16 @@ class EntryApp:
         # other side, and it would have fired only on the contended path -- the
         # one path this is about. A second writer for this record genuinely
         # exists in the process (`_runs_sync_loop`), so the lock is contendable.
+        #
+        # SAMPLED ONCE, AND THAT IS THE FIELD'S MEANING, not an oversight: a run
+        # submitted while the slot was free and overtaken during its own
+        # preparation is NOT flagged. The question `slot_busy` answers is "was
+        # this run sharing a worker when it started", which is what a caller
+        # comparing two runs' timings needs and what the reported case was.
+        # Re-sampling would answer a different question ("was it ever
+        # contended") and would need a write per sample; `status` already
+        # reaches QUEUED for the live state, and the failure note is attached
+        # from this same reading, so the two agree by construction.
         slot_busy = self._training_sem.locked()
         try:
             if slot_busy:
@@ -2551,7 +2565,10 @@ class EntryApp:
             None, description="Optional validation images; same forms as train_images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
-            None, description="Validation labels."
+            None,
+            description="Validation labels, in the same forms as train_labels and "
+            "read by the same loader — including the .geojson axis convention: "
+            "[x, y] in image pixels, origin TOP-LEFT, y increasing DOWNWARD.",
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
@@ -2873,7 +2890,9 @@ class EntryApp:
         ),
         val_labels: Optional[List[str]] = Field(
             None,
-            description="Optional validation label sources, paired with val_images.",
+            description="Optional validation label sources, paired with val_images. "
+            "A .geojson label follows the same convention as train_labels: [x, y] "
+            "in image pixels, origin TOP-LEFT, y increasing DOWNWARD.",
         ),
         enable_clahe: bool = Field(
             False,
@@ -3010,7 +3029,19 @@ class EntryApp:
     ) -> Dict[str, Any]:
         """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
         STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
-        means another fine-tuning holds the single training slot."""
+        means another fine-tuning holds the single training slot.
+
+        `slot_busy` is true when another run held that slot at the moment this
+        one started, with `slot_busy_message` saying so in words. It is the
+        answer to "was my run sharing a worker?", which `status` cannot give
+        during preparation: a contended run and an uncontended one both read
+        PREPARING while they resolve their inputs, so a fault in that phase used
+        to arrive as a bare transport error with nothing attributing it. The
+        field records the state AT SUBMISSION and is never written back, so it is
+        still true-as-written on a finished run; the live "is it waiting now?" is
+        `status` reaching QUEUED. A failure under contention also carries the
+        note appended to `message`, after the underlying error rather than
+        instead of it."""
         import training
 
         return training.get_status(session_id)

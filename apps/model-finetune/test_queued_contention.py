@@ -359,3 +359,30 @@ async def test_the_contention_note_is_still_true_after_the_run_finishes():
             f"the note is present-tense, so it still claims {present_tense.strip()!r} "
             f"on a run that has finished: {note}"
         )
+
+
+# ── a signal a caller cannot find is not a signal ───────────────────────────
+
+
+def test_the_status_method_documents_the_contention_fields():
+    """The defect being fixed is that a caller cannot tell contention from a
+    failure. A new key they have never heard of does not fix that: the RPC
+    schema is what a caller reads, so `get_training_status`'s own description
+    has to name the fields."""
+    import entry
+
+    doc = getattr(entry.EntryApp.func_or_class, "get_training_status").__doc__ or ""
+    assert "QUEUED" in doc, "the wrong method was read; this is not the status doc"
+    assert "slot_busy" in doc, (
+        "get_training_status does not mention slot_busy, so the only way to find "
+        "the field is to already know it exists"
+    )
+    assert "slot_busy_message" in doc
+
+
+def test_the_README_documents_the_contention_fields():
+    from pathlib import Path
+
+    text = (Path(__file__).with_name("README.md")).read_text(encoding="utf-8")
+    assert len(text) > 5000, f"README read implausibly short ({len(text)})"
+    assert "slot_busy" in text, "the README does not document the contention fields"

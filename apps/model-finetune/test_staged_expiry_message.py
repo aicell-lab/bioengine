@@ -11,10 +11,14 @@ failed with `Source 'temp/<uuid>.png' does not exist or has expired.` That
 message is true and useless -- "does not exist OR has expired" leaves the caller
 unable to tell a typo from an aged-out file, and those have different repairs.
 
-NOT CLAIMED HERE: which mechanism removes the object. There is no lifecycle or
-retention configuration for `temp/` anywhere in this repository (searched, with a
-control), so the expiry is enforced by the storage service and extending it is
-not a change that can be made here. Stating it is.
+WHAT REMOVES THE OBJECT, AND WHOSE HOUR IT IS. `get_upload_url` passes
+`ttl=3600` to `put_file`, and that argument IS the deletion timer: the storage
+service schedules the object's removal when the URL is minted. So the hour is
+this app's own number, raising it is a one-line change here, and the clock starts
+at the MINT rather than at the upload — which is why staging a dataset from URLs
+minted up front spends part of it before the first byte moves. These tests cover
+only what the app SAYS about that; what the number should be is a separate
+decision and is not taken here.
 """
 
 from __future__ import annotations
@@ -91,3 +95,44 @@ def test_a_non_404_failure_is_not_turned_into_an_expiry_claim():
         _load(_Stub(status=500), "temp/4f0e2a1c-0000-0000-0000-000000000000.png")
     assert "500" in str(err.value)
     assert "hour" not in str(err.value)
+
+
+# ── the DOCS half of "stated in the error and docs" ─────────────────────────
+#
+# The error text was the easy half. A caller who has not hit the failure yet
+# reads the README, and it said only "1-hour TTL", which is the sentence the
+# reporter read as a limit on how long they could upload.
+
+
+def _readme() -> str:
+    from pathlib import Path
+
+    return (Path(__file__).with_name("README.md")).read_text(encoding="utf-8")
+
+
+def test_the_README_says_the_staged_OBJECT_is_deleted_not_just_the_url():
+    text = _readme()
+    # CONTROL: the file has to be the README, or every assertion below is about
+    # an empty string.
+    assert len(text) > 5000, f"README read implausibly short ({len(text)})"
+    assert "get_upload_url" in text, "this is not the README that documents staging"
+
+    lowered = text.lower()
+    assert "object is deleted" in lowered or "object is gone" in lowered, (
+        "the README does not say the staged OBJECT is removed — only a TTL, "
+        "which reads as a limit on how long you may upload"
+    )
+
+
+def test_the_README_names_where_the_hour_is_measured_from():
+    """The clock starts at the mint, not at the upload. The reporter staged 76
+    files from URLs minted up front, which is exactly the case where that
+    difference is spent before the first byte moves."""
+    lowered = _readme().lower()
+    assert "ttl=3600" in lowered or "ttl` is passed" in lowered, (
+        "the README does not name the ttl that schedules the deletion, so a "
+        "reader cannot tell whose hour it is or that it can be changed here"
+    )
+    assert (
+        "minted" in lowered
+    ), "the README does not say the clock starts when the URL is minted"

@@ -2372,7 +2372,12 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per Polygon/MultiPolygon feature, ids from 1 in document order.
+    One instance per POLYGON PART, ids from 1 in document order — not one per
+    feature. A MultiPolygon of two parts yields two ids (measured: ids [1, 2]),
+    because the counter advances per part, and interior rings are ignored, so a
+    polygon with a hole is filled solid. Both matter to a caller counting
+    instances: a two-part feature is two objects here and one object in the
+    file it came from.
 
     THE AXIS CONVENTION, which GeoJSON itself does not fix and which nothing
     here can detect a violation of. Coordinates are IMAGE PIXELS as ``[x, y]``
