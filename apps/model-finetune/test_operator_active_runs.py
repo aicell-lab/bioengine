@@ -179,9 +179,9 @@ def test_the_ORDINARY_listing_is_still_narrow_for_an_administrator(runs):
     `list_sessions` so operators can see everything. That hands every owned run
     to every administrator and undoes a deliberate privacy decision.
 
-    Pinned HERE as well as in the co-manager suite, because this is the row
-    whose fix would be the one to break it, and a guard in a file nobody edits
-    while making that mistake is a guard that fires too late.
+    Pinned HERE as well as in the co-manager suite, because this listing is
+    what a change in this area would be most likely to break, and a guard in a
+    file nobody edits while making that mistake fires too late.
     """
     runs("theirs", OTHER, "TRAINING")
     assert training.list_sessions(ADMIN) == {}, (

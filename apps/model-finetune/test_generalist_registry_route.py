@@ -1,6 +1,6 @@
 """A MIRRORED generalist loads through micro-sam's registry.
 
-WHAT THE ROW IS ABOUT. Generalist annotation -- no fine-tuned checkpoint --
+WHAT THIS IS ABOUT. Generalist annotation -- no fine-tuned checkpoint --
 fetched its weights from the bioimage.io zoo over a host this deployment cannot
 reach, with `known_hash=None` on both files. The training path already resolves
 base weights through micro-sam's registry, which is seeded from a verified

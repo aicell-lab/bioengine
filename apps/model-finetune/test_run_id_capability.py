@@ -524,9 +524,9 @@ def test_the_README_TABLE_ROW_itself_names_the_weights():
     """Review's surviving mutant: the original wording could come back.
 
     Restoring "progress of an export already started" in the `get_export_status`
-    row left all 20 tests green, because only the separate paragraph below was
-    pinned. A reader scanning the table is exactly who the first version of
-    this documentation misled, so the row has to carry the warning too.
+    table left all 20 tests green, because only the separate paragraph below
+    was pinned. A reader scanning the table is exactly who incomplete
+    documentation misleads, so the table has to carry the warning too.
     """
     readme = pathlib.Path(__file__).with_name("README.md").read_text()
     rows = [

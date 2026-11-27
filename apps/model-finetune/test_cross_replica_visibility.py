@@ -5,7 +5,7 @@ list the SAME runs, and that a run started on either appears in both. Every
 existing test builds ONE instance against ONE sessions root -- including
 `test_ONE_REPLICAS_bookkeeping_does_not_reach_ANOTHERS`, which does make a
 second instance but shares the first's root and is about class-dict pollution,
-not visibility. So the one thing the row exists to fix has no test that would
+not visibility. So the one thing this file exists to cover has no test that would
 notice it breaking.
 
 THE TWO REPLICAS HAVE SEPARATE DISKS AND ONE SHARED ARTIFACT. That is the real

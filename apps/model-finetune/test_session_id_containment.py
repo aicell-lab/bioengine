@@ -222,8 +222,7 @@ MODULE_SCOPE = "<module or class body>"
 def _sessions_root_calls(module_file: str) -> dict:
     """How many times each scope CALLS `sessions_root`, from the syntax tree.
 
-    Three properties, and round 4 of the review established that my first
-    version had only the first:
+    Three properties, and all three are load-bearing:
 
     1. AST rather than text, which is a repair: the line-matching version
        counted a DOCSTRING mentioning `sessions_root()` in prose as a call
@@ -305,10 +304,10 @@ def test_no_path_helper_bypasses_the_chokepoint():
 
 
 #: The body of each permitted function in the fake module. Parameterised, so a
-#: control can put an extra call INSIDE one of them -- which is the case round 4
-#: was about and round 5 found untested: my earlier controls added a NEW
-#: function, and a new function is caught by a set of names just as well, so
-#: they could not tell a per-function COUNT from a set.
+#: control can put an extra call INSIDE one of them -- the case that matters
+#: and that earlier controls did not cover: they added a NEW function, and a new
+#: function is caught by a set of names just as well, so they could not tell a
+#: per-function COUNT from a set.
 #: The synthetic module the controls build. It has to name the SAME scopes as
 #: `SESSIONS_ROOT_CALLS`, or "a module with exactly the allowed callers passes"
 #: is a claim about a module the guard does not actually allow. `list_sessions`
@@ -340,10 +339,10 @@ def _point_guard_at(tmp_path, monkeypatch, name, bodies=None, extra=""):
 @pytest.mark.parametrize(
     "label, bodies, extra",
     [
-        # THE case a set of names cannot see, and now it really is inside an
-        # allowed function: `list_sessions` reaching the root TWICE. Round 5
-        # proved the old version of this control was satisfied by a set,
-        # because it added a function called `list_sessions_extra` instead.
+        # THE case a set of names cannot see, and it really is inside an
+        # allowed function: `list_sessions` reaching the root TWICE. A control
+        # that instead adds a function called `list_sessions_extra` is
+        # satisfied by a set of names, so it cannot discriminate.
         (
             "a SECOND call inside run_names_on_disk itself",
             {
@@ -381,9 +380,9 @@ def _point_guard_at(tmp_path, monkeypatch, name, bodies=None, extra=""):
 )
 def test_that_chokepoint_guard_CAN_fail(tmp_path, monkeypatch, label, bodies, extra):
     """The controls for the structural test above, which reads a file and so
-    can silently measure the wrong thing -- as two of these did until round 5
-    of the review mutated the assertion back to a set of names and watched
-    every one of them still pass."""
+    can silently measure the wrong thing -- as two of these did until the
+    assertion was mutated back to a set of names and every one of them still
+    passed."""
     _point_guard_at(tmp_path, monkeypatch, "fake_training.py", bodies, extra)
     with pytest.raises(AssertionError):
         test_no_path_helper_bypasses_the_chokepoint()

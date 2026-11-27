@@ -117,8 +117,8 @@ def test_identity_never_raises_whatever_it_is_handed():
 
 # ── behaviourally: the owner is WRITTEN, and the public read path REDACTS it ──
 #
-# The previous tests here were substring greps over entry.py. The reviewer broke
-# them twice while keeping the substring alive -- once by calling the helper and
+# The previous tests here were substring greps over entry.py. Both were broken
+# twice while the substring stayed alive -- once by calling the helper and
 # discarding its result, once by passing `None` instead of `context` with the
 # original kept in a comment -- and both mutations left the suite green. A grep
 # cannot see what a write actually stores, so these drive the write and read the
@@ -178,8 +178,8 @@ def test_THE_PUBLIC_READ_PATH_DOES_NOT_RETURN_THE_OWNER(sessions):
 
 def test_a_caller_THAT_ASKS_can_still_read_the_owner(sessions):
     """THE CONTROL for the redaction. Without it, the assertions above would also
-    pass if the owner were never stored at all -- which is the bug the reviewer
-    produced twice. This proves the field is present and merely withheld, and it
+    pass if the owner were never stored at all -- the mutation that slipped
+    through twice. This proves the field is present and merely withheld, and it
     is the hook the per-caller filter will use."""
     _write_owned(S_PRIVATE_READ, {"user": {"id": "github|7", "is_anonymous": False}})
     private = training.get_status(S_PRIVATE_READ, include_private=True)

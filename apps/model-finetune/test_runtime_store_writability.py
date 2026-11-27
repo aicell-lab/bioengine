@@ -14,9 +14,9 @@ threshold is a bet on that duration. A probe that never fails the check cannot
 be tuned wrong, and the fault is surfaced instead through `ping`/`store_status`
 and refused at the door.
 
-The row's clause 3 is the control, and it is load-bearing: with a writable
-store nothing may change, because a check that refused everything would satisfy
-clause 1 on its own.
+The third property below is the control, and it is load-bearing: with a
+writable store nothing may change, because a check that refused everything
+would satisfy the first on its own.
 """
 
 from __future__ import annotations
@@ -261,7 +261,7 @@ def test_NEITHER_RUNTIME_DECLARES_A_HEALTH_CHECK(name, cls):
     A failing Serve health check restarts the replica. Reporting an unwritable
     store through one would crash-loop the GPU runtimes under a fault the app
     cannot repair, on a shared cluster. If someone later adds a health check to
-    a runtime, this goes red and they have to argue for it on the row.
+    a runtime, this goes red and the change has to be justified deliberately.
     """
     module = __import__(cls.__module__)
     decorated = _health_check_decorated(module)
@@ -413,8 +413,8 @@ def test_START_TRAINING_ASKS_before_it_accepts_anything():
 
 # ── the STATUS surface, which is what the page reads ───────────────────────
 #
-# Round 1 of the review: the verdict reached only internal composition
-# endpoints, so `get_training_capabilities` -- the status the annotate page
+# A first version of the verdict reached only internal composition endpoints,
+# so `get_training_capabilities` -- the status the annotate page
 # polls -- still answered `trainable: True, reason: "fits"` for a backend whose
 # runtime could not write a single run record. The refusal at `start_training`
 # tells a user who has already committed to a run; the page reads this.
@@ -542,7 +542,7 @@ async def test_a_runtime_that_cannot_be_ASKED_is_not_reported_as_either(monkeypa
 
 # ── what the status surface COSTS, because the page polls it ───────────────
 #
-# Review round 2's finding 3, as tests. Adding the store view made this method
+# What the status surface costs, as tests. Adding the store view made this method
 # ping every enabled runtime, and the first version did it one await after
 # another with a 5 s timeout each -- so with VRAM declared, both backends
 # enabled and one hung runtime it took 10.01 s and returned no verdict anyway.
@@ -739,7 +739,7 @@ async def test_a_runtime_that_ANSWERS_is_not_penalised_by_an_earlier_failure(
 
 @pytest.mark.asyncio
 async def test_START_TRAINING_actually_awaits_the_store_gate(monkeypatch):
-    """Closes the hole round 1 named in my ordering test: that one reads AST
+    """Closes a hole in the ordering test above: that one reads AST
     call names in source order, so it stays GREEN if the gate sits in a dead
     branch or its await is dropped. This one runs the method and requires the
     refusal to come OUT of it, with no session created."""
@@ -780,7 +780,7 @@ async def test_START_TRAINING_actually_awaits_the_store_gate(monkeypatch):
 async def test_TRAIN_refuses_in_the_process_that_would_write(
     name, cls, read_only_store
 ):
-    """Round 1's minor (b): the entry's verdict comes from whichever replica
+    """The entry's verdict comes from whichever replica
     its handle routed to, which need not be the one that trains. So `train`
     asks for itself, with a FRESH probe, before taking the GPU lock -- a
     refused run must neither hold the GPU nor die mid-epoch."""

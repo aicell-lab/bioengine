@@ -79,7 +79,7 @@ def _read(cls, inst):
 
 
 def test_MORE_ENTRIES_THAN_ONE_PAGE_are_ALL_returned(shared):
-    """The row's substance: 10 records behind a 4-entry page, all 10 read."""
+    """The core property: 10 records behind a 4-entry page, all 10 read."""
     cls, inst, am, ids = shared(10, page_size=4)
     inst.RUNS_LIST_PAGE = 4
 

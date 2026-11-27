@@ -161,7 +161,7 @@ def test_an_anonymous_identity_is_a_REAL_identity_here(runs):
 
 
 def test_two_fresh_anonymous_callers_cannot_see_each_other(runs):
-    """The pair the row measures as (b) and (c)."""
+    """The pair measured as (b) and (c)."""
     runs("b-run", ANON_B, owner_anonymous=True)
     assert training.list_sessions(ctx(ANON_A)) == {}
     # paired demonstration: the run exists and IS visible to its owner
@@ -512,7 +512,7 @@ def _owned(runs, sid, owner, **kw):
 
 @pytest.mark.asyncio
 async def test_a_DIFFERENT_caller_cannot_stop_my_run(runs):
-    """The reviewer's first named RED-able case."""
+    """The first case that can be made to fail."""
     sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
     cls, inst = _entry()
     with pytest.raises(training.NotTheOwner):
@@ -526,7 +526,7 @@ async def test_a_DIFFERENT_caller_cannot_stop_my_run(runs):
 
 @pytest.mark.asyncio
 async def test_an_ANONYMOUS_caller_cannot_stop_an_owned_run(runs):
-    """The reviewer's second named RED-able case."""
+    """The second case that can be made to fail."""
     sid = _owned(runs, "2026-11-25-150730-abcdef12", ME)
     cls, inst = _entry()
     for who in (ctx(ANON_A), ctx(ANON_B), None, {}):
@@ -826,10 +826,10 @@ GATED_BY_RUN_ID = {
 # into the shared pool), resume (creates a new model derived from them), and
 # stop (acts on someone else's run).
 #
-# That line is the ruling's, not this lane's. An earlier version of this file
-# classified inference as open on the reasoning that it "locates a model rather
-# than acting on a run" -- which reached the same answer by a route that would
-# also have let export through, and which was mine to begin with.
+# That line is deliberate. Classifying inference as open because it "locates a
+# model rather than acting on a run" reaches the same answer by a route that
+# would also let export through, which is why the rule is stated by run id
+# instead.
 READ_ONLY_BY_RUN_ID = {"get_training_status", "infer", "compute_embedding"}
 
 

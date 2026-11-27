@@ -242,7 +242,7 @@ def base_checkpoint_refusal(model_type: Any, status: Any) -> Optional[str]:
 
     *status* is what `RuntimeApp.base_checkpoint_status` returns: the PARTS,
     not a verdict. The decision lives here, away from the network, so the rule
-    can be tested without one and so a reviewer can read the rule in one place.
+    can be tested without one and so the rule can be read in one place.
 
     FAILS CLOSED ON ITS OWN IGNORANCE, deliberately. A probe that errored, a
     part with no URL and no cached copy, or a part that is neither cached nor

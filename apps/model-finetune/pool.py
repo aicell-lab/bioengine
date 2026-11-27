@@ -643,8 +643,8 @@ def contribution_digest_provenance(record: Optional[Dict[str, Any]]) -> Dict[str
     through it requires remembering BOTH ``digest_key="weights_sha256"`` and
     ``absent_basis=CONTRIBUTION_DIGEST_BASIS`` at every call site; forgetting the
     second answers "undetermined" for a record whose code path proves the file
-    meaning, which reads exactly like this module's honest refusal. The wire projection shipped that
-    exact call to the wire and a reviewer caught it. Call this instead.
+    meaning, which reads exactly like this module's honest refusal. The wire projection
+    shipped that exact mistake once. Call this instead.
 
     ``reproducible_by_re_merge`` is ``None`` for every basis here, and that is not the
     "we do not know" of ``_DIGEST_REPRODUCIBLE``: a contribution digest covers one

@@ -181,7 +181,7 @@ async def test_an_unsupported_extension_still_fails_before_any_request() -> None
         await _entry_instance(404)._load_image_from_source("temp/x.bmp")
 
 
-# --- the case the row is actually about -------------------------------------
+# --- the case this file is actually about -----------------------------------
 # `preflight_training_dataset(stage=True)` hands back presigned DOWNLOAD URLs,
 # not `temp/` paths, and the README tells callers to feed those to
 # `start_training`. A guard keyed on `startswith("temp/")` therefore missed the
@@ -262,8 +262,8 @@ def test_the_staged_marker_is_what_THIS_APP_mints_not_the_word_temp() -> None:
     `https://lab.example.org/temp/scan_001.tif`, and an artifact path like
     `datasets/temp/a.npy`, were both told on a 403 that their presigned signature
     had expired and that they should re-stage a file they never staged. I had
-    guarded the trick I thought of -- `?prefix=temp/` in a query string -- and not
-    the one a reviewer found.
+    first version guarded the obvious trick -- `?prefix=temp/` in a query string
+    -- and not the subtler one.
 
     So the marker is the shape this app actually writes, `temp/<uuid4><ext>`, and
     the foreign cases are asserted as NOT staged rather than left to inference.
@@ -290,7 +290,7 @@ def test_the_staged_marker_is_what_THIS_APP_mints_not_the_word_temp() -> None:
 
 @pytest.mark.asyncio
 async def test_a_foreign_temp_URL_403_is_NOT_reported_as_an_expired_signature() -> None:
-    """The regression a reviewer found, pinned at the level a caller sees it.
+    """The regression this file exists for, pinned at the level a caller sees it.
 
     A 403 from somebody else's server is an access problem. Telling its caller
     that a presigned signature ran out, and to re-stage, is a confident wrong

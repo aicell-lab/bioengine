@@ -726,7 +726,8 @@ def test_a_commit_that_loses_the_race_ONCE_is_retried_and_still_completes(store)
 
 
 def test_a_commit_that_KEEPS_failing_RETURNS_A_REPORT_rather_than_raising(store):
-    """THE regression this answers. An exception here is the row's own harm.
+    """THE regression this answers. An exception here is the very harm the
+    migration is supposed to prevent.
 
     From the caller's side a raised error is indistinguishable from "the write did
     not happen" -- which is exactly what this operation exists to let them tell

@@ -59,9 +59,9 @@ NO_URL = {"cached": False, "reachable": None, "url": None}
 def test_a_part_this_site_cannot_produce_is_REFUSED(parts):
     """Every part must be obtainable, not just one.
 
-    The decoder cases are not padding: the row was filed about a model type
-    whose ENCODER is reachable and whose AIS decoder is not, and a check that
-    looked only at the encoder would admit exactly that run.
+    The decoder cases are not padding. The failure that prompted this check was
+    a model type whose ENCODER is reachable and whose AIS decoder is not, and a
+    check that looked only at the encoder would admit exactly that run.
     """
     msg = training.base_checkpoint_refusal("vit_t_em_organelles", status(parts))
     assert msg, f"{parts} was admitted"
@@ -298,7 +298,7 @@ def test_a_store_that_answers_HEAD_with_405_is_still_ADMITTED(tmp_path, monkeypa
 def test_an_UNREACHABLE_store_is_REFUSED_with_the_unavailable_text(
     tmp_path, monkeypatch
 ):
-    """(c) The case the row was filed for. A refused connection is used rather
+    """(c) The case that prompted this check. A refused connection is used rather
     than a black hole so the test is fast and deterministic; the BUDGET under a
     black hole is the next test."""
     s = socket.socket()

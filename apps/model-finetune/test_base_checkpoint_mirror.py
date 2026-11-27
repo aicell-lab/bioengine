@@ -1,6 +1,6 @@
 """The mirror fallback's hash fence.
 
-The row's rule is "do NOT relax checksum verification", so these arms are about
+The rule is "do NOT relax checksum verification", so these arms are about
 REFUSAL: what the fence rejects, and that a rejected file never becomes visible
 where the training subprocess would read it.
 
