@@ -2161,6 +2161,26 @@ class AppsManager:
                     f"Application '{application_id}' for artifact '{application_info['artifact_id']}' "
                     "is marked as deployed but not found in Ray Serve status."
                 )
+            elif (
+                application_info.get("deployment_task") is not None
+                and not application_info["deployment_task"].done()
+            ):
+                # A build task is RUNNING and Ray Serve has no details for the application
+                # yet. Reporting NOT_STARTED here is a falsehood a caller acts on: deploy_app
+                # can hand back an RPC timeout while the deployment goes on to SUCCEED, and
+                # this call is the caller's only way to find out which happened. Worse, the
+                # NOT_STARTED message says the application "has not been deployed yet", which
+                # invites a retry -- and a second deploy racing the first is what leaves an
+                # application running in Serve that the worker no longer tracks.
+                # DEPLOYING is already in this method's documented state list; until now it
+                # was documented and never emitted.
+                status = "DEPLOYING"
+                message = (
+                    f"Application '{application_id}' is still being deployed. A timeout from "
+                    "deploy_app does NOT mean the deployment failed: poll this call until the "
+                    "status leaves DEPLOYING, rather than calling deploy_app again, which "
+                    "would race the deployment that is already running."
+                )
             else:
                 status = "NOT_STARTED"
                 message = f"Application '{application_id}' has not been deployed yet."

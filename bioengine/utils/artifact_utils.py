@@ -5,7 +5,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import httpx
 import yaml
@@ -483,7 +483,7 @@ async def stage_artifact(
     manifest: Dict[str, Any],
     logger: Optional[logging.Logger] = None,
     permissions: Optional[Dict[str, Any]] = None,
-) -> "ObjectProxy":
+) -> Tuple["ObjectProxy", Optional[Set[str]]]:
     """
     Put an artifact into stage mode. Creates a new artifact if it doesn't exist.
 
@@ -501,7 +501,13 @@ async def stage_artifact(
         permissions: Optional permissions to set on the artifact
 
     Returns:
-        The staged artifact handle.
+        A tuple of (staged artifact handle, the artifact's committed version tags as they
+        were BEFORE the stage). The second element is captured before ``edit()`` because
+        that is the only moment it can be read: once staging has begun, a later read cannot
+        distinguish versions that were already published from one this call created. It is
+        ``None`` when that reading could not be taken at all — ``None`` and the empty set
+        are deliberately different, since a caller comparing two readings must not confuse
+        "there were no versions" with "could not tell".
 
     Raises:
         ValueError: If the manifest is missing a version or the version is not
@@ -805,23 +811,6 @@ def _collision_hint(upload_errors) -> str:
             "id will meet the strictly-greater-version refusal."
         )
     return ""
-
-
-async def artifact_versions(
-    artifact_manager: ObjectProxy,
-    artifact_id: str,
-) -> Optional[Set[str]]:
-    """The committed version tags an artifact has right now, or None if that cannot be read.
-
-    None and the empty set are deliberately different: "no versions" and "could not tell" must
-    not collapse, because the caller compares two of these readings and a silent empty set
-    would read as "nothing was there before".
-    """
-    try:
-        info = await artifact_manager.read(artifact_id)
-        return {str(v["version"]) for v in (getattr(info, "versions", None) or [])}
-    except Exception:
-        return None
 
 
 async def describe_artifact_state(
