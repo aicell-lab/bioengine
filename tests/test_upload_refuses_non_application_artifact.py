@@ -147,6 +147,30 @@ def test_the_guard_compares_against_the_type_the_code_actually_WRITES():
     assert _APPLICATION_ARTIFACT_TYPE != "ray-serve"
 
 
+def test_the_validate_note_describes_the_REFUSAL_not_a_deletion():
+    """The user-facing note must not survive this change unamended.
+
+    Before the fix the honest note said upload DELETES such an artifact. That sentence is
+    now false, and a note that confidently describes the opposite of the behaviour is worse
+    than a vague one -- so assert the old wording is gone, not merely that new wording was
+    added. Rendered through the real command, because a substring search over the source
+    proves the bytes and not that the f-string renders.
+    """
+    from click.testing import CliRunner
+
+    from bioengine.cli.apps import apps_group
+
+    result = CliRunner().invoke(apps_group, ["validate", "apps/model-runner"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+
+    assert "refuses outright" in out, out
+    assert "WHOLE workspace" in out, out
+    # the retired claims
+    assert "DELETES that artifact" not in out, out
+    assert "has to be free in" not in out, out
+
+
 # --------------------------------------------------------------------------- #
 # the real call site -- these go RED on the unfixed code
 # --------------------------------------------------------------------------- #
@@ -158,17 +182,28 @@ async def test_stage_artifact_does_NOT_DELETE_a_dataset_at_the_same_alias():
     dataset = _FakeArtifact("dataset", f"{WORKSPACE}/datasets")
     am = _FakeArtifactManager(dataset)
 
-    with pytest.raises(ValueError, match="not a BioEngine application"):
+    # Catch rather than pytest.raises, and assert on the DELETE first, so that the RED on
+    # unfixed code names the DATA LOSS. Wrapped in pytest.raises the unfixed code fails
+    # with "DID NOT RAISE" -- the missing refusal -- and the am.deleted assertion below is
+    # never reached, so the arm would report the wrong defect for the right reason.
+    error = None
+    try:
         await stage_artifact(
             artifact_manager=am,
             workspace=WORKSPACE,
             manifest=_manifest(),
         )
+    except ValueError as e:
+        error = e
 
-    assert am.deleted == [], (
-        "stage_artifact deleted a non-application artifact: " f"{am.deleted}"
-    )
-    assert am.created == [], "it also recreated it as an application"
+    assert (
+        am.deleted == []
+    ), f"stage_artifact DELETED a non-application artifact: {am.deleted}"
+    assert am.created == [], f"it also recreated it as an application: {am.created}"
+    assert (
+        error is not None
+    ), "stage_artifact accepted the upload instead of refusing it"
+    assert "not a BioEngine application" in str(error), str(error)
 
 
 @pytest.mark.asyncio

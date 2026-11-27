@@ -177,11 +177,18 @@ def validate(app_dir):
     click.echo(
         f"\nChecked locally: structure, required fields, and `entry`.\n"
         f"NOT checked: whether the id '{app_id}' is free in the workspace you upload to. "
-        f"This command opens no connection, so it cannot know. If that id is already in use "
-        f"there, `bioengine apps upload` refuses the bundle unless the manifest version is "
-        f"higher than every version that id already carries — and if the lineage is not "
-        f"yours, the id itself is what has to change.\n"
-        f"To see which ids exist: bioengine apps list"
+        f"This command opens no connection, so it cannot know. Upload resolves the id "
+        f"against the WHOLE workspace, not just the application collection, and what "
+        f"happens next depends on what already holds it there.\n"
+        f"If an APPLICATION holds '{app_id}', `bioengine apps upload` refuses the bundle "
+        f"unless the manifest version is higher than every version that id already "
+        f"carries — and if the lineage is not yours, the id itself is what has to change.\n"
+        f"If something that is NOT an application holds it — a dataset, a model — upload "
+        f"refuses outright, at any version, rather than replacing it.\n"
+        f"So `bioengine apps list` does not settle this on its own: it shows only the "
+        f"application collection. The ids from `bioengine apps status` are APPLICATION ids "
+        f"of running deployments, a different namespace again: an id absent there can "
+        f"still be taken as an artifact."
     )
 
 
