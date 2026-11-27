@@ -4,8 +4,8 @@ WHAT THIS IS ABOUT. Generalist annotation -- no fine-tuned checkpoint --
 fetched its weights from the bioimage.io zoo over a host this deployment cannot
 reach, with `known_hash=None` on both files. The training path already resolves
 base weights through micro-sam's registry, which is seeded from a verified
-mirror and fences with a pinned sha256. The change under test puts the
-generalist on that same path.
+mirror and fences with a pinned sha256. Routing the generalist through that
+registry puts it on the same path.
 
 SCOPED, AND THE SCOPE IS ASKED OF THE MIRROR. Only the model types the mirror
 holds move; the rest keep the zoo path untouched. The predicate asks
@@ -66,7 +66,7 @@ def stubbed(monkeypatch):
     caller passed no checkpoint. `get_predictor_and_segmenter` then picks AIS
     on that key. Both halves are the pinned 1.8.11 behaviour, read from the
     wheel; a stub that always produced a decoder could not tell the registry
-    route's path from a silent downgrade.
+    route from a silent downgrade.
     """
     calls = _Calls()
     registry = {"vit_b_lm", "vit_b_lm_decoder", "vit_t_lm", "vit_t_lm_decoder"}

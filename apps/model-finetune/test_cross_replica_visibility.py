@@ -1,13 +1,12 @@
-"""At the code level: a run on ONE replica's disk is listed by ANOTHER.
+"""A run on ONE replica's disk is listed by ANOTHER.
 
-WHAT IT COVERS, AND WHY NOTHING ELSE DOES. The requirement is that two
-replicas must list the SAME runs, and that a run started on either appears in
-both. Every
+WHAT IT COVERS, AND WHY NOTHING ELSE DOES. The requirement is that two replicas
+must list the SAME runs, and that a run started on either appears in both. Every
 existing test builds ONE instance against ONE sessions root -- including
 `test_ONE_REPLICAS_bookkeeping_does_not_reach_ANOTHERS`, which does make a
 second instance but shares the first's root and is about class-dict pollution,
-not visibility. So the one thing the row exists to fix has no test that would
-notice it breaking.
+not visibility. So the one behaviour this file exists to cover has no other test
+that would notice it breaking.
 
 THE TWO REPLICAS HAVE SEPARATE DISKS AND ONE SHARED ARTIFACT. That is the real
 topology: `sessions_root` is a module-level function, so it is switched per
@@ -103,7 +102,7 @@ ADMIN = {
 
 
 def test_a_run_on_ONE_replicas_disk_is_LISTED_BY_THE_OTHER(two_replicas):
-    """Clause 3's substance: B has an empty disk and must still see A's run."""
+    """B has an empty disk and must still see A's run."""
     A, B, am, as_replica, _cur = two_replicas
 
     as_replica(A)
@@ -123,7 +122,7 @@ def test_a_run_on_ONE_replicas_disk_is_LISTED_BY_THE_OTHER(two_replicas):
 
 
 def test_BOTH_replicas_list_the_SAME_run_ids(two_replicas):
-    """Clause 1's wording: the same runs, not merely overlapping ones."""
+    """The two replicas list the same runs, not merely overlapping ones."""
     A, B, am, as_replica, _cur = two_replicas
 
     as_replica(A)

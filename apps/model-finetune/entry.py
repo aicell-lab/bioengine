@@ -1038,8 +1038,7 @@ class EntryApp:
 
         Asked of the runtime rather than computed here, and that distinction is
         the whole point: a runtime replica has its own HOME, so the entry's own
-        store says nothing about the one training writes. A measurement on a live
-        cluster found a
+        store says nothing about the one training writes. A measurement found a
         replica writing the share while another in the same image could not
         write anything, because the redirect pointing HOME at the share had not
         run in that process.
