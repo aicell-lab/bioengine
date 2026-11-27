@@ -789,7 +789,7 @@ class EntryApp:
             # The runtime was reachable a moment ago via _check_runtime_available;
             # if its ping now fails, that is a runtime problem and not this
             # guard's to convert into a training refusal.
-            self.logger.warning(
+            logger.warning(
                 "could not read runtime capabilities (%s); skipping the "
                 "base-checkpoint preflight for %s",
                 exc,
@@ -798,7 +798,7 @@ class EntryApp:
             return
         caps = (pong or {}).get("capabilities") or []
         if "base_checkpoint_status" not in caps:
-            self.logger.warning(
+            logger.warning(
                 "this runtime does not advertise base_checkpoint_status "
                 "(capabilities=%s); skipping the base-checkpoint preflight for "
                 "%s, so a run with unfetchable weights fails late as before",
@@ -874,7 +874,7 @@ class EntryApp:
                 # and a fence rejection arrives here as a plain RPC error, so
                 # this is also where "the mirror served bytes that did not
                 # verify" becomes readable.
-                self.logger.warning(
+                logger.warning(
                     "the base-checkpoint mirror fallback did not help for %s "
                     "(%s: %s); the run stays refused",
                     model_type,
@@ -883,7 +883,7 @@ class EntryApp:
                 )
             else:
                 if seeded.get("installed"):
-                    self.logger.warning(
+                    logger.warning(
                         "seeded %d base-checkpoint part(s) for %s from the "
                         "mirror: %s",
                         len(seeded["installed"]),
@@ -899,7 +899,8 @@ class EntryApp:
                 # A review caught this: `ensure_base_checkpoint` legitimately
                 # returns `installed: []` with no error when the state changed
                 # under the probe -- the file arrived between the probe and the
-                # fetch (which is the race the disk re-check closes), or its own
+                # fetch (which is the race the disk re-check NARROWS -- it does
+                # not close it; see runtime.py's own note), or its own
                 # re-probe found the part cached or upstream reachable after all.
                 # Keying the re-probe on `installed` kept the STALE refusal in
                 # exactly those cases, so a run whose weights ARE cached was
@@ -920,7 +921,7 @@ class EntryApp:
                         )
                         refusal = training.base_checkpoint_refusal(model_type, status)
                     except Exception as exc:
-                        self.logger.warning(
+                        logger.warning(
                             "could not re-check the base checkpoint for %s "
                             "after seeding (%s: %s); the run stays refused",
                             model_type,

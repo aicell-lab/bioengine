@@ -406,9 +406,22 @@ def _entry_instance(runtime_obj):
     inst = object.__new__(cls)
     inst._enabled_backends = {"microsam", "cellpose"}
     inst.runtime = runtime_obj
-    import logging
-
-    inst.logger = logging.getLogger("test-entry")
+    # NO LOGGER ATTRIBUTE IS SET HERE, DELIBERATELY. An earlier version of this
+    # builder attached a stdlib logger to the instance, and that one line hid a
+    # defect from all 21 arms in this file: `EntryApp` has no such attribute, so
+    # the five logging calls the preflight used to make through `self` raised
+    # `AttributeError` in production while every test here passed. The arms were
+    # handing the subject an attribute it cannot have, so the suite was testing
+    # a shape that does not exist. The module-level `logger` is what the other
+    # 33 logging calls in `entry.py` use, and what the preflight uses now.
+    #
+    # Measured on a live KTH replica before the fix: the mirror seeded and
+    # verified the weights, and then the call that LOGGED that success crashed
+    # the run with `'EntryApp' object has no attribute 'logger'`.
+    #
+    # Leaving it off is what makes every arm below load-bearing for this. The
+    # preflight logs on five paths, so any path reached through a non-existent
+    # attribute now fails the arm that reaches it, instead of passing.
     return cls, inst
 
 
@@ -562,9 +575,7 @@ def test_start_training_REFUSES_WITHOUT_EVER_ASKING_FOR_THE_GPU(tmp_path, monkey
     cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
     inst = object.__new__(cls)
     inst._enabled_backends = {"microsam", "cellpose"}
-    import logging
-
-    inst.logger = logging.getLogger("test-entry")
+    # No logger attribute here either -- see `_entry_instance` for why.
     inst.runtime = _FakeRuntime(
         caps=["base_checkpoint_status"],
         probe=lambda mt: status({"encoder": UNREACHABLE}, model_type=mt),
@@ -869,3 +880,155 @@ def test_a_fallback_that_reports_an_ERROR_does_NOT_re_probe():
     with pytest.raises(ValueError):
         asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
     assert rt.calls.count("base_checkpoint_status") == 1, rt.calls
+
+
+def test_the_preflight_NEVER_logs_through_SELF_because_EntryApp_HAS_NO_LOGGER():
+    """`entry.py` must not reach a logger through `self`. Measured, not stylistic.
+
+    `EntryApp` sets no `logger` attribute, so `self.logger.warning(...)` raises
+    `AttributeError` the moment the line is reached. The preflight had five such
+    calls and they shipped: on a live KTH replica the mirror seeded and verified
+    the base checkpoint and then the call that LOGGED that success crashed the
+    training run. Three of the five sat on paths whose documented job is to SKIP
+    rather than stop training -- an older replica, and a transient ping failure
+    -- so each one turned a deliberate tolerance into a crash.
+
+    This is a SOURCE assertion on purpose, and it is the belt to the braces that
+    `_entry_instance` provides. Removing the fake logger from the builder makes
+    the behavioural arms catch any of the five paths they actually reach; this
+    catches a sixth call added on a path no arm reaches, which is how the first
+    five got in.
+
+    The positive control matters: a scanner that silently matched nothing would
+    pass this test forever. `entry.py` logs through the module-level `logger`
+    dozens of times, so the control asserts the scan can see those.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).with_name("entry.py").read_text()
+    tree = ast.parse(src)
+
+    through_self = []
+    module_level = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        # `self.logger` -> Attribute(value=Name('self'), attr='logger')
+        if node.attr == "logger" and isinstance(node.value, ast.Name):
+            if node.value.id == "self":
+                through_self.append(node.lineno)
+        # `logger.warning` -> Attribute(value=Name('logger'), attr='warning')
+        if isinstance(node.value, ast.Name) and node.value.id == "logger":
+            module_level.append(node.lineno)
+
+    assert len(module_level) >= 20, (
+        "POSITIVE CONTROL FAILED: the scan found only %d module-level logger "
+        "uses in entry.py, so it is not seeing logging calls at all and its "
+        "silence about `self.logger` would mean nothing" % len(module_level)
+    )
+    assert not through_self, (
+        "entry.py reaches a logger through `self` at line(s) %s. EntryApp has "
+        "no `logger` attribute, so every one of those raises AttributeError "
+        "when reached. Use the module-level `logger`." % through_self
+    )
+
+
+def test_a_RUNTIME_WHOSE_PING_RAISES_skips_the_preflight_WITHOUT_crashing():
+    """Path 1 of the five logging sites: `ping()` itself fails.
+
+    The guard treats this as a runtime problem and skips, rather than turning
+    it into a training refusal -- `_check_runtime_available` has already said
+    the runtime was reachable a moment ago. The skip is reached only by passing
+    THROUGH a logging call, so before the fix this raised `AttributeError` and
+    the deliberate tolerance became a crashed training call.
+
+    No arm covered this path. A mutant restoring all five logging calls through
+    `self` reddened three behavioural arms, not five, which is how I know.
+    """
+
+    class _PingRaises:
+        async def ping(self):
+            raise RuntimeError("ping timed out")
+
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+
+            async def _call(*a, **k):
+                raise AssertionError(
+                    "nothing should be called after a failed ping, got %r" % name
+                )
+
+            return _call
+
+    cls, inst = _entry_instance(_PingRaises())
+    # Returns rather than raising: the run is admitted, not refused.
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+
+
+def test_a_RE_PROBE_that_RAISES_after_seeding_leaves_the_run_REFUSED_not_crashed():
+    """Path 5 of the five: the post-seeding re-probe fails.
+
+    The mirror seeded something, so the refusal has to be recomputed -- and if
+    that recomputation cannot be done, the ORIGINAL refusal stands. Failing
+    closed is the point: admitting the run because the re-check broke would
+    restore exactly the late failure this guard removes.
+
+    The surviving refusal must arrive as the refusal, NOT as an
+    `AttributeError` from the logging call on the way to it. Both are
+    exceptions, so the arm pins the type and the message rather than just
+    asserting that something was raised.
+    """
+    calls = {"n": 0}
+
+    def _status(model_type):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _unreachable_parts(model_type)
+        raise RuntimeError("re-probe exploded")
+
+    def _ensure(model_type, **kw):
+        return {
+            "model_type": model_type,
+            "source": "mirror",
+            "parts": {},
+            "installed": [{"name": model_type, "sha256": "a" * 64, "bytes": 1}],
+            "unavailable": [],
+            "error": None,
+        }
+
+    runtime = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={
+            "base_checkpoint_status": _status,
+            "ensure_base_checkpoint": _ensure,
+        },
+    )
+    cls, inst = _entry_instance(runtime)
+    # PINS THE TYPE AND THE MESSAGE, which is what this arm's docstring claims
+    # and what an earlier version of it did NOT do. It used
+    # `pytest.raises(Exception)` plus "not an AttributeError", and a review
+    # mutant -- a bare `raise` in the except around the re-probe, so a re-probe
+    # failure CRASHES instead of keeping the refusal -- SURVIVED it. That is the
+    # same defect this file exists to prevent: an arm asserting less than it
+    # says. `ValueError` is what the refusal raises (entry.py), and the refusal
+    # text names the model type, so `match` binds to the refusal specifically
+    # rather than to any ValueError that happens by.
+    with pytest.raises(ValueError, match="vit_b_lm") as ei:
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert not isinstance(ei.value, AttributeError), (
+        "the run was stopped by an AttributeError from a logging call, not by "
+        "the refusal: %r" % (ei.value,)
+    )
+    # The phrase is COPIED FROM THE REAL MESSAGE, captured by running this arm,
+    # not guessed. My first attempt asserted the word "refused", which does not
+    # appear: the "neither cached nor reachable" branch says "cannot be trained
+    # at this site: its base checkpoint is unavailable". Writing an assertion
+    # from what I assumed the text said is the same mistake, one level along, as
+    # writing a fixture from what I assumed the class had.
+    assert "base checkpoint is unavailable" in str(ei.value), (
+        "the surviving exception is a ValueError naming the model type but does "
+        "not read as the base-checkpoint refusal: %r" % (ei.value,)
+    )
+    assert calls["n"] >= 2, "the re-probe was never attempted"
