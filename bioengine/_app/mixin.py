@@ -227,11 +227,22 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
     """Check, IN THE SERVING PROCESS, that ``HOME`` and ``TMPDIR`` point under the per-app
     directory — and say so loudly and repair them if not.
 
-    WHAT WAS MEASURED, and only that. On a live external-cluster site, eight of eight
-    ``ray::ServeReplica:*`` processes for a freshly deployed app served with ``HOME=/home/ray``, the
-    image default, which is read-only. The app then refused every model type with
-    ``[Errno 30] Read-only file system: '/home/ray/.bioengine'``, two steps from the cause. The
-    identical scan on another site showed six of six under the per-app home.
+    WHAT WAS MEASURED, and only that — stated so neither instrument is read past what it answers.
+    On a live external-cluster site, a scan of ``/proc/<pid>/environ`` found eight of eight
+    ``ray::ServeReplica:*`` processes for a freshly deployed app had been **started** with
+    ``HOME=/home/ray``, the read-only image default. That is all ``/proc`` can say: it reports the
+    environment a process was started with, and an in-process ``os.environ["HOME"] = ...`` never
+    appears there (measured, with a control: after the assignment the string is absent from
+    ``/proc/self/environ`` while ``PATH=`` is present).
+
+    What establishes the EFFECTIVE value is the app's own refusal:
+    ``[Errno 30] Read-only file system: '/home/ray/.bioengine'``. An in-process assignment *does*
+    steer ``Path.home()``, so a process with it in effect would have resolved the per-app home; the
+    one that produced that error had not. The symptom is two steps from the cause.
+
+    The identical scan on another site showed six of six serving replicas under the per-app home,
+    and there ``/proc`` is the right instrument: a value visible in it can only have arrived WITH
+    the process — through the runtime_env — which is exactly the leg that version adds.
 
     WHY THE TWO SITES DIFFERED — the cause, read out of the versions they actually run rather than
     out of ``main``. The broken site ran worker 0.16.130, the healthy one 0.16.131:
