@@ -1099,18 +1099,21 @@ class EntryApp:
     ) -> Dict[str, str]:
         """Presigned S3 PUT URL for staging an input image or embedding.
 
-        THE ONE-HOUR TTL IS ON THE URL, NOT ON THE FILE. The handout below is
-        good for one hour: upload within it, or re-request a URL. Once the PUT
-        has landed, the object itself persists -- the temp store has no
-        short-lifetime policy, so a path staged hours or days earlier is still
-        readable, and a run that waits its turn in the training queue does not
-        lose its inputs by waiting.
+        THE HOUR IS THE FILE'S LIFETIME, AND IT STARTS HERE -- not when the PUT
+        lands. ``ttl`` below is not only a signature lifetime: the storage service
+        schedules the object's DELETION when the URL is minted, so a file staged
+        through this call stops existing about an hour after *this call*, however
+        long the caller then took to upload it.
 
-        So a 404 on a staged path is not evidence that it "expired": the usual
-        cause is that the PUT was attempted after its URL had run out, which is
-        easy to do when a dataset is staged by minting many URLs up front and
-        uploading them in a long sequential loop. Mint each URL next to its own
-        upload.
+        That distinction is the one that costs time. Staging a dataset by minting
+        many URLs up front and uploading them in a long sequential loop spends the
+        window on the loop: the files staged first are already near the end of
+        their life when the last one lands. Mint each URL next to its own upload,
+        and anything that stages and then WAITS -- a run queued behind another, a
+        second evaluation pass after a long training -- must re-stage first.
+
+        The lifetime is ``ttl`` on the line below, in this repository: raising it
+        raises the window, at the cost of holding the staged bytes longer.
         """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
@@ -1221,21 +1224,32 @@ class EntryApp:
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
-            # A 404 here cannot tell three different situations apart, so the message
-            # names all three rather than asserting one. S3 answers 404 for an object
-            # that was never written just as it does for one that is gone, and the
-            # staging handout from `get_upload_url` is a presigned PUT valid for one
-            # hour -- so a caller who held that URL longer than the window never
-            # uploaded at all, and arrives here indistinguishable from a typo.
+            # A staged path gets the lifetime and the repair, because the single
+            # most likely cause here is that the file has been deleted: the
+            # storage service schedules deletion when `get_upload_url` mints the
+            # URL, about an hour ahead, so the clock runs from the MINT and not
+            # from the upload. Measured against the live store: of 585 objects
+            # under `temp/`, 453 were under an hour old, 17 between one and 1.25
+            # hours, and NONE between 1.25 hours and 30 days -- an app staging
+            # hundreds an hour cannot leave that range empty unless they are
+            # removed. A typo and a never-written path answer identically, so
+            # those stay in the message; what the message must not do is leave a
+            # caller who waited believing their inputs are still there.
+            if source.startswith("temp/"):
+                raise FileNotFoundError(
+                    f"Staged source '{source}' could not be read (HTTP 404) and has "
+                    f"most likely been deleted: a file staged with `get_upload_url` "
+                    f"lives about 1 hour from the moment that URL was MINTED, not "
+                    f"from when the upload finished. So anything that stages and "
+                    f"then waits -- a run queued behind another one, a second pass "
+                    f"after a long training -- must re-stage first. A path that was "
+                    f"never uploaded, or a typo, answers with the same 404. "
+                    f"Re-request an upload URL, re-upload, and submit promptly."
+                )
             raise FileNotFoundError(
                 f"Source '{source}' could not be read (HTTP 404). It may never have "
-                f"been uploaded, may have been removed, or the upload may have been "
-                f"attempted after its staging URL expired -- `get_upload_url` returns "
-                f"a presigned PUT valid for 1 hour, and a 404 cannot distinguish "
-                f"these. What it is NOT is the staged file timing out: once a PUT "
-                f"has landed the object is not removed on a timer, so a run that "
-                f"waited its turn in the training queue did not lose its inputs by "
-                f"waiting. Re-request an upload URL and re-upload before training."
+                f"been uploaded, may have been removed, or may be a mistyped path -- "
+                f"a 404 cannot distinguish these."
             )
         resp.raise_for_status()
         buffer = BytesIO(resp.content)

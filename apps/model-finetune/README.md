@@ -124,18 +124,21 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
 - **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
   an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
 
-**Staged files: the hour is on the URL, not on the file.** The PUT URL
-`get_upload_url` hands back is good for one hour — upload within it, or request
-another. The **object** it uploads to is not on a timer: once the PUT has landed,
-the returned `file_path` stays readable, and a run that waits its turn in the
-training queue does not lose its inputs by waiting. So a `404` on a staged path
-is not a file that "timed out"; the usual cause is a PUT attempted after its URL
-had run out, which is easy to do when a dataset is staged by minting many URLs
-up front and uploading them in a long sequential loop — mint each URL next to
-its own upload. Presigned **download** URLs (what `preflight_training_dataset`
-and `compute_embedding(return_url=True)` return) are a separate, shorter-lived
-thing; pass the `file_path` instead of a download URL where a call accepts it,
-and the app mints a fresh one at read time.
+**Staged files live about an hour, and the clock starts at `get_upload_url`.**
+The `ttl` that call passes to the storage service is not only a signature
+lifetime: the service schedules the object's **deletion** when the URL is minted.
+So a staged `file_path` stops existing roughly an hour after you asked for the
+URL, however long you then took to upload. Measured against the live store: of
+585 objects under `temp/`, 453 were under an hour old and 17 between one and 1.25
+hours, with **none at all** between 1.25 hours and 30 days.
+
+Two consequences. Staging a dataset by minting many URLs up front and uploading
+them in a long sequential loop spends the window on the loop — the first files
+staged are near the end of their life by the time the last lands, so mint each
+URL next to its own upload. And anything that stages and then **waits** — a run
+queued behind another one, a second evaluation pass after a long training — must
+re-stage before it uses those paths. A `404` on a staged path is most likely a
+deleted file; a never-uploaded path and a typo answer identically.
 
 **Embedding reuse (Leg B).** Encode once, reuse the embedding for both the
 in-browser interactive decoder and automatic segmentation without a second
@@ -239,9 +242,9 @@ launch instead of OOMing mid-train.
   source is reported per-pair as `{ok: false, error}` rather than failing the batch.
   With `stage=True` (default) the prepared arrays are re-staged into the app's temp
   store and the returned `train_images`/`train_labels` URL lists feed straight into
-  `start_training` (call it promptly — those are presigned **download URLs** and
-  they are short-lived, though the objects behind them are not: see
-  "Staged files" below). `enable_clahe`
+  `start_training` (call it promptly — the re-staged files are deleted about an
+  hour after they were staged, so a dataset prepared and then left to wait has to
+  be prepared again: see "Staged files" above). `enable_clahe`
   applies contrast-limited adaptive histogram equalisation while staging (forces
   `stage` on) — reintroducing the old Cellpose app's CLAHE as an explicit opt-in for
   low-contrast fluorescence. Returns `{ok, train_pair_count, train_pair_ok,

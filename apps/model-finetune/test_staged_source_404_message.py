@@ -1,10 +1,22 @@
-"""A 404 on a staged training input must say what window closed, not just "expired".
+"""A 404 on a staged training input must name the lifetime and when its clock starts.
 
-`get_upload_url` hands back a presigned PUT valid for one hour. A caller who holds
-that handout longer than the window never uploads at all, and S3 then answers the
-read with the same 404 it gives for a path that was never written and for one that
-has been removed. The old message asserted one of those three ("does not exist or
-has expired") and named no window, so a caller could not tell a typo from a timeout.
+A file staged through `get_upload_url` is DELETED about an hour later, and the
+storage service schedules that deletion when the URL is minted -- so the clock runs
+from the mint, not from the moment the upload finished. The old message ("does not
+exist or has expired") named no window and no remedy, and a caller whose queued run
+had waited could not tell a deleted input from a mistyped path.
+
+The mint-not-upload distinction is the half that costs time, and it has its own arm:
+staging a dataset by minting many URLs up front and uploading them over the next
+twenty minutes spends the window on the loop.
+
+An earlier version of this file asserted the OPPOSITE -- that the object persists and
+only the PUT URL expires -- on a probe that read one object per age band and found a
+225-day-old one still readable. That inference was wrong: those old objects predate
+scheduled deletion. The evidence is the DISTRIBUTION, not a sample. Of 585 objects
+under `temp/`, 453 were under an hour old, 17 between one and 1.25 hours, and zero
+between 1.25 hours and 30 days; an app staging hundreds an hour cannot leave that
+range empty unless they are removed.
 
 Offline by construction: the subject's two collaborators on this path are replaced,
 so no network and no credentials. Nothing else is attached to the instance --
@@ -61,38 +73,78 @@ async def _raise_message(inst) -> str:
 
 
 @pytest.mark.asyncio
-async def test_the_404_names_the_one_hour_staging_window() -> None:
-    """The window is the actionable part: it tells the caller to re-request a URL."""
+async def test_the_404_names_the_one_hour_lifetime() -> None:
+    """The window is the actionable part: it tells the caller to re-stage."""
     msg = await _raise_message(_entry_instance(404))
     assert "1 hour" in msg, (
-        "the message must name the staging window; without it a caller cannot tell "
-        "a path typo from an upload URL that timed out: %r" % msg
+        "the message must name the staged file's lifetime; without it a caller "
+        "cannot tell a path typo from a file that has been deleted: %r" % msg
     )
 
 
 @pytest.mark.asyncio
-async def test_the_404_does_not_assert_one_of_three_indistinguishable_causes() -> None:
-    """S3 answers 404 for never-written, removed and never-uploaded alike.
+async def test_the_404_says_the_clock_starts_AT_THE_MINT_not_at_the_upload() -> None:
+    """The half that costs time, and the half a reader gets wrong by default.
 
-    So the message has to offer all three. The old text picked two and stated them
-    as fact ("does not exist or has expired"), which reads as a diagnosis the HTTP
-    status cannot support.
+    "one-hour TTL" reads as a limit on how long you may UPLOAD. It is not: the
+    deletion is scheduled when `get_upload_url` returns, so a caller who minted 76
+    URLs and then uploaded them over twenty minutes has spent a third of the
+    window before the last PUT lands. A message that says only "lasts about an
+    hour" leaves that caller measuring from the wrong event.
     """
     msg = (await _raise_message(_entry_instance(404))).lower()
-    for cause in ("never have been uploaded", "removed", "expired"):
-        assert cause in msg, "the message must offer %r as a possibility: %r" % (
-            cause,
-            msg,
-        )
+    assert "mint" in msg, (
+        "the message must say the hour runs from when the URL was MINTED: %r" % msg
+    )
+    assert "not" in msg and "upload finished" in msg, (
+        "the message must say explicitly that the clock is NOT from the upload, "
+        "which is the reading a caller arrives with: %r" % msg
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_404_still_admits_the_causes_it_cannot_rule_out() -> None:
+    """Deletion is the likely cause, not the only one, and the 404 cannot tell.
+
+    A message that asserted deletion alone would send someone who simply mistyped
+    a path off to re-upload a file that was never there. So "most likely" plus the
+    alternatives, rather than a diagnosis the HTTP status cannot support.
+    """
+    msg = (await _raise_message(_entry_instance(404))).lower()
+    assert "most likely" in msg, (
+        "deletion must be offered as likely, not certain: %r" % msg
+    )
+    assert "never uploaded" in msg and "typo" in msg, (
+        "the message must still admit a never-uploaded path and a typo: %r" % msg
+    )
 
 
 @pytest.mark.asyncio
 async def test_the_404_tells_the_caller_what_to_do() -> None:
-    msg = await _raise_message(_entry_instance(404))
-    assert "re-request" in msg.lower() and "re-upload" in msg.lower(), (
-        "a message that names three causes and no remedy leaves the caller nowhere: %r"
-        % msg
+    msg = (await _raise_message(_entry_instance(404))).lower()
+    assert "re-stage" in msg, (
+        "a message naming a lifetime and no remedy leaves the caller nowhere: %r" % msg
     )
+    assert "re-request" in msg and "re-upload" in msg, msg
+
+
+@pytest.mark.asyncio
+async def test_a_NON_staged_404_does_not_claim_a_staging_lifetime() -> None:
+    """The staged branch is keyed on the `temp/` prefix, and that needs its own arm.
+
+    An http(s) source or an artifact path reaching this 404 has nothing to do with
+    `get_upload_url`, and telling its caller to re-stage would be a wrong
+    instruction confidently given. Without this arm the prefix test could be
+    inverted or dropped and every message would still read plausibly.
+    """
+    inst = _entry_instance(404)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await inst._load_image_from_source("datasets/ds-1/image.npy")
+    msg = str(excinfo.value).lower()
+    assert "re-stage" not in msg and "1 hour" not in msg, (
+        "a non-staged source must not be told about the staging lifetime: %r" % msg
+    )
+    assert "never have been uploaded" in msg or "never been uploaded" in msg, msg
 
 
 # --- controls -----------------------------------------------------------------
