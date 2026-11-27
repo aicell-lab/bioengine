@@ -4707,9 +4707,19 @@ class AppsManager:
                 user_id=user_id,
             )
         )
-        self._deployed_applications[application_id][
-            "undeployment_task"
-        ] = undeployment_task
+        # Do NOT replace the handle to an undeployment that is still running. A second stop of
+        # the same application is a no-op inside _undeploy_application (it returns as soon as it
+        # sees `stopping`), so the new task finishes almost at once — and overwriting the handle
+        # with it would leave the stored handle pointing at a COMPLETED no-op while the task
+        # actually tearing the application down was referenced by nothing. Whoever awaits this
+        # handle to decide whether teardown finished would then be told it had: stop_all_apps
+        # awaits exactly this, with a timeout. The new task is still created so the no-op logs
+        # itself for an operator; only the handle is kept pointing at the real work.
+        in_flight = self._deployed_applications[application_id].get("undeployment_task")
+        if in_flight is None or in_flight.done():
+            self._deployed_applications[application_id][
+                "undeployment_task"
+            ] = undeployment_task
 
     @schema_method
     async def stop_all_apps(
