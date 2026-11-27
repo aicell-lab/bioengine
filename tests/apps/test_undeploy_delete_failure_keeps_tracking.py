@@ -77,6 +77,14 @@ def _make_manager(delete_raises: bool) -> AppsManager:
 
     manager._cancel_deployment_process = AsyncMock()
     manager._deploy_application = AsyncMock()
+    # _undeploy_application asks the builder whether the build task it just cancelled actually
+    # ended: ``ray.cancel`` is a request, and a task still alive can re-create the application
+    # after this delete. These arms are about the DELETE failing, so the answer here is "it
+    # ended" — False — which is also the control for the arm that drives the other answer in
+    # test_undeploy_cannot_leave_an_orphan_in_serve.py.
+    manager.app_builder = SimpleNamespace(
+        take_unconfirmed_build_cancellation=lambda application_id: False
+    )
 
     return manager
 

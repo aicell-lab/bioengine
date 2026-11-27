@@ -30,7 +30,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import ray
 import yaml
@@ -199,6 +199,11 @@ class AppBuilder:
         self.elastic_gpu_cluster: bool = elastic_gpu_cluster
         self.server_url: str = server_url
         self.data_server_url: Optional[str] = None
+        # Application ids whose cancelled build task was NOT confirmed finished. Such a task
+        # may still reach ``serve.run`` and re-create the application after the undeploy has
+        # deleted it, so the undeploy has to be able to ASK — a log line it cannot read is not
+        # a signal. Drained by ``take_unconfirmed_build_cancellation``.
+        self._unconfirmed_build_cancellations: Set[str] = set()
 
     def complete_initialization(
         self,
@@ -212,6 +217,18 @@ class AppBuilder:
 
     def update_data_server_url(self, data_server_url: str) -> None:
         self.data_server_url = data_server_url
+
+    def take_unconfirmed_build_cancellation(self, application_id: str) -> bool:
+        """Report AND clear whether this app's cancelled build task was left unconfirmed.
+
+        Draining is deliberate: the answer describes one teardown, and the caller acts on it by
+        keeping the tracking entry. Leaving it set would make every later stop of the same id
+        report the same stale hazard.
+        """
+        if application_id in self._unconfirmed_build_cancellations:
+            self._unconfirmed_build_cancellations.remove(application_id)
+            return True
+        return False
 
     # ────────────────────────── manifest ─────────────────────────────────
 
@@ -1076,6 +1093,13 @@ class AppBuilder:
         No worker-side cleanup needed: the worker never wrote anything to
         its own filesystem. Replicas sync source per file from Hypha.
         """
+        # A newer build for this id supersedes any earlier unconfirmed cancellation: the
+        # question the record answers is "can a task still re-create THIS application behind
+        # my back", and the deploy about to run will create it in the open. Without this the
+        # record could outlive its own cause — ``_cancel_deployment_process`` is also called on
+        # the UPDATE path, which does not drain it — and a later clean stop would then be
+        # reported as unclean.
+        self._unconfirmed_build_cancellations.discard(application_id)
         # Before serve.run, because that is what starts the replicas that
         # fetch them.
         await self._store_replica_secrets(
@@ -1159,6 +1183,12 @@ class AppBuilder:
                     f"{cancel_error}."
                 )
             if not cancelled_cleanly:
+                # RECORDED, not just logged. The undeploy that asked for this cancellation is
+                # the only caller that can act on the answer — it decides whether to drop the
+                # tracking entry — and it cannot read a log line. Without this the outcome
+                # stopped here and the undeploy went on to untrack an application whose build
+                # task was still able to re-create it, which is this row's orphan.
+                self._unconfirmed_build_cancellations.add(application_id)
                 # Reported LOUDLY and attributed, never swallowed: this is the state in
                 # which an application can still appear in Ray Serve after the worker
                 # has deleted it and stopped tracking it.
