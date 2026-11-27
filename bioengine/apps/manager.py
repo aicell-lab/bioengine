@@ -764,7 +764,7 @@ class AppsManager:
         # build, so acquiring it in get_app_status would block every status call for the
         # length of a deploy. A set membership test runs to completion without awaiting, so
         # an unlocked read cannot observe a half-applied change.
-        self._deploying_application_ids = set()
+        self._deploying_application_ids = {}
 
         # Per-app auto-redeploy backoff state. Keyed by application_id; each
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
@@ -2215,6 +2215,19 @@ class AppsManager:
             if application_info["is_deployed"].is_set():
                 status = "UNHEALTHY"
                 message = f"Application '{application_id}' is marked as deployed but not found in Ray Serve status."
+                if application_id in self._in_flight_deploys():
+                    # An update is building and Ray Serve has gone quiet about the old
+                    # application. UNHEALTHY is still the honest status -- the worker does
+                    # believe it is deployed and Serve cannot see it -- but without naming
+                    # the update a caller reads a fault where there is a deployment in
+                    # progress, and this is the one window where the field alone was the
+                    # only hint.
+                    message = (
+                        f"{message} An update to version "
+                        f"{self._in_flight_deploys()[application_id]} is in progress, so "
+                        "this may be the deployment replacing it rather than a fault. A "
+                        "timeout from deploy_app does not mean the update failed."
+                    )
                 self.logger.warning(
                     f"Application '{application_id}' for artifact '{application_info['artifact_id']}' "
                     "is marked as deployed but not found in Ray Serve status."
@@ -2337,9 +2350,11 @@ class AppsManager:
             "code_verified": code_verified,
             "pinned_version": pinned_version,
             "recovered_app": application_info["recovered_app"],
-            # The version an in-flight update is heading for, or None when no deploy for
-            # this application is mid-build. The caller cannot derive it: `version` above is
-            # what is RUNNING, which during an update is still the old one.
+            # The version an in-flight deploy is heading for, or None when no deploy for
+            # this application is mid-build. Never None while one IS in flight: a caller
+            # that named no version reads "latest", so this field alone answers "is a
+            # deploy in flight, and what is it heading for". The caller cannot derive it --
+            # `version` above is what is RUNNING, still the old one during an update.
             "updating_to_version": self._in_flight_deploys().get(application_id),
             "status": status,
             "message": message,
@@ -4128,7 +4143,14 @@ class AppsManager:
         marked = []
 
         def mark(application_id: str, requested_version: Optional[str]) -> None:
-            self._in_flight_deploys()[application_id] = requested_version
+            # Store "latest" rather than None when the caller named no version. The value is
+            # read back as "the version this deploy is heading for", and None there would be
+            # indistinguishable from "no deploy in flight" -- which is the common case for an
+            # update, since omitting the version is how a caller says "take the newest". No
+            # artifact version is literally "latest", so the sentinel cannot collide with a
+            # real one. The RESOLVED version is not available here: it does not exist until
+            # the build returns.
+            self._in_flight_deploys()[application_id] = requested_version or "latest"
             marked.append(application_id)
 
         try:

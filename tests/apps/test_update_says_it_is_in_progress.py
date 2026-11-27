@@ -1,13 +1,7 @@
 """RED arm for the update path, written as a standalone pytest file so it can be dropped in.
 
-NOT YET COMMITTED. The production fix for this needs a design ruling (which status branch
-reads the in-flight marker), and that is not mine to pick. What does NOT need a ruling is the
-arm: the defect is the same whatever shape the fix takes, so this is written and shown RED
-now, and lands with the fix later.
-
-It also cannot land yet for a mechanical reason: it reads the in-flight marker introduced by
-the new-application change, which is approved and green but not merged. Run it with
-PYTHONPATH pointed at a tree that carries that change.
+These arms assert the DEFECT rather than a mechanism, so they were written and shown RED
+before the fix existed and did not need rewriting when its shape was ruled on.
 
 WHAT IT ASSERTS, and why these two statements are design-independent:
 
@@ -309,5 +303,103 @@ async def test_C_the_new_application_window_is_unaffected() -> None:
         assert "To deploy this application" not in str(
             st.get("message", "")
         ), "the NOT_RUNNING retry invitation came back for a new application"
+    finally:
+        await h.finish(fut)
+
+
+# ── the regression the first round shipped ─────────────────────────────────────────────
+
+
+def _init_value_for_the_marker():
+    """Run ``__init__``'s OWN assignment for the marker and return what it produced.
+
+    Deliberately executing the real line rather than hard-coding a value. Round 1 of this
+    change broke EVERY deploy_app -- new or update -- because the marker became a mapping
+    while ``__init__`` still built a set, so ``mark()`` did item assignment on a set and
+    raised TypeError before the build. Nothing caught it: every arm builds the manager with
+    ``object.__new__``, and the one test line that DID mirror ``__init__`` was edited to
+    match the new type instead of the code being fixed, which removed the last signal.
+
+    Reading the line from the source couples this arm to ``__init__``: if the two ever
+    disagree again, this goes red instead of production.
+    """
+    import re
+    from pathlib import Path
+
+    import bioengine.apps.manager as manager_module
+
+    src = Path(manager_module.__file__).read_text()
+    m = re.search(r"^\s*(self\._deploying_application_ids = .+)$", src, re.M)
+    assert (
+        m
+    ), "__init__ no longer initialises _deploying_application_ids; this arm is blind"
+    holder = SimpleNamespace()
+    exec(m.group(1).strip(), {}, {"self": holder})
+    return holder._deploying_application_ids
+
+
+@pytest.mark.asyncio
+async def test_deploy_app_works_on_a_marker_built_the_way_init_builds_it() -> None:
+    """RED if __init__ and the marker's use ever disagree again.
+
+    Drives a real deploy_app with the marker holding exactly what __init__ produces.
+    """
+    h = _Harness(gate="build")
+    h.m._deploying_application_ids = _init_value_for_the_marker()
+    fut = h.start()
+    try:
+        await asyncio.wait_for(h.reached.wait(), timeout=5)
+        assert not fut.done(), (
+            "deploy_app returned or raised before reaching the build, with the marker "
+            "initialised the way __init__ initialises it"
+        )
+    finally:
+        await h.finish(fut)
+        if fut.done() and fut.exception() is not None:
+            raise AssertionError(
+                f"deploy_app raised with __init__'s marker value: {fut.exception()!r}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_update_is_named_even_when_serve_has_gone_quiet() -> None:
+    """RED on main. The window the issue's own table lists and arm A did not cover.
+
+    ``is_deployed`` is set (the old application was deployed) and Ray Serve reports nothing,
+    so the status is UNHEALTHY. That remains honest, but without naming the update a caller
+    reads a fault where there is a deployment in progress.
+    """
+    h = _Harness(gate="build")
+    fut = h.start()
+    try:
+        await asyncio.wait_for(h.reached.wait(), timeout=5)
+        st = await h.status(SERVE_EMPTY)
+        msg = str(st.get("message", ""))
+        assert NEW in msg, (
+            f"Serve went quiet during the update and the message says nothing about it: "
+            f"status={st.get('status')!r} message={msg!r}"
+        )
+    finally:
+        await h.finish(fut)
+
+
+@pytest.mark.asyncio
+async def test_the_field_is_set_even_when_the_caller_named_no_version() -> None:
+    """RED on main, and the common case: omitting the version is how a caller says 'newest'.
+
+    If the field were None here it could not be told apart from "no deploy in flight", which
+    is the one thing it exists to answer.
+    """
+    h = _Harness(gate="build")
+    h.requested_version = None
+    fut = h.start()
+    try:
+        await asyncio.wait_for(h.reached.wait(), timeout=5)
+        st = await h.status(SERVE_RUNNING_OLD)
+        assert st.get("updating_to_version") is not None, (
+            "a version-less update leaves updating_to_version None, so a caller cannot tell "
+            "it from no deploy being in flight"
+        )
+        assert NOT_DEPLOYED_PHRASE not in str(st.get("message", ""))
     finally:
         await h.finish(fut)
