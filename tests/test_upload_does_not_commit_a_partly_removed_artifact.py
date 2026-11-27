@@ -78,20 +78,27 @@ class _FakeArtifactManager:
     whether it published anything.
     """
 
-    def __init__(self, existing=(), remove_raises=()):
+    def __init__(self, existing=(), remove_raises=(), versions=("0.9.0",)):
         self.existing = list(existing)
         self.remove_raises = set(remove_raises)
+        # A PRIOR RELEASE by default, because that is the normal case and the one that caught
+        # the last defect: stale files to remove exist only on a RE-upload, and a re-upload has
+        # a version history. Every fake here used to return no versions, which for the removal
+        # path is a state real Hypha does not produce — and that unrealism is exactly what hid
+        # "a version exists" being read as "this attempt published something".
+        self.versions = [{"version": v} for v in versions]
         self.put_files = []
         self.removed = []
         self.commits = []
         self.edits = []
 
     async def read(self, artifact_id=None, **kw):
-        # An EXISTING artifact, already in the right collection — which is the only situation
-        # this contract can arise in: stale files to remove exist only on a RE-upload. Its
-        # `versions` is empty so the monotonicity check passes, and `parent_id` matches the
+        # An EXISTING artifact, already in the right collection, with its release history —
+        # which is the only situation this contract can arise in. `parent_id` matches the
         # collection so stage_artifact takes the edit path rather than delete-and-recreate.
-        return _Artifact(artifact_id, parent_id="ws/applications", versions=[])
+        return _Artifact(
+            artifact_id, parent_id="ws/applications", versions=self.versions
+        )
 
     async def edit(self, *a, **kw):
         self.edits.append((a, kw))
@@ -210,10 +217,19 @@ async def test_a_removal_failure_is_NOT_committed() -> None:
         "the message describes the artifact's state without re-reading it, which is the defect "
         f"review refused this branch for: {text!r}"
     )
-    assert "STAGED" in text and "no committed version" in text, (
-        "the error must say what state the artifact was LEFT in — staged and recoverable is a "
-        f"different situation from published and not, and wants a different action: {text!r}"
+    # F4: the artifact HAS a prior release (0.9.0), and this attempt published nothing. The
+    # message must not read "a version exists" as "your upload changed what is published" —
+    # that was false in the commonest case, an ordinary re-upload.
+    assert "unchanged" in text and "0.9.0" in text, (
+        "the message must say the published versions are UNCHANGED and name them; a prior "
+        f"release is the normal case, not evidence that this attempt published: {text!r}"
     )
+    assert (
+        "DID change" not in text
+    ), f"the message claims a published version changed when nothing was committed: {text!r}"
+    assert (
+        "committed nothing" in text
+    ), f"the message must say this attempt committed nothing: {text!r}"
 
 
 @pytest.mark.asyncio
@@ -268,8 +284,12 @@ async def test_an_upload_failure_also_names_the_state_it_left() -> None:
         "deployment.py" in text
     ), f"the error does not name the file that failed: {text!r}"
     assert (
-        "Re-read of" in text and "STAGED" in text
+        "Re-read of" in text
     ), f"the error does not report a RE-READ state for the artifact: {text!r}"
+    assert "DID change" not in text and "unchanged" in text, (
+        "a failed upload against an app with a prior release published nothing, and the "
+        f"message must not say otherwise: {text!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -359,7 +379,15 @@ async def test_a_failed_upload_can_be_FOLLOWED_by_a_successful_one() -> None:
     """Backs the "re-running re-stages it" advice, which was an inference until now.
 
     Review's F3: nothing modelled a second upload after a failure, so the message's own remedy
-    was untested. The fake keeps its staged state between calls, as a real artifact would.
+    was untested.
+
+    SCOPE, stated because review was right to limit it: this fake does NOT keep staged state
+    between calls (`edit()` returns a fresh object and `read()` is constant). So this is a
+    SMOKE TEST — it shows the function can be driven twice and that the retry publishes. It does
+    NOT establish that Hypha's `edit(stage=True, version='new')` on an already-open stage
+    discards the leftover files. The failure message says "re-run the upload with the complete
+    file set", which is an instruction, and no longer claims that re-staging has been shown to
+    discard anything.
     """
     calls = {"n": 0}
 

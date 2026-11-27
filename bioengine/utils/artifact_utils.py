@@ -794,9 +794,27 @@ def _collision_hint(upload_errors) -> str:
     return ""
 
 
+async def artifact_versions(
+    artifact_manager: ObjectProxy,
+    artifact_id: str,
+) -> Optional[Set[str]]:
+    """The committed version tags an artifact has right now, or None if that cannot be read.
+
+    None and the empty set are deliberately different: "no versions" and "could not tell" must
+    not collapse, because the caller compares two of these readings and a silent empty set
+    would read as "nothing was there before".
+    """
+    try:
+        info = await artifact_manager.read(artifact_id)
+        return {str(v["version"]) for v in (getattr(info, "versions", None) or [])}
+    except Exception:
+        return None
+
+
 async def describe_artifact_state(
     artifact_manager: ObjectProxy,
     artifact_id: str,
+    versions_at_stage: Optional[Set[str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> str:
     """Re-READ the artifact and describe what is actually there, for a failure message.
@@ -819,20 +837,42 @@ async def describe_artifact_state(
             f"published under '{artifact_id}' is UNKNOWN from here — inspect it before retrying."
         )
     try:
-        versions = [v["version"] for v in (getattr(info, "versions", None) or [])]
+        versions = {str(v["version"]) for v in (getattr(info, "versions", None) or [])}
     except Exception:
-        versions = []
+        versions = set()
+
+    # COMPARED AGAINST THE BASELINE, not against "are there any versions at all".
+    #
+    # Prior versions are the normal case: an app being re-uploaded has a release history, and
+    # stale files to remove exist ONLY on a re-upload. Reading "some version exists" as "this
+    # attempt published something" is therefore false almost every time on the removal path.
+    # It also repeats the defect this helper was added to fix — stating a state that was never
+    # established — one level further in.
+    appeared = versions - (versions_at_stage or set())
+    if appeared and versions_at_stage is not None:
+        return (
+            f"Re-read of '{artifact_id}': version(s) {', '.join(sorted(appeared))} appeared "
+            f"while this upload was running and were not there when it staged, so SOMETHING "
+            f"ELSE committed this id. A committed version is immutable, so this is not "
+            f"recoverable under the same id — inspect what the artifact now contains."
+        )
+    if versions_at_stage is None:
+        return (
+            f"Re-read of '{artifact_id}': it currently has version(s) "
+            f"{', '.join(sorted(versions)) if versions else 'none'}, but the versions present "
+            f"when this upload staged could not be read, so whether anything was published by "
+            f"this attempt is UNKNOWN from here — inspect it before retrying."
+        )
     if versions:
         return (
-            f"Re-read of '{artifact_id}': it is COMMITTED, with version(s) "
-            f"{', '.join(map(str, versions))}. A published version therefore DID change and a "
-            f"committed version is immutable, so this is not recoverable by re-uploading the "
-            f"same version — inspect what the artifact now contains."
+            f"Re-read of '{artifact_id}': its published version(s) are unchanged "
+            f"({', '.join(sorted(versions))}) and this attempt committed nothing, so the "
+            f"staged work is what was lost. Re-run the upload with the complete file set."
         )
     return (
-        f"Re-read of '{artifact_id}': no committed version, so it is left STAGED and nothing is "
-        f"published from this attempt. Re-running the upload with the complete file set "
-        f"re-stages it."
+        f"Re-read of '{artifact_id}': no committed version, so nothing is published from this "
+        f"attempt and the staged work is what was lost. Re-run the upload with the complete "
+        f"file set."
     )
 
 
@@ -922,6 +962,14 @@ async def create_application_from_files(
         permissions=permissions,
     )
 
+    # The versions present AT STAGE TIME. This is the baseline every failure message below
+    # compares against: "a version exists" is not "this attempt published something", because a
+    # re-upload of a released app always has prior versions. Read once, here, so a later read
+    # that differs means something changed WHILE this upload ran.
+    versions_at_stage = await artifact_versions(
+        artifact_manager=artifact_manager, artifact_id=artifact.id
+    )
+
     # Get existing files if artifact already exists (to remove old files later)
     existing_files = set()
     try:
@@ -968,7 +1016,10 @@ async def create_application_from_files(
     if upload_errors:
         error_details = "; ".join([f"{name}: {err}" for name, err in upload_errors])
         state = await describe_artifact_state(
-            artifact_manager=artifact_manager, artifact_id=artifact.id, logger=logger
+            artifact_manager=artifact_manager,
+            artifact_id=artifact.id,
+            versions_at_stage=versions_at_stage,
+            logger=logger,
         )
         raise RuntimeError(
             f"Failed to upload {len(upload_errors)} file(s) to '{artifact.id}': "
@@ -1013,7 +1064,10 @@ async def create_application_from_files(
     if removal_errors:
         details = "; ".join(f"{name}: {err}" for name, err in removal_errors)
         state = await describe_artifact_state(
-            artifact_manager=artifact_manager, artifact_id=artifact.id, logger=logger
+            artifact_manager=artifact_manager,
+            artifact_id=artifact.id,
+            versions_at_stage=versions_at_stage,
+            logger=logger,
         )
         raise RuntimeError(
             f"Upload of '{artifact.id}' did NOT complete: {len(removal_errors)} stale "
