@@ -406,9 +406,22 @@ def _entry_instance(runtime_obj):
     inst = object.__new__(cls)
     inst._enabled_backends = {"microsam", "cellpose"}
     inst.runtime = runtime_obj
-    import logging
-
-    inst.logger = logging.getLogger("test-entry")
+    # NO LOGGER ATTRIBUTE IS SET HERE, DELIBERATELY. An earlier version of this
+    # builder attached a stdlib logger to the instance, and that one line hid a
+    # defect from all 21 arms in this file: `EntryApp` has no such attribute, so
+    # the five logging calls the preflight used to make through `self` raised
+    # `AttributeError` in production while every test here passed. The arms were
+    # handing the subject an attribute it cannot have, so the suite was testing
+    # a shape that does not exist. The module-level `logger` is what the other
+    # 33 logging calls in `entry.py` use, and what the preflight uses now.
+    #
+    # Measured on a live KTH replica before the fix: the mirror seeded and
+    # verified the weights, and then the call that LOGGED that success crashed
+    # the run with `'EntryApp' object has no attribute 'logger'`.
+    #
+    # Leaving it off is what makes every arm below load-bearing for this. The
+    # preflight logs on five paths, so any path reached through a non-existent
+    # attribute now fails the arm that reaches it, instead of passing.
     return cls, inst
 
 
@@ -562,9 +575,7 @@ def test_start_training_REFUSES_WITHOUT_EVER_ASKING_FOR_THE_GPU(tmp_path, monkey
     cls = getattr(entry.EntryApp, "func_or_class", entry.EntryApp)
     inst = object.__new__(cls)
     inst._enabled_backends = {"microsam", "cellpose"}
-    import logging
-
-    inst.logger = logging.getLogger("test-entry")
+    # No logger attribute here either -- see `_entry_instance` for why.
     inst.runtime = _FakeRuntime(
         caps=["base_checkpoint_status"],
         probe=lambda mt: status({"encoder": UNREACHABLE}, model_type=mt),
@@ -869,3 +880,55 @@ def test_a_fallback_that_reports_an_ERROR_does_NOT_re_probe():
     with pytest.raises(ValueError):
         asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
     assert rt.calls.count("base_checkpoint_status") == 1, rt.calls
+
+
+def test_the_preflight_NEVER_logs_through_SELF_because_EntryApp_HAS_NO_LOGGER():
+    """`entry.py` must not reach a logger through `self`. Measured, not stylistic.
+
+    `EntryApp` sets no `logger` attribute, so `self.logger.warning(...)` raises
+    `AttributeError` the moment the line is reached. The preflight had five such
+    calls and they shipped: on a live KTH replica the mirror seeded and verified
+    the base checkpoint and then the call that LOGGED that success crashed the
+    training run. Three of the five sat on paths whose documented job is to SKIP
+    rather than stop training -- an older replica, and a transient ping failure
+    -- so each one turned a deliberate tolerance into a crash.
+
+    This is a SOURCE assertion on purpose, and it is the belt to the braces that
+    `_entry_instance` provides. Removing the fake logger from the builder makes
+    the behavioural arms catch any of the five paths they actually reach; this
+    catches a sixth call added on a path no arm reaches, which is how the first
+    five got in.
+
+    The positive control matters: a scanner that silently matched nothing would
+    pass this test forever. `entry.py` logs through the module-level `logger`
+    dozens of times, so the control asserts the scan can see those.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).with_name("entry.py").read_text()
+    tree = ast.parse(src)
+
+    through_self = []
+    module_level = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        # `self.logger` -> Attribute(value=Name('self'), attr='logger')
+        if node.attr == "logger" and isinstance(node.value, ast.Name):
+            if node.value.id == "self":
+                through_self.append(node.lineno)
+        # `logger.warning` -> Attribute(value=Name('logger'), attr='warning')
+        if isinstance(node.value, ast.Name) and node.value.id == "logger":
+            module_level.append(node.lineno)
+
+    assert len(module_level) >= 20, (
+        "POSITIVE CONTROL FAILED: the scan found only %d module-level logger "
+        "uses in entry.py, so it is not seeing logging calls at all and its "
+        "silence about `self.logger` would mean nothing" % len(module_level)
+    )
+    assert not through_self, (
+        "entry.py reaches a logger through `self` at line(s) %s. EntryApp has "
+        "no `logger` attribute, so every one of those raises AttributeError "
+        "when reached. Use the module-level `logger`." % through_self
+    )
