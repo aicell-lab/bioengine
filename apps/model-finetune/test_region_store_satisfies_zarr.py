@@ -2,25 +2,41 @@
 
 WHAT HAPPENED. ``_LengthCheckedStore`` is a ``zarr.abc.store.Store`` subclass that
 hands zarr the bytes for one key and checks the length. It defined eighteen
-methods and not ``set_partial_values``, which zarr 3.0.8 declares abstract — so
+methods and not ``set_partial_values``, which zarr declares abstract up to and
+including 3.1.2 — so
 the class could not be INSTANTIATED, and every region read failed with
 
     TypeError: Can't instantiate abstract class _LengthCheckedStore
                with abstract method set_partial_values
 
 reported by this module as ``could not open '0' in <url>``: a message that points
-a reader at the network rather than at the class. Measured at zarr 3.0.8, the
-floor ``requirements-entry.txt`` declares: 18 of the 36 cases in the three region
-test files failed, which is every region read in them.
+a reader at the network rather than at the class.
 
-WHY A GREEN SUITE DID NOT SEE IT. The published app image carries no zarr, so
-those three files are not collected there at all and a suite run against it
-reports green with the region reader entirely unexercised. Note that the
-``importorskip`` below has the same shape: where zarr is absent this file SKIPS,
-which is not a failure. So whatever runs the suite has to install zarr and assert
-it imports, or "green" keeps meaning "not exercised" — and it has to pin a
-version in 3.0.8..3.1.2, because from 3.1.3 on ``set_partial_values`` is no longer
-abstract and all 36 cases pass against the unfixed class.
+THE VERSIONS, read off the file rather than remembered.
+``requirements-entry.txt`` declares ``zarr>=3.1,<3.1.6``, so the lowest version a
+build may resolve is 3.1.0. The method is abstract from 3.0.8 through 3.1.2 and
+concrete from 3.1.3, which puts that floor INSIDE the window: measured at 3.1.0,
+18 of the 36 cases in the three region test files failed — every region read in
+them — and all 36 pass at 3.1.3. So whether region reading worked depended on
+where inside the declared range a resolve happened to land.
+
+WHY A GREEN SUITE DID NOT SEE IT, and what each arm is worth at which version.
+An image carrying no zarr does not collect those three files at all, and the
+``importorskip`` below has the same shape: this file SKIPS there, which is not a
+failure. Two separate guards matter, and they guard different things.
+
+Arms 1 and 2 — the abstract set, and construction — can only be RED inside
+3.0.8..3.1.2, because from 3.1.3 the method is concrete and inherited, so the
+unfixed class constructs happily. Arm 3 is the one that keeps working at CI's
+pinned ``zarr==3.1.3`` (requirements-datasets.txt): the inherited method does not
+raise ``RegionSourceError``, so deleting this override, or making it a silent
+``return None``, reddens arm 3 there.
+
+An absent zarr is caught too, and not by this file: the suite registry's
+``max_skipped`` for this app is 6, and a run with zarr uninstalled skips 10, so
+``app_bundle_suites.py`` refuses it rather than reporting green. Exercising the
+3.1.0 end of the declared range is what nothing in CI does, which is why the
+evidence for this change is a separate run at that version.
 
 WHY THIS TEST IS NOT "assert set_partial_values exists". Naming the one method
 that happened to be missing pins today's zarr and nothing else: the next release

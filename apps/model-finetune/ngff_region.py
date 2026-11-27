@@ -724,18 +724,25 @@ def _length_checked_store_class() -> Any:
             """Refused, like `set` and `delete`, and PRESENT because zarr
             requires it.
 
-            It is not optional cover for a method nobody calls. zarr 3.0.8
-            declares `set_partial_values` abstract on `zarr.abc.store.Store`, so
+            It is not optional cover for a method nobody calls. zarr declares
+            `set_partial_values` abstract on `zarr.abc.store.Store` up to and
+            including 3.1.2, so
             a subclass without it cannot be INSTANTIATED at all:
 
                 TypeError: Can't instantiate abstract class _LengthCheckedStore
                            with abstract method set_partial_values
 
             which this module then reports as `could not open '0' in <url>` --
-            a message that points at the network and not at this class. Measured
-            at zarr 3.0.8, the floor `requirements-entry.txt` declares: 18 of the
-            36 cases in the three region test files failed, i.e. every region
-            read. `supports_partial_writes` already answers False; that property
+            a message that points at the network and not at this class.
+
+            THE VERSIONS, read off the file rather than remembered.
+            `requirements-entry.txt` declares `zarr>=3.1,<3.1.6`, so the lowest
+            version a build may resolve is 3.1.0. `set_partial_values` is
+            abstract from 3.0.8 through 3.1.2 and concrete from 3.1.3, which puts
+            that floor INSIDE the window: measured at 3.1.0, 18 of the 36 cases
+            in the three region test files failed, i.e. every region read, and
+            all of them pass at 3.1.3. So whether region reading worked depended
+            on where inside the declared range a resolve happened to land. `supports_partial_writes` already answers False; that property
             says what the store WOULD do, and says nothing about which methods
             the ABC demands exist.
             """
