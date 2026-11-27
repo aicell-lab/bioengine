@@ -1097,22 +1097,7 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL for staging an input image or embedding.
-
-        **THE STAGED OBJECT IS SHORT-LIVED, NOT JUST THE URL.** The returned
-        ``upload_url`` is presigned for one hour, and the staged object under
-        ``temp/`` also stops being readable about an hour after staging.
-        Measured: a ``start_training`` submitted 74 minutes after staging, and an
-        ``infer`` 80 minutes after, both failed with "does not exist or has
-        expired". So the hour bounds the whole round trip, not just the upload
-        window -- anything that stages a dataset and then WAITS (a queued run, a
-        second evaluation pass after a long training) must re-stage first.
-
-        Which knob governs the object's lifetime is NOT established here: the
-        ``ttl`` below may bound only the URL, with a bucket lifecycle rule on
-        ``temp/`` doing the rest. The observable behaviour above is what callers
-        should plan against.
-        """
+        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1222,11 +1207,7 @@ class EntryApp:
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
-            raise FileNotFoundError(
-                f"Source '{source}' does not exist or has expired. A staged "
-                f"temp/ object stops being readable about an hour after "
-                f"get_upload_url; re-stage the file and retry with the new path."
-            )
+            raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
         if ext == ".npy":
@@ -2492,11 +2473,7 @@ class EntryApp:
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
-            "needs DENSE labels — annotate all objects per image. GeoJSON coordinates "
-            "are image pixels (x, y) = (column, row), origin TOP-LEFT, y increasing "
-            "DOWNWARD; a y-up file trains on vertically mirrored masks and nothing "
-            "detects it. One id per polygon (each MultiPolygon part counts separately); "
-            "interior rings are ignored.",
+            "needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
             None, description="Optional validation images; same forms as train_images."
@@ -2816,9 +2793,7 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). GeoJSON "
-            "coordinates are image pixels (x, y) = (column, row), origin TOP-LEFT, "
-            "y increasing DOWNWARD — a y-up file is silently mirrored.",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."
