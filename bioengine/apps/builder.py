@@ -1126,13 +1126,28 @@ class AppBuilder:
         finally:
             # Always drop it: a finished task must not be cancellable later, and a stale ref would
             # make a future stop cancel someone else's build.
-            getattr(self, "_inflight_builds", {}).pop(application_id, None)
+            # Pop only if the entry is still OURS. `_fire_redeploy` starts a new deploy
+            # task without cancelling the old one, so two submits can overlap on one id:
+            # the second ref overwrites the first, and without this check the first
+            # build's `finally` would pop the SECOND build's ref — leaving a later stop
+            # with nothing to cancel and the orphan back.
+            _inflight = getattr(self, "_inflight_builds", {})
+            if _inflight.get(application_id) is build_ref:
+                _inflight.pop(application_id, None)
         self.logger.info(f"Submitted '{application_id}' to Ray Serve")
 
     def cancel_inflight_build(self, application_id: str) -> bool:
-        """Cancel the Ray task still building *application_id*, if one is running.
+        """Make sure no build task can still re-create *application_id*.
 
-        Returns True when a task was cancelled, False when there was nothing to cancel.
+        Returns **True when nothing can re-create the application** — either there was no build
+        registered, or the cancel succeeded. Returns **False only when a cancel was attempted and
+        failed**, which means a build may still be running and the caller must keep the
+        application visible rather than dropping its tracking entry.
+
+        The two "nothing happened" cases are deliberately NOT the same value: a caller needs to
+        distinguish "safe to tear down" from "a build may re-create this", and an earlier version
+        returned False for both, which made the safe case look dangerous and the dangerous case
+        look ordinary.
 
         WHY THIS EXISTS SEPARATELY FROM THE ASYNCIO CANCEL. ``_cancel_deployment_process`` calls
         ``deployment_task.cancel()``, which cancels the *coroutine* awaiting this build. That
@@ -1148,7 +1163,8 @@ class AppBuilder:
         """
         build_ref = getattr(self, "_inflight_builds", {}).pop(application_id, None)
         if build_ref is None:
-            return False
+            # Nothing registered: no build can re-create it, so teardown is safe.
+            return True
         try:
             ray.cancel(build_ref, force=True)
         except Exception as exc:  # noqa: BLE001
