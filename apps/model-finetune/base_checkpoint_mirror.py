@@ -50,6 +50,15 @@ from typing import Dict, Optional, Tuple
 MIRROR_ARTIFACT_ID = "bioimage-io/micro-sam-checkpoint-mirror"
 MIRROR_VERSION = "v0"
 
+#: The micro-sam release whose registry literals the xxh128 values below were
+#: copied from. Recorded because "upstream's digest" is only a provenance claim
+#: if you can say WHICH upstream: micro-sam may republish a model under the same
+#: registry key, and then a future reader comparing our xxh128 against a newer
+#: installed micro-sam would get a mismatch with no way to tell a corrupted
+#: mirror from a moved upstream. The mirror artifact records the same version,
+#: and the cross-check asserts the two agree.
+MIRROR_MICRO_SAM_VERSION = "1.8.11"
+
 #: name -> (upstream xxh128 provenance, our sha256 integrity, exact size)
 #:
 #: The sha256 and the size were measured over the MIRROR's own bytes, streamed
