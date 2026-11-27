@@ -60,6 +60,29 @@ _ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
 _MAX_CONCURRENT_TRAINING = max(
     1, int(os.getenv("MODEL_FINETUNE_MAX_CONCURRENT_TRAINING", "1") or "1")
 )
+
+# How much of a failure message is kept in a session's status document. Named
+# because the failure path has to fit two things inside it -- the underlying
+# error and the contention note -- and a bare literal at the truncation site
+# hides a limit that two strings have to share. `train_worker.py` and
+# `train_worker_cellpose.py` clip to the same 800 with their own literals; they
+# run as separate processes and write a single string, so they are left alone
+# rather than made to import this, but the number is the same by intent.
+_STATUS_MESSAGE_LIMIT = 800
+
+# THE CONTENTION WORDING, DEFINED ONCE. It is read in three places -- the
+# `slot_busy_message` field, the note appended to a failure message, and the
+# tests -- and it drifted the moment there were two copies: a review caught the
+# field saying "every training slot" while both notes still said "the training
+# slot", which is true only at the default cap of 1. Deriving the note from the
+# message makes the two unable to disagree, and the tests assert against these
+# names rather than against a repeated sentence.
+_SLOT_BUSY_MESSAGE = (
+    "all training slots were held when this run started, so it prepared its "
+    "data alongside a run already in progress"
+)
+_SLOT_BUSY_NOTE = f" [{_SLOT_BUSY_MESSAGE}; that may or may not be related]"
+
 RuntimeApp = None
 CellposeRuntime = None
 if "microsam" in _ENABLED_BACKENDS:
@@ -1853,7 +1876,70 @@ class EntryApp:
         import training
 
         preparing_hb = asyncio.create_task(self._preparing_heartbeat(session_id))
+        # WHETHER THE SLOT IS ALREADY HELD, RECORDED BEFORE ANY PREPARATION.
+        #
+        # QUEUED is only written further down, after the whole dataset has been
+        # resolved and materialised, because preparing while another run trains
+        # is deliberate -- it keeps the GPU from idling between runs. The cost
+        # is that for the whole of that phase a contended run is
+        # indistinguishable from an uncontended one, and anything that fails in
+        # it reports whatever error it hit with nothing saying a slot was busy.
+        # Measured end to end by a caller: a second start_training went
+        # PREPARING -> FAILED with a bare `get_service` timed-out message, and
+        # their conclusion was the right one -- a caller cannot tell contention
+        # from a real failure.
+        #
+        # So it is recorded in its own field rather than in `status`. Setting
+        # the status to QUEUED here instead would read better and cost more:
+        # the quiet-run sweep moves a run to STOPPED only from PREPARING or
+        # TRAINING and deliberately exempts QUEUED, so a run marked QUEUED
+        # before it prepares would make every stuck preparation immune to the
+        # sweep -- and preparation is the phase that does the downloading.
+        #
+        # BEST-EFFORT, AND INSIDE THE TRY, for the reason the heartbeat above
+        # gives in full: `write_status` raises `RunRecordLockTimeout` when the
+        # record mutex cannot be taken and `RunRecordUnreadable` when the file
+        # will not parse, which is right for a write that carries an outcome and
+        # wrong for one that carries a label. Raised where this sits -- before
+        # the `try` -- the exception escaped `_run_training` with no handler in
+        # scope: no FAILED record, the `finally` skipped, the heartbeat task left
+        # dangling and the session in `_training_tasks` for ever, leaving the run
+        # at PREPARING until the quiet-run sweep called it STOPPED. That is the
+        # same unreadable outcome this change exists to remove, reached from the
+        # other side, and it would have fired only on the contended path -- the
+        # one path this is about. A second writer for this record genuinely
+        # exists in the process (`_runs_sync_loop`), so the lock is contendable.
+        #
+        # SAMPLED ONCE, AND THAT IS THE FIELD'S MEANING, not an oversight: a run
+        # submitted while the slot was free and overtaken during its own
+        # preparation is NOT flagged. The question `slot_busy` answers is "was
+        # this run sharing a worker when it started", which is what a caller
+        # comparing two runs' timings needs and what the reported case was.
+        # Re-sampling would answer a different question ("was it ever
+        # contended") and would need a write per sample; `status` already
+        # reaches QUEUED for the live state, and the failure note is attached
+        # from this same reading, so the two agree by construction.
+        #
+        # `locked()` is ALL slots held, not one. At the default cap of 1 that
+        # is the same statement; above it, a run starting beside N-1 training
+        # runs reads false, which is the right answer to "was a slot free at
+        # submission" and
+        # is why the field is described as every slot being held rather than
+        # as the slot.
+        slot_busy = self._training_sem.locked()
         try:
+            if slot_busy:
+                training.write_status_best_effort(
+                    session_id,
+                    slot_busy=True,
+                    # Past tense on purpose: the field records the state AT
+                    # SUBMISSION and is never written back, so it is still on the
+                    # record after the run has trained and completed. The live
+                    # answer to "is it waiting?" is `status`, which reaches
+                    # QUEUED further down; a present-tense sentence here reads as
+                    # that on a finished run and contradicts it.
+                    slot_busy_message=_SLOT_BUSY_MESSAGE,
+                )
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
             )
@@ -1948,9 +2034,43 @@ class EntryApp:
             # quoting the URL. This catches the paths nobody has thought of,
             # which is the only kind that matters for a credential.
             safe = ngff_region.redact_store_credential(e)
-            logger.error(f"Training session {session_id} failed: {safe}")
+            # THE CONTENTION IS APPENDED, NOT SUBSTITUTED. The underlying error
+            # is the diagnostic and a caller needs it; what it does not say, and
+            # cannot, is that this run was sharing a worker with another one.
+            # The reported case was a bare `get_service` timed out, which reads
+            # as an unrelated RPC fault. Note this does NOT claim the contention
+            # caused the failure -- it says a slot was busy at the time, which is
+            # the fact the caller was missing.
+            # THE NOTE IS KEPT BY TRUNCATING THE ERROR, NOT THE WHOLE STRING.
+            #
+            # Appending and then slicing to the field's limit loses whichever end
+            # the slice drops, and the note is at that end: it is ~170
+            # characters, so any underlying error longer than ~630 cut it off
+            # COMPLETELY while the README and get_training_status both promise a
+            # failure under contention carries it. Measured on the harness
+            # below: an error of 700 characters kept the note, 790 and 2000
+            # stored an 800-character message with none of it. A Hypha
+            # RemoteException's traceback is routinely past 630, so that was the
+            # ordinary case rather than an edge.
+            #
+            # The error keeps the front, which is where its type and message
+            # are, and the note is always whole -- reversing which half is
+            # sacrificed, because a truncated diagnostic is still a diagnostic
+            # and a truncated note is nothing.
+            note = _SLOT_BUSY_NOTE
+            logged = f"{safe}{note}" if slot_busy else safe
+            logger.error(f"Training session {session_id} failed: {logged}")
+            if slot_busy and len(note) < _STATUS_MESSAGE_LIMIT:
+                room = _STATUS_MESSAGE_LIMIT - len(note)
+                message = f"{safe[:room]}{note}"
+            else:
+                # No contention, or a note that cannot fit at all: the error
+                # alone, clipped as before. The guard is not decoration -- a
+                # later edit lengthening the note past the limit would otherwise
+                # produce a message with no error text in it.
+                message = safe[:_STATUS_MESSAGE_LIMIT]
             training.write_status(
-                session_id, status="FAILED", message=safe[:800], terminated_by="entry"
+                session_id, status="FAILED", message=message, terminated_by="entry"
             )
         finally:
             preparing_hb.cancel()
@@ -3051,7 +3171,20 @@ class EntryApp:
     ) -> Dict[str, Any]:
         """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
         STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
-        means another fine-tuning holds the single training slot."""
+        means every training slot is held by another fine-tuning (one slot by
+        default; MODEL_FINETUNE_MAX_CONCURRENT_TRAINING raises it).
+
+        `slot_busy` is true when all of them were held at the moment this
+        one started, with `slot_busy_message` saying so in words. It is the
+        answer to "was my run sharing a worker?", which `status` cannot give
+        during preparation: a contended run and an uncontended one both read
+        PREPARING while they resolve their inputs, so a fault in that phase used
+        to arrive as a bare transport error with nothing attributing it. The
+        field records the state AT SUBMISSION and is never written back, so it is
+        still true-as-written on a finished run; the live "is it waiting now?" is
+        `status` reaching QUEUED. A failure under contention also carries the
+        note appended to `message`, after the underlying error rather than
+        instead of it."""
         import training
 
         return training.get_status(session_id)

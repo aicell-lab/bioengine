@@ -26,6 +26,7 @@ the raw string.
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 import ngff_region
@@ -50,6 +51,10 @@ class _Stub:
     """Enough of the app to reach the failure branch, and nothing else."""
 
     _training_tasks: dict = {}
+    # `_run_training` reads this before it prepares, to record whether
+    # another run already held the training slot. The app sets it in
+    # __init__, so a stub that drives `_run_training` needs one too.
+    _training_sem = asyncio.Semaphore(1)
 
     def __init__(self, exc):
         self._exc = exc
