@@ -534,6 +534,14 @@ async def stage_artifact(
     artifact = None
     manifest_version = manifest.get("version")
 
+    # The versions present BEFORE this function stages anything. Returned to the caller so a
+    # failure message can tell "was already published" from "appeared while we were uploading",
+    # and taken HERE rather than after `edit()`: the gap between the edit and a later read is a
+    # window in which a concurrent uploader's commit lands INSIDE the baseline, which makes it
+    # invisible as a change. That window produced a message whose two halves gave opposite
+    # instructions. `None` means it could not be established and must not read as "nothing".
+    versions_before: Optional[Set[str]] = None
+
     try:
         # Check if artifact already exists
         existing_artifact = await artifact_manager.read(artifact_id)
@@ -563,6 +571,8 @@ async def stage_artifact(
             existing_versions = [
                 v["version"] for v in (existing_artifact.versions or [])
             ]
+            # Same read, no extra RPC: this is the pre-edit truth.
+            versions_before = {str(v) for v in existing_versions}
             _enforce_version_increases(
                 new_version=manifest_version,
                 existing_versions=existing_versions,
@@ -610,11 +620,14 @@ async def stage_artifact(
                 create_kwargs["config"] = initial_config
 
             artifact = await artifact_manager.create(**create_kwargs)
+            versions_before = (
+                set()
+            )  # brand new: no published version, and that is KNOWN
             logger.info(f"Created new artifact '{artifact.id}'")
         except Exception as e:
             raise RuntimeError(f"Failed to create artifact '{artifact_id}': {e}")
 
-    return artifact
+    return artifact, versions_before
 
 
 async def upload_file_to_artifact(
@@ -829,6 +842,17 @@ async def describe_artifact_state(
     """
     if logger is None:
         logger = create_logger("ArtifactUtils")
+    # The open stage is not a harmless leftover, and this is the one place the caller will
+    # read about it. While a stage is open on an artifact, Hypha's `read()` answers with the
+    # PUBLISHED state without consulting the version index — so a later `deploy_app(version=X)`
+    # against this id serves the published version while still reporting `version_source:
+    # requested`. The deploy looks pinned and is not. Saying only "staged" leaves the caller to
+    # discover that themselves.
+    open_stage_warning = (
+        " NOTE: the stage is left OPEN, not discarded. While it is open, a version-pinned "
+        "deploy of this artifact resolves to the PUBLISHED version while still reporting the "
+        "version you asked for, so resolve or supersede this upload before deploying it."
+    )
     try:
         info = await artifact_manager.read(artifact_id)
     except Exception as exc:
@@ -866,13 +890,12 @@ async def describe_artifact_state(
     if versions:
         return (
             f"Re-read of '{artifact_id}': its published version(s) are unchanged "
-            f"({', '.join(sorted(versions))}) and this attempt committed nothing, so the "
-            f"staged work is what was lost. Re-run the upload with the complete file set."
+            f"({', '.join(sorted(versions))}) and this attempt committed nothing. Re-run the "
+            f"upload with the complete file set." + open_stage_warning
         )
     return (
         f"Re-read of '{artifact_id}': no committed version, so nothing is published from this "
-        f"attempt and the staged work is what was lost. Re-run the upload with the complete "
-        f"file set."
+        f"attempt. Re-run the upload with the complete file set." + open_stage_warning
     )
 
 
@@ -954,20 +977,12 @@ async def create_application_from_files(
     # Edit or create artifact, put in stage mode. Strict version monotonicity
     # is enforced inside stage_artifact, so the staged snapshot always gets a
     # fresh manifest-version tag on commit.
-    artifact = await stage_artifact(
+    artifact, versions_at_stage = await stage_artifact(
         artifact_manager=artifact_manager,
         workspace=workspace,
         manifest=application_manifest,
         logger=logger,
         permissions=permissions,
-    )
-
-    # The versions present AT STAGE TIME. This is the baseline every failure message below
-    # compares against: "a version exists" is not "this attempt published something", because a
-    # re-upload of a released app always has prior versions. Read once, here, so a later read
-    # that differs means something changed WHILE this upload ran.
-    versions_at_stage = await artifact_versions(
-        artifact_manager=artifact_manager, artifact_id=artifact.id
     )
 
     # Get existing files if artifact already exists (to remove old files later)

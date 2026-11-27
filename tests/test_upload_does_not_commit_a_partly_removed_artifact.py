@@ -372,6 +372,23 @@ async def test_an_ID_COLLISION_is_reported_as_one_with_the_artifacts_REAL_state(
     assert (
         "different id" in text
     ), f"the message must say what to actually do about a collision: {text!r}"
+    # The message must not ALSO contain the opposite instruction. Review F5: with the baseline
+    # read AFTER staging, the other client's commit landed inside it, so nothing "appeared",
+    # the state sentence said "unchanged … Re-run the upload with the complete file set", and
+    # the collision hint said re-running under the same id would be refused. Two halves of one
+    # message, opposite instructions.
+    #
+    # And this arm passed anyway: "COMMITTED" matched the hint while "1.0.0" matched the
+    # "unchanged (1.0.0)" sentence. Asserting that the right words are present is not the same
+    # as asserting that the wrong ones are absent.
+    assert "unchanged" not in text, (
+        "the message says the published versions are UNCHANGED while also saying something "
+        f"else committed this id — the two halves contradict each other: {text!r}"
+    )
+    assert "Re-run the upload" not in text, (
+        "the message tells the caller to re-run the upload AND that re-running will be "
+        f"refused. On a collision the remedy is a different id, not a retry: {text!r}"
+    )
 
 
 @pytest.mark.asyncio
