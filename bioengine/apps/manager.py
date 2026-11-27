@@ -734,6 +734,22 @@ class AppsManager:
         self._deployment_lock = asyncio.Lock()
         self._deployed_applications = {}
 
+        # Ray Serve apps this worker saw but did NOT adopt, keyed by
+        # application_id with the reason it was passed over.
+        #
+        # Recovery walks `serve.status()` and skips anything it will not take
+        # on; nothing on that path deletes the Serve app, so a skipped app
+        # keeps running and keeps its GPUs while being absent from
+        # `_deployed_applications`. Two of those skips used to be silent (a
+        # missing ProxyDeployment logged nothing; a sibling workspace logged at
+        # DEBUG), so the app became invisible to every BioEngine surface at
+        # once — see the worker status field `applications_skipped_at_recovery`.
+        #
+        # Deleting the Serve app would be the wrong remedy: the
+        # sibling-workspace case is another worker's app and legitimately not
+        # ours to remove. Making it VISIBLE is the fix.
+        self._applications_skipped_at_recovery: Dict[str, str] = {}
+
         # Per-app auto-redeploy backoff state. Keyed by application_id; each
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
         # moment an app is observed healthy again. See monitor_applications.
@@ -2081,11 +2097,20 @@ class AppsManager:
         serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
         recovered_count = 0
 
+        # Rebuilt from scratch on every pass: an app adopted (or gone) since
+        # the last pass must stop being reported as unadopted.
+        self._applications_skipped_at_recovery = {}
+
         for application_id, application in serve_status.applications.items():
             if application_id in self._deployed_applications:
+                # Already ours — adopted, not orphaned.
                 continue
 
             if "ProxyDeployment" not in application.deployments:
+                self._applications_skipped_at_recovery[application_id] = (
+                    "no ProxyDeployment in the Serve application, so it is not a "
+                    "BioEngine app this worker can manage"
+                )
                 continue
 
             try:
@@ -2111,6 +2136,10 @@ class AppsManager:
                         f"BioEngine major version break — redeploy this app "
                         f"explicitly to bring it under the new builder."
                     )
+                    self._applications_skipped_at_recovery[application_id] = (
+                        f"app_data carries format_version={recovered_format!r}, "
+                        "expected '0.6.0' (deployed before a major version break)"
+                    )
                     continue
 
                 # When multiple bioengine workers from different Hypha
@@ -2123,6 +2152,10 @@ class AppsManager:
                     current_workspace=self.server.config.workspace,
                     logger=self.logger,
                 ):
+                    self._applications_skipped_at_recovery[application_id] = (
+                        "not stamped with this worker's workspace (deployed before "
+                        "the cross-workspace filter, or owned by a sibling worker)"
+                    )
                     continue
 
                 required_keys = {
@@ -2237,6 +2270,9 @@ class AppsManager:
                 self.logger.warning(
                     f"Failed to recover application '{application_id}' from Ray Serve: {e}"
                 )
+                self._applications_skipped_at_recovery[application_id] = (
+                    f"recovery raised {type(e).__name__}: {e}"
+                )
 
         if recovered_count:
             self.logger.info(
@@ -2244,6 +2280,21 @@ class AppsManager:
             )
         else:
             self.logger.info("No existing Ray Serve applications needed recovery.")
+
+        if self._applications_skipped_at_recovery:
+            # One line naming every one of them: a skipped app keeps running
+            # and keeps its resources, so "it is not in my list" must never be
+            # the only trace it leaves.
+            self.logger.warning(
+                "%d Ray Serve application(s) are running but NOT managed by this "
+                "worker; they keep their resources and will not appear in "
+                "get_app_status: %s",
+                len(self._applications_skipped_at_recovery),
+                ", ".join(
+                    f"{app_id} ({reason})"
+                    for app_id, reason in sorted(self._applications_skipped_at_recovery.items())
+                ),
+            )
 
     async def deploy_startup_applications(self) -> None:
         """
