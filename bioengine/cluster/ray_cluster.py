@@ -35,6 +35,13 @@ from bioengine.utils import (
 )
 
 
+# Ray's own default URI-cache size, read from ray/_private/runtime_env/uri_cache.py
+# (DEFAULT_MAX_URI_CACHE_SIZE_BYTES = (1024**3) * 10) and from the agent that consumes it in
+# ray/_private/runtime_env/plugin.py (os.environ.get(..., 10)). A named constant so the
+# comparison below says WHY 10 is the threshold instead of hiding a bare literal.
+_RAY_DEFAULT_PIP_CACHE_GB = 10
+
+
 class ProxyHandleAbsentError(RuntimeError):
     """The cached ``proxy_actor_handle`` is ``None``, so there is nothing to call.
 
@@ -249,6 +256,44 @@ class RayCluster:
             "slurm": {},
         }
 
+        # `runtime_env_pip_cache_size_gb` is accepted in EVERY mode and can only take effect in
+        # the modes where this process starts Ray itself, because Ray reads it from the
+        # runtime_env agent's own environment:
+        #
+        #   ray/_private/runtime_env/plugin.py (2.55.1)
+        #     cache_size_env_var = f"RAY_RUNTIME_ENV_{plugin.name}_CACHE_SIZE_GB".upper()
+        #     cache_size_bytes = int((1024**3) * float(os.environ.get(cache_size_env_var, 10)))
+        #
+        # In external-cluster mode that agent lives in a KubeRay pod created before this worker
+        # attaches, so an export here never reaches it and the configured size silently becomes
+        # Ray's 10 GB default. That is not a hypothetical: it was measured on a site whose app
+        # environments are 5.7-7.9 GB each, where the second one evicted the first and replicas
+        # cycled in STARTING with no error for 40+ minutes.
+        #
+        # It is reported LOUDLY rather than refused. Refusing would break every external-cluster
+        # worker whose config carries the value harmlessly, and the operator's real problem is
+        # not knowing the setting was dropped.
+        self._pip_cache_size_gb = int(runtime_env_pip_cache_size_gb)
+        self._pip_cache_applied = False
+
+        # Logged when the configured size differs from Ray's own default, because that is exactly
+        # when something is LOST. At 10 the intent and the effect agree and an error would be
+        # noise. There is no way to distinguish "passed 30" from "defaulted to 30" without a
+        # sentinel default, and changing the signature's default to one would alter the public
+        # API for every mode, so the condition is the behavioural one rather than the syntactic
+        # one. The default IS 30, so an unconfigured external-cluster worker still says so.
+        if mode == "external-cluster" and self._pip_cache_size_gb != _RAY_DEFAULT_PIP_CACHE_GB:
+            self.logger.error(
+                f"runtime_env_pip_cache_size_gb={self._pip_cache_size_gb} is NOT APPLIED in "
+                f"external-cluster mode and has been ignored. Ray reads "
+                f"RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB from the runtime_env agent's own process, "
+                f"and that agent runs in a Ray pod this worker did not create, so the pods keep "
+                f"Ray's {_RAY_DEFAULT_PIP_CACHE_GB} GB default. Multi-GB app environments will "
+                f"evict one another and replicas can sit in STARTING with no error. To apply it, "
+                f"set RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB={self._pip_cache_size_gb} in the Ray "
+                f"pods' own environment (containerEnv on the RayCluster), not here."
+            )
+
         # Additional configuration for starting a Ray cluster
         if mode in ["single-machine", "slurm"]:
             # Find and store Ray executable path
@@ -297,6 +342,7 @@ class RayCluster:
             os.environ["RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"] = str(
                 runtime_env_pip_cache_size_gb
             )
+            self._pip_cache_applied = True
             self.logger.debug(
                 f"Setting RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB to {runtime_env_pip_cache_size_gb}"
             )
@@ -369,6 +415,20 @@ class RayCluster:
             "start_time": self.start_time if self.mode != "external-cluster" else "N/A",
             "mode": self.mode,
             "geo_location": self.head_geo_location,
+            # Reported because a configured value that is silently dropped is indistinguishable
+            # from one that took effect, and the symptom surfaces far away: replicas sitting in
+            # STARTING while gigabytes are installed and evicted in a loop. `effective_gb` is
+            # what Ray will actually enforce, so a reader never has to know which mode implies
+            # which.
+            "runtime_env_pip_cache": {
+                "configured_gb": self._pip_cache_size_gb,
+                "applied": self._pip_cache_applied,
+                "effective_gb": (
+                    self._pip_cache_size_gb
+                    if self._pip_cache_applied
+                    else _RAY_DEFAULT_PIP_CACHE_GB
+                ),
+            },
         }
 
         # History is keyed by the time.time() of the write and the newest entry is
