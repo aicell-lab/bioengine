@@ -121,8 +121,26 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
   per session, run with `onnxruntime-web`, decode each box locally using the
   `compute_embedding` features. `compute_embedding` and `get_onnx_model` are
   **micro-sam only** — cpsam has no encoder embedding or ONNX prompt decoder.
-- **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
-  an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
+- **`get_upload_url(file_type)`** Presigned S3 PUT URL for staging an input image
+  (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`). **The one-hour
+  figure covers BOTH the staged file and the URL** — the file is deleted about an
+  hour after this call returns, and the presigned signature expires on the same
+  clock. See "Staged files" below.
+
+**Staged files live about an hour, and the clock starts at `get_upload_url`.**
+Two things expire, both an hour after you asked for the URL: the **object**,
+which `ttl` schedules for deletion, and the **URL itself**, whose signature has a
+separate `expires_in` defaulting to the same hour. So it is an upload deadline
+*and* a file lifetime — and raising `ttl` alone widens neither in a way a caller
+can use, because the signature still dies on the hour.
+
+Two consequences. Staging a dataset by minting many URLs up front and uploading
+them in a long sequential loop spends the window on the loop — the first files
+staged are near the end of their life by the time the last lands, so mint each
+URL next to its own upload. And anything that stages and then **waits** — a run
+queued behind another one, a second evaluation pass after a long training — must
+re-stage before it uses those paths. A `404` on a staged path is most likely a
+deleted file; a never-uploaded path and a typo answer identically.
 
 **Embedding reuse (Leg B).** Encode once, reuse the embedding for both the
 in-browser interactive decoder and automatic segmentation without a second
@@ -183,7 +201,18 @@ launch instead of OOMing mid-train.
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
-  `.geojson` FeatureCollection of polygons (rasterized to instances).
+  `.geojson` FeatureCollection of polygons (rasterized to instances). Polygon
+  coordinates are **image pixels in `(x, y)` order, origin at the top-left pixel
+  and y increasing downward** — the raster convention, not y-up. One instance per
+  polygon **part**, numbered from 1 in document order: a `Polygon` is one
+  instance, and **each part of a `MultiPolygon` is its own**, so the count is per
+  part and not per feature. Only the outer ring of each part is drawn, so an
+  interior ring (a hole) **adds no instance**: it is filled with the outer id
+  rather than cut out, and a holed polygon is one instance, not two. A
+  FeatureCollection that carries polygons but rasterizes to nothing is rejected
+  rather than trained on; a **y-up** one is not, because it rasterizes mirrored
+  with every polygon still inside the image, so nothing raises and the run trains
+  on wrong masks. Flip y before uploading if your annotator writes y-up.
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).
@@ -215,7 +244,9 @@ launch instead of OOMing mid-train.
   source is reported per-pair as `{ok: false, error}` rather than failing the batch.
   With `stage=True` (default) the prepared arrays are re-staged into the app's temp
   store and the returned `train_images`/`train_labels` URL lists feed straight into
-  `start_training` (call it promptly — staged URLs are short-lived). `enable_clahe`
+  `start_training` (call it promptly — the re-staged files are deleted about an
+  hour after they were staged, so a dataset prepared and then left to wait has to
+  be prepared again: see "Staged files" above). `enable_clahe`
   applies contrast-limited adaptive histogram equalisation while staging (forces
   `stage` on) — reintroducing the old Cellpose app's CLAHE as an explicit opt-in for
   low-contrast fluorescence. Returns `{ok, train_pair_count, train_pair_ok,

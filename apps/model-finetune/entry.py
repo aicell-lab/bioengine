@@ -476,6 +476,74 @@ class _RecognisedRedeposit(Exception):
         self.existing = existing
 
 
+# Exactly what `get_upload_url` and `_put_temp_embedding` write: a `temp/`
+# segment holding a uuid4, then an extension.
+#
+# THE UUID IS THE DISCRIMINATOR, NOT THE BOUNDARY, and an earlier version of
+# this comment got that backwards -- it claimed `datasets/temp/<uuid>.npy`
+# "cannot match on the right of a longer path". It does match: `(?:^|/)` has to
+# accept a leading path, because the real download URL is
+# `.../s3/<bucket>/<workspace>/temp/<uuid>.npy` and the segment is never at the
+# start. What keeps a foreign source out is the UUID: `/temp/scan_001.tif` and
+# `datasets/temp/a.npy` both fail on it. An artifact file literally named
+# `temp/<uuid4>.<ext>` would be taken for a staged one, which is accepted --
+# nothing in this app writes one, and the alternative is losing the proxy form.
+_STAGED_PATH_RE = re.compile(
+    r"(?:^|/)temp/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.[A-Za-z0-9]+$"
+)
+
+
+def _staged_gone_message(source: str, status: int) -> str:
+    """What to tell a caller whose staged input is no longer readable.
+
+    One place, because the same sentence has to serve a 404 (the object was
+    deleted) and a 403 (its presigned signature expired). Both run on the same
+    one-hour clock from the mint, both have the same remedy, and a caller cannot
+    act on the difference between them.
+    """
+    return (
+        f"Staged source '{source}' could not be read (HTTP {status}) and is most "
+        f"likely gone. A file staged with `get_upload_url` lasts about 1 hour from "
+        f"the moment that URL was MINTED, not from when the upload finished -- and "
+        f"the presigned URL itself expires on the same clock, so an HTTP 403 here "
+        f"means the signature ran out rather than the permissions changing. "
+        f"Anything that stages and then waits -- a run queued behind another one, a "
+        f"second pass after a long training, or a dataset prepared by "
+        f"`preflight_training_dataset` and submitted later -- must re-stage first. "
+        f"A path that was never uploaded, or a typo, answers with the same 404. "
+        f"Re-request an upload URL, re-upload, and submit promptly."
+    )
+
+
+def _is_staged_source(source: str) -> bool:
+    """Is this a file staged through ``get_upload_url``?
+
+    NOT ``startswith("temp/")``. That tested the shape I pictured rather than the
+    thing: ``preflight_training_dataset(stage=True)`` re-stages the prepared arrays
+    and hands back presigned DOWNLOAD URLs, not ``temp/`` paths -- and the README
+    tells callers to feed exactly those to ``start_training``. So the one case this
+    row is about, a dataset prepared and then left to wait, arrived as
+    ``https://.../temp/<uuid>.npy?X-Amz-...`` and missed the staged branch
+    entirely, getting a message with no lifetime and no remedy.
+
+    NOT "has a ``/temp/`` segment" either, which is what this function said first
+    and which was worse than the bug it replaced. ``https://lab.example.org/temp/
+    scan_001.tif`` is somebody else's server, and an artifact path like
+    ``datasets/temp/a.npy`` is not staged at all -- both were being told, on a 403,
+    that their presigned signature had expired and that they should re-stage a file
+    they never staged. A confident wrong diagnosis, which is precisely what the
+    arms in this file's test call out.
+
+    So match WHAT THIS APP MINTS, not a word that happens to appear in a path.
+    Every staged path is written here as ``temp/<uuid4><ext>`` -- see
+    ``get_upload_url`` and ``_put_temp_embedding`` -- so the marker is a ``temp/``
+    segment followed by a UUID. The query string is cut first, so a
+    ``?prefix=temp/...`` parameter cannot masquerade as one either.
+    """
+    return _STAGED_PATH_RE.search(source.split("?", 1)[0]) is not None
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -1120,7 +1188,32 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
+        """Presigned S3 PUT URL for staging an input image or embedding.
+
+        TWO THINGS EXPIRE AN HOUR AFTER THIS CALL, and the clock starts HERE
+        rather than when the PUT lands:
+
+        * the OBJECT. ``ttl`` below is the storage service's deletion schedule --
+          it arranges for the staged file to be removed about an hour later.
+        * the URL. The signature has its own lifetime, ``expires_in``, which this
+          call does not pass and which defaults to the same hour. So the handout
+          is also an upload deadline.
+
+        An earlier version of this docstring said ``ttl`` was "not only a
+        signature lifetime" and that raising it "raises the window". Both were
+        wrong: ``ttl`` is ONLY the deletion schedule, and raising it alone widens
+        nothing a caller can use, because the signature still dies on the hour.
+        Widening the real window means raising ``expires_in`` as well -- on
+        ``get_file`` too, since ``preflight_training_dataset`` hands back download
+        URLs minted with its default.
+
+        The distinction is what costs time. Staging a dataset by minting many URLs
+        up front and uploading them in a long sequential loop spends the window on
+        the loop: the files staged first are near the end of their life when the
+        last one lands. Mint each URL next to its own upload, and anything that
+        stages and then WAITS -- a run queued behind another, a second evaluation
+        pass after a long training -- must re-stage first.
+        """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1229,8 +1322,34 @@ class EntryApp:
             else (await self._get_download_url(source))
         )
         resp = await self._http_retry("GET", url)
+        # A STAGED SOURCE IS ANSWERED ON 403 AS WELL AS 404, and both get the
+        # lifetime and the repair. Two things expire on the same clock, an hour
+        # after `get_upload_url` minted the URL: the storage service schedules the
+        # object's deletion (`ttl`), and the presigned signature itself runs out
+        # (`expires_in`, which defaults to the same hour). A dead object answers
+        # 404; a dead signature answers 403, and `_http_retry` retries 403 and
+        # hands it back, so `raise_for_status()` below used to turn the single most
+        # likely staging failure into an `HTTPStatusError` that was not even a
+        # `FileNotFoundError`.
+        #
+        # Measured against the live store: of 585 objects under `temp/`, 453 were
+        # under an hour old, 17 between one and 1.25 hours, and NONE between 1.25
+        # hours and 30 days -- an app staging hundreds an hour cannot leave that
+        # range empty unless they are removed.
+        #
+        # A 403 on a NON-staged source keeps its old behaviour deliberately: that
+        # is an access problem, not a lifetime one, and must not be dressed up as a
+        # missing file.
+        if resp.status_code in (403, 404) and _is_staged_source(source):
+            raise FileNotFoundError(_staged_gone_message(source, resp.status_code))
         if resp.status_code == 404:
-            raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
+            # A typo and a never-written path answer identically here, so the
+            # message offers both rather than asserting one.
+            raise FileNotFoundError(
+                f"Source '{source}' could not be read (HTTP 404). It may never have "
+                f"been uploaded, may have been removed, or may be a mistyped path -- "
+                f"a 404 cannot distinguish these."
+            )
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
         if ext == ".npy":
@@ -2572,14 +2691,22 @@ class EntryApp:
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
-            "needs DENSE labels — annotate all objects per image.",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
+            "and y increasing DOWNWARD -- the raster convention, not y-up; y-up "
+            "polygons rasterise mirrored and train silently on wrong masks. One "
+            "id per polygon PART, so each MultiPolygon part counts separately "
+            "and an interior ring adds none). "
+            "AIS fine-tuning needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
             None, description="Optional validation images; same forms as train_images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
-            None, description="Validation labels."
+            None,
+            description="Validation labels; same forms as train_labels, including "
+            "a .geojson FeatureCollection read under the same convention "
+            "((x, y), origin top-left, y downward, one id per polygon part).",
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
@@ -2893,14 +3020,21 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y), origin TOP-LEFT and y "
+            "increasing DOWNWARD -- the raster convention; y-up polygons "
+            "rasterise mirrored. One id per polygon PART, so each MultiPolygon "
+            "part counts separately; interior rings are ignored).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."
         ),
         val_labels: Optional[List[str]] = Field(
             None,
-            description="Optional validation label sources, paired with val_images.",
+            description="Optional validation label sources, paired with val_images; "
+            "same forms as train_labels, .geojson included and read under the same "
+            "convention ((x, y), origin top-left, y downward, one id per "
+            "polygon part).",
         ),
         enable_clahe: bool = Field(
             False,
