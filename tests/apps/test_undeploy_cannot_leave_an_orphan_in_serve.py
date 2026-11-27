@@ -38,6 +38,7 @@ import logging
 import pytest
 
 import bioengine.apps.builder as builder_mod
+import bioengine.apps.manager as manager_mod
 from bioengine.apps.builder import AppBuilder
 from bioengine.apps.manager import AppsManager
 
@@ -178,6 +179,9 @@ class _ClusterStub:
 
     def __init__(self, present_after_delete):
         # one entry per _serve_application_names() call, consumed in order
+        # The LAST entry repeats once the list is exhausted. Returning [] instead would make
+        # an application the arm intends to be permanent quietly vanish, and the arm would
+        # pass for the opposite reason to the one it was written for.
         self.present_after_delete = list(present_after_delete)
         self.deletes = 0
         self.proxy_actor_handle = self
@@ -196,11 +200,32 @@ class _ClusterStub:
             self.deletes += 1
             return None
         if name == "status":
-            names = (
-                self.present_after_delete.pop(0) if self.present_after_delete else []
-            )
+            # The LAST entry REPEATS once the list is exhausted, rather than falling back to
+            # []. Falling back would make an application an arm intends to be permanently
+            # present quietly vanish after a few polls, and the arm would then pass for the
+            # opposite reason to the one it was written for.
+            if len(self.present_after_delete) > 1:
+                names = self.present_after_delete.pop(0)
+            elif self.present_after_delete:
+                names = self.present_after_delete[0]
+            else:
+                names = []
             return _ServeStatus(names)
         raise AssertionError(f"unexpected call {name}")
+
+
+@pytest.fixture(autouse=True)
+def _fast_confirm_window(monkeypatch):
+    """The confirm window sleeps between polls; arms must not pay the real 3s x 5.
+
+    Only the INTERVAL is zeroed. The poll COUNT is left alone, because the number of
+    consecutive absences required is the contract under test and shortening it would make
+    these arms agree with a weaker fix.
+    """
+    if hasattr(manager_mod, "_POST_DELETE_CONFIRM_INTERVAL_SECONDS"):
+        monkeypatch.setattr(
+            manager_mod, "_POST_DELETE_CONFIRM_INTERVAL_SECONDS", 0, raising=False
+        )
 
 
 def _real_or_missing(name: str):
@@ -230,6 +255,7 @@ class _ManagerStub:
     # with a wrong one.
     _serve_application_names = _real_or_missing("_serve_application_names")
     _serve_application_exists = _real_or_missing("_serve_application_exists")
+    _delete_and_confirm_absent = _real_or_missing("_delete_and_confirm_absent")
 
     def __init__(self, cluster, logger):
         self.ray_cluster = cluster
@@ -266,7 +292,7 @@ async def test_an_app_that_reappears_after_a_successful_delete_is_deleted_again(
         APP not in mgr._deployed_applications
     ), "the second delete worked, so the app should not be left tracked"
     assert any(
-        "present in Ray Serve again" in m for m in log.messages("warning")
+        "present in Ray Serve again" in m for m in log.messages("error")
     ), "the reappearance was not reported; it would look like a clean undeploy"
 
 
@@ -417,3 +443,75 @@ def test_the_sweep_tolerates_a_manager_built_without_init() -> None:
         "the cooldown timestamp is read directly, which raises AttributeError on every manager "
         "built without __init__ - that is most of the monitor test suite"
     )
+
+
+# ───────── 5. absence must HOLD, because ray.cancel is a request and not a death ──────────────
+
+
+@pytest.mark.asyncio
+async def test_an_app_recreated_AFTER_the_first_poll_is_still_caught() -> None:
+    """The window, not the sample.
+
+    ``ray.cancel`` requests cancellation; a task already inside ``serve.run`` can run to the end
+    of it. So the first check after a delete can read "absent" for a build that re-creates the
+    application a moment later — in the incident, four seconds later. Checking once would pass
+    that case and drop the app from tracking, which is the orphan.
+
+    Here Serve answers absent, then PRESENT (the late re-creation), then absent from then on.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[[], [APP], [], [], [], [], [], []])
+    mgr = _ManagerStub(cluster, log)
+
+    confirmed = await _real_or_missing("_delete_and_confirm_absent")(
+        mgr, APP, polls=3, interval=0
+    )
+
+    assert confirmed is True
+    assert (
+        cluster.deletes >= 1
+    ), "the late re-creation was never deleted; checking once would have missed it entirely"
+    assert any(
+        "present in Ray Serve again" in m for m in log.messages("error")
+    ), "a re-creation after the first poll was not reported LOUDLY"
+
+
+@pytest.mark.asyncio
+async def test_an_app_that_keeps_coming_back_is_reported_as_NOT_confirmed() -> None:
+    """A build that re-creates it on every look must not be declared gone."""
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[[APP]] * 12)
+
+    class _FailingDelete(_ClusterStub):
+        async def call_with_reconnect(self, fn, *args):
+            if getattr(fn, "__name__", "") == "delete":
+                raise RuntimeError("delete refused")
+            return await _ClusterStub.call_with_reconnect(self, fn, *args)
+
+    failing = _FailingDelete(present_after_delete=[[APP]] * 12)
+    mgr = _ManagerStub(failing, log)
+
+    confirmed = await _real_or_missing("_delete_and_confirm_absent")(
+        mgr, APP, polls=3, interval=0
+    )
+    assert confirmed is False, (
+        "an application Serve still holds was reported as confirmed gone, so the caller drops "
+        "it from tracking and it becomes unstoppable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_delete_confirms_without_deleting_again() -> None:
+    """The silence half: an app that really went stays gone, and costs no extra delete."""
+    log = _Logger()
+    cluster = _ClusterStub(present_after_delete=[[], [], [], [], []])
+    mgr = _ManagerStub(cluster, log)
+
+    confirmed = await _real_or_missing("_delete_and_confirm_absent")(
+        mgr, APP, polls=3, interval=0
+    )
+    assert confirmed is True
+    assert (
+        cluster.deletes == 0
+    ), f"a clean delete issued {cluster.deletes} extra delete(s)"
+    assert not log.messages("error")

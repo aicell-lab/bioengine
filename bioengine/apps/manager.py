@@ -394,6 +394,14 @@ _CONTROLLER_RECOVERY_COOLDOWN_SECONDS = 25.0
 # signal becomes noise an operator filters. Long enough to stay visible, rare enough to read.
 _ORPHAN_REPORT_COOLDOWN_SECONDS = 300.0
 
+# How long absence must HOLD after a delete before the application counts as gone. ray.cancel
+# requests cancellation and does not prove the task is dead, and the measured re-creation landed
+# 4s after the delete reported success, so one sample straight afterwards answers for a build
+# that has not reached serve.run yet. 5 polls x 3s spans 12s of continuous absence, comfortably
+# past that, and only an undeploy pays it.
+_POST_DELETE_CONFIRM_POLLS = 5
+_POST_DELETE_CONFIRM_INTERVAL_SECONDS = 3.0
+
 # How long one monitor tick waits for the controller actor lookup. Measured
 # 0.10-0.12 s against a live head and 27.4 s against an unreachable one, so
 # this is ~100x the healthy case and still far inside the worker's 120 s
@@ -1326,6 +1334,74 @@ class AppsManager:
             )
         return orphans
 
+    async def _delete_and_confirm_absent(
+        self,
+        application_id: str,
+        polls: Optional[int] = None,
+        interval: Optional[float] = None,
+    ) -> bool:
+        """Watch Ray Serve until the application has stayed absent, deleting any reappearance.
+
+        ``ray.cancel`` REQUESTS cancellation; it does not prove the task is dead. A task already
+        inside ``serve.run`` can run to the end of it, so a single check straight after the delete
+        can read "absent" for a build that re-creates the application a moment later. In the
+        incident the re-creation landed four seconds after the delete reported success.
+
+        So absence has to hold across consecutive polls spanning that window rather than be
+        sampled once. Any reappearance is reported LOUDLY and deleted again, and the clock
+        restarts — a build that re-creates the app twice must not pass because the second
+        creation happened to fall between two polls.
+
+        Returns True when the application is confirmed gone, False when it survived the window,
+        in which case the caller keeps it tracked so it stays stoppable.
+        """
+        # Read from the module in the BODY, not as default arguments. A default is evaluated
+        # once at def time, so a test that monkeypatches the module constant would change
+        # nothing and quietly pay the real sleep — which is exactly what happened: the arms
+        # took 79s with the patch supposedly applied.
+        polls = _POST_DELETE_CONFIRM_POLLS if polls is None else polls
+        interval = (
+            _POST_DELETE_CONFIRM_INTERVAL_SECONDS if interval is None else interval
+        )
+
+        # BOUNDED. Without a cap this loop never ends for an application that is present on
+        # every look: `consecutive_absent` only advances on an absence, so a build that keeps
+        # re-creating the app would spin here forever - inside an undeploy, on the worker's
+        # own event loop. Giving up and returning False is the safe answer: the caller then
+        # keeps the app TRACKED, which leaves it visible and stoppable.
+        max_rounds = polls * 4
+        consecutive_absent = 0
+        rounds = 0
+        while consecutive_absent < polls:
+            rounds += 1
+            if rounds > max_rounds:
+                self.logger.error(
+                    f"Application '{application_id}' is still in Ray Serve after "
+                    f"{max_rounds} delete/confirm rounds. Giving up on confirming its "
+                    "removal and keeping it tracked so it stays visible and stoppable."
+                )
+                return False
+            if await self._serve_application_exists(application_id):
+                consecutive_absent = 0
+                self.logger.error(
+                    f"Application '{application_id}' is present in Ray Serve again after a "
+                    "successful delete: an in-flight build re-created it. Deleting it again."
+                )
+                try:
+                    await self.ray_cluster.call_with_reconnect(
+                        serve.delete, application_id
+                    )
+                except Exception as delete_err:
+                    self.logger.error(
+                        f"Re-delete of '{application_id}' failed: {delete_err}"
+                    )
+                    return False
+            else:
+                consecutive_absent += 1
+            if consecutive_absent < polls:
+                await asyncio.sleep(interval)
+        return True
+
     async def _undeploy_application(
         self,
         application_id: str,
@@ -1405,27 +1481,16 @@ class AppsManager:
             #
             # So the delete is VERIFIED rather than assumed, and a reappearance
             # is deleted again.
-            if await self._serve_application_exists(application_id):
-                self.logger.warning(
-                    f"Application '{application_id}' is present in Ray Serve again "
-                    "after a successful delete, which means an in-flight build "
-                    "re-created it. Deleting it a second time."
-                )
-                try:
-                    await self.ray_cluster.call_with_reconnect(
-                        serve.delete, application_id
-                    )
-                except Exception as second_delete_err:
-                    self.logger.error(
-                        f"Second delete of '{application_id}' failed: "
-                        f"{second_delete_err}"
-                    )
-                if await self._serve_application_exists(application_id):
-                    # Still there. Keeping it tracked is the whole point: an
-                    # application Ray Serve holds and this worker does not list
-                    # cannot be seen by get_app_status or stopped by stop_app, so
-                    # it holds its resources with no route to release them.
-                    delete_failed = True
+            #
+            # WATCHED OVER A WINDOW, not polled once. ``ray.cancel`` returning does
+            # not mean the task is dead: it requests cancellation, and a task inside
+            # ``serve.run`` can still reach the end of it. A single poll straight
+            # after the delete therefore answers "absent" for a task that re-creates
+            # the application a second later — which is the exact timing measured in
+            # the incident, where the re-creation landed four seconds after the
+            # delete reported success. The window has to outlast that.
+            if not await self._delete_and_confirm_absent(application_id):
+                delete_failed = True
 
         if delete_failed and application_info is not None:
             # The app is still running in Ray Serve. Leaving it untracked makes it
