@@ -80,14 +80,18 @@ async def test_the_404_does_not_assert_one_of_three_indistinguishable_causes() -
     """
     msg = (await _raise_message(_entry_instance(404))).lower()
     for cause in ("never have been uploaded", "removed", "expired"):
-        assert cause in msg, "the message must offer %r as a possibility: %r" % (cause, msg)
+        assert cause in msg, "the message must offer %r as a possibility: %r" % (
+            cause,
+            msg,
+        )
 
 
 @pytest.mark.asyncio
 async def test_the_404_tells_the_caller_what_to_do() -> None:
     msg = await _raise_message(_entry_instance(404))
     assert "re-request" in msg.lower() and "re-upload" in msg.lower(), (
-        "a message that names three causes and no remedy leaves the caller nowhere: %r" % msg
+        "a message that names three causes and no remedy leaves the caller nowhere: %r"
+        % msg
     )
 
 
