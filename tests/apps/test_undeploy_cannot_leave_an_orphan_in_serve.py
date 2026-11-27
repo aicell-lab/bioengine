@@ -96,12 +96,22 @@ class _FakeRay:
                 super().__init__("task failed")
                 self.cause = cause
 
-    def __init__(self, ref: _Ref, wait_returns_done: bool = True) -> None:
+    def __init__(
+        self,
+        ref: _Ref,
+        wait_returns_done: bool = True,
+        block_wait: bool = False,
+    ) -> None:
         self.ref = ref
         self.cancelled: list[tuple[object, bool]] = []
         self.waits: list[tuple[list, object]] = []
         self.wait_returns_done = wait_returns_done
         self.get_started = asyncio.Event()
+        # `block_wait` parks inside ray.wait so an arm can deliver a SECOND cancellation while
+        # the bounded wait is still open — the window in which the outcome used to be lost.
+        self.block_wait = block_wait
+        self.wait_entered = threading.Event()
+        self.release_wait = threading.Event()
         # Lets the arm release the executor thread when it is done. The thread used to
         # ``time.sleep(30)``, and because the loop's shutdown JOINS its default executor, each
         # such arm added a real 30s to the suite in teardown — paid in full, invisibly, after
@@ -127,6 +137,10 @@ class _FakeRay:
 
     def wait(self, refs, timeout=None):
         self.waits.append((list(refs), timeout))
+        self.wait_entered.set()
+        if self.block_wait:
+            # Backstop timeout, so a mistake in an arm cannot wedge the suite.
+            self.release_wait.wait(timeout=30)
         if self.wait_returns_done:
             return list(refs), []  # the task really ended
         return [], list(refs)  # still running when the bounded wait expired
@@ -184,6 +198,12 @@ class _BuilderStub:
     take_unconfirmed_build_cancellation = _real_builder_or_missing(
         "take_unconfirmed_build_cancellation"
     )
+    # Bound from the real class too: `submit` calls it from a `finally`, so a stub that
+    # lacked it turned a cancelled submit into an AttributeError instead of the ERROR the
+    # arms read.
+    _report_unconfirmed_build_cancellation = _real_builder_or_missing(
+        "_report_unconfirmed_build_cancellation"
+    )
 
     def __init__(self, logger):
         self.logger = logger
@@ -206,12 +226,17 @@ async def _cancel_a_submit_in_flight(monkeypatch, *, wait_returns_done: bool):
     builder = _BuilderStub(log)
 
     task = asyncio.create_task(AppBuilder.submit(builder, _BuiltApp(), APP))
-    await asyncio.wait_for(fake.get_started.wait(), timeout=5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    # Let the executor thread finish instead of leaving the loop's shutdown to join it.
-    fake.release_get.set()
+    try:
+        await asyncio.wait_for(fake.get_started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        # In a `finally`: let the executor thread finish even when the body above RAISED.
+        # Outside one, a failing arm leaves the thread parked on its backstop timeout and the
+        # loop's shutdown joins it — measured, a 29.73s teardown on a 0.03s failure. Suite
+        # cost must not depend on the arms passing.
+        fake.release_get.set()
     return fake, builder, log
 
 
@@ -1090,3 +1115,129 @@ async def test_a_STALE_cancel_record_does_NOT_hold_a_clean_stop() -> None:
     assert (
         not mgr.app_builder._unconfirmed_build_cancellations
     ), "the stale record is still there, so it will decide the next stop too"
+
+
+# ───── 12. the unconfirmed-cancel path, round-3 findings NEW-2 and NEW-1 ─────
+
+
+@pytest.mark.asyncio
+async def test_a_SECOND_stop_during_the_wait_does_not_ERASE_the_unconfirmed_outcome(
+    monkeypatch,
+) -> None:
+    """Round-3 finding NEW-2, and it is reachable BECAUSE of an earlier fix on this branch.
+
+    Keeping the entry listed for the whole teardown (round-2 finding (a)) means ``stop_app``
+    on an id that is already stopping is now ACCEPTED, where it used to raise "not currently
+    deployed". A second undeploy then calls ``deployment_task.cancel()`` again while the
+    builder is parked on its bounded ``ray.wait``.
+
+    ``asyncio.CancelledError`` derives from ``BaseException``, so that second delivery is
+    caught by neither the ``except Exception`` nor any plain statement after the ``try``. The
+    record and the ERROR were both skipped, and the undeploy went on to untrack an application
+    whose build task was still alive — the orphan again, through a door the fix for it opened.
+
+    So the record is written BEFORE the wait and cleared only on a confirmed end, and the
+    ERROR is reported from a ``finally``.
+    """
+    log = _Logger()
+    ref = _Ref()
+    fake = _FakeRay(ref, wait_returns_done=False, block_wait=True)
+    monkeypatch.setattr(builder_mod, "ray", fake)
+    builder = _BuilderStub(log)
+
+    task = asyncio.create_task(AppBuilder.submit(builder, _BuiltApp(), APP))
+    try:
+        await asyncio.wait_for(fake.get_started.wait(), timeout=5)
+        task.cancel()  # stop #1: enters the handler and parks on the bounded wait
+        await asyncio.to_thread(fake.wait_entered.wait, 5)
+        assert fake.wait_entered.is_set(), (
+            "premise failed: the bounded wait was never entered, so this arm is not in the "
+            "window it is about"
+        )
+        task.cancel()  # stop #2, delivered while that wait is still open
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        fake.release_wait.set()
+        fake.release_get.set()
+
+    assert APP in builder._unconfirmed_build_cancellations, (
+        "a second stop arriving during the bounded wait erased the unconfirmed outcome, so "
+        "the undeploy will untrack an application whose build task can still re-create it"
+    )
+    assert any("NOT confirmed finished" in m for m in log.messages("error")), (
+        "the loudest line in this function was skipped by an exception that is not an "
+        f"Exception. errors seen: {log.messages('error')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_after_a_SECOND_stop_the_SWEEP_is_what_reports_a_late_recreation() -> (
+    None
+):
+    """Round-3 finding NEW-1: the kept entry does NOT survive another stop, and that is owned.
+
+    The entry kept for an unconfirmed cancellation makes a re-creation visible — and nothing
+    more. On a second undeploy there is no deployment task left to cancel, so nothing new is
+    recorded and the entry is dropped; the ObjectRef died with the submit frame, so no later
+    code can re-wait that task. Re-waiting it would need a per-id ref registry, which is the
+    design the lead ruled against when choosing this branch over the alternative.
+
+    So this path's remedy is the orphan sweep, and this arm proves the remedy EXISTS rather
+    than asserting the gap. The ERROR text was also corrected: it no longer promises the entry
+    is "stoppable", because that promise invited the very stop that discards it.
+    """
+    log = _Logger()
+    cluster = _ClusterStub(
+        present_after_delete=[[]]
+    )  # deleted, and gone, for both stops
+    mgr = _SweepManager(cluster, log, tracked={APP: {"auto_redeploy": True}})
+
+    async def _cancel_that_cannot_confirm(application_id):
+        mgr.app_builder._unconfirmed_build_cancellations.add(application_id)
+
+    mgr._cancel_deployment_process = _cancel_that_cannot_confirm
+    await _real_or_missing("_undeploy_application")(
+        mgr, application_id=APP, user_id="u"
+    )
+    assert (
+        APP in mgr._deployed_applications
+    ), "premise: an unconfirmed cancellation keeps the entry (the arm above pins this)"
+
+    # The OTHER half of NEW-1: what the ERROR is allowed to promise. Keeping the entry makes a
+    # re-creation visible and nothing more, so promising it is "stoppable" invited the second
+    # stop that discards the tracking — the message talked the reader into the failure.
+    kept_errs = " ".join(log.messages("error"))
+    assert "stoppable" not in kept_errs, (
+        "the message promises the kept entry is stoppable; stopping it again is exactly what "
+        f"drops it, so the promise leads the operator into the hole. message: {kept_errs!r}"
+    )
+    assert "VISIBLE" in kept_errs and "orphan sweep" in kept_errs, (
+        "the message must say what the entry actually buys (visibility) and name what covers "
+        f"a re-creation after another stop (the sweep). message: {kept_errs!r}"
+    )
+
+    async def _nothing_left_to_cancel(application_id):
+        return None
+
+    mgr._cancel_deployment_process = _nothing_left_to_cancel
+    await _real_or_missing("_undeploy_application")(
+        mgr, application_id=APP, user_id="u"
+    )
+    assert mgr._deployed_applications == {}, (
+        "premise: the second stop drops the entry — this arm is about what covers that, not "
+        "about pretending it does not happen"
+    )
+
+    # The wedged build task finally lands: Ray Serve holds the app, the worker lists nothing.
+    cluster.present_after_delete = [[APP]]
+    orphans = await _real_or_missing("get_orphaned_applications")(mgr)
+
+    assert orphans and APP in orphans, (
+        "after the entry is gone, the orphan sweep is the ONLY thing that can attribute a "
+        f"late re-creation, and it reported {orphans!r}. That is this path's remedy; if it "
+        "does not fire, a re-created app holds its GPUs invisibly, which is this row"
+    )
+    assert any(
+        APP in m for m in log.messages("error")
+    ), "the sweep found it but said nothing an operator would see"

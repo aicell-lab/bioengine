@@ -1154,6 +1154,20 @@ class AppBuilder:
                 "in-flight build task so it cannot re-create the application."
             )
             cancelled_cleanly = False
+            # RECORD FIRST, clear only on a CONFIRMED end. The record is the undeploy's only
+            # way to learn this outcome — it cannot read a log line — so it is written in the
+            # fail-safe direction: "not confirmed" until something proves otherwise.
+            #
+            # Writing it after the wait lost it entirely whenever the wait did not return
+            # normally, and there is a reachable way for that to happen now: since the
+            # tracking entry stays listed for the whole teardown, `stop_app` on an id that is
+            # already stopping is ACCEPTED where it used to raise "not currently deployed". A
+            # second undeploy then calls `deployment_task.cancel()` again while this coroutine
+            # is parked on the wait below, and `asyncio.CancelledError` derives from
+            # BaseException, so neither the `except Exception` nor anything after it runs. The
+            # record and the ERROR were both skipped and the app was untracked with its build
+            # task still alive.
+            self._unconfirmed_build_cancellations.add(application_id)
             try:
                 ray.cancel(ref, force=True)
                 # ``ray.cancel`` RETURNING is not the task ENDING. Wait for the ref to
@@ -1170,33 +1184,44 @@ class AppBuilder:
                     ray.wait, [ref], timeout=_BUILD_CANCEL_WAIT_SECONDS
                 )
                 cancelled_cleanly = bool(done)
+                if cancelled_cleanly:
+                    # The ONLY thing that clears the record: positive proof the task ended.
+                    self._unconfirmed_build_cancellations.discard(application_id)
             except Exception as cancel_error:
                 self.logger.warning(
                     f"Could not cancel the build task for '{application_id}': "
                     f"{cancel_error}."
                 )
-            if not cancelled_cleanly:
-                # RECORDED, not just logged. The undeploy that asked for this cancellation is
-                # the only caller that can act on the answer — it decides whether to drop the
-                # tracking entry — and it cannot read a log line. Without this the outcome
-                # stopped here and the undeploy went on to untrack an application whose build
-                # task was still able to re-create it, which is this row's orphan.
-                self._unconfirmed_build_cancellations.add(application_id)
-                # Reported LOUDLY and attributed, never swallowed: this is the state in
-                # which an application can still appear in Ray Serve after the worker
-                # has deleted it and stopped tracking it.
-                self.logger.error(
-                    f"The build task for '{application_id}' was NOT confirmed finished "
-                    f"within {_BUILD_CANCEL_WAIT_SECONDS}s of cancelling it. It may still "
-                    "call serve.run and re-create the application after the undeploy has "
-                    "deleted it, which would leave an application Ray Serve holds and "
-                    "this worker does not list."
-                )
+            finally:
+                # In a `finally`, so an aborted wait still SAYS so. A second cancellation
+                # delivered while the wait is parked unwinds this frame with a BaseException,
+                # and a plain `if` after the try would never run — leaving the quietest
+                # possible version of the loudest thing here.
+                if not cancelled_cleanly:
+                    self._report_unconfirmed_build_cancellation(application_id)
             raise
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc
         self.logger.info(f"Submitted '{application_id}' to Ray Serve")
+
+    def _report_unconfirmed_build_cancellation(self, application_id: str) -> None:
+        """Say LOUDLY that a cancelled build task was never confirmed finished.
+
+        Reported LOUDLY and attributed, never swallowed: this is the state in which an
+        application can still appear in Ray Serve after the worker has deleted it and stopped
+        tracking it.
+
+        A method rather than an inline block only so the caller can reach it from a
+        ``finally`` without repeating it on two paths.
+        """
+        self.logger.error(
+            f"The build task for '{application_id}' was NOT confirmed finished "
+            f"within {_BUILD_CANCEL_WAIT_SECONDS}s of cancelling it. It may still "
+            "call serve.run and re-create the application after the undeploy has "
+            "deleted it, which would leave an application Ray Serve holds and "
+            "this worker does not list."
+        )
 
 
 class BuiltApp:

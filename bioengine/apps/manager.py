@@ -1637,12 +1637,23 @@ class AppsManager:
             # task behind this application was never confirmed finished, and the window cannot
             # outlast a wedged runtime_env install. If that task does reach ``serve.run``, the
             # application comes back; dropping the entry now is precisely what turns that
-            # return into an orphan nothing lists. So the entry stays, and the one API that
-            # could clean it up keeps working.
+            # return into an orphan nothing lists. So the entry stays.
+            #
+            # WHAT THIS MESSAGE MUST NOT SAY is "stoppable". Keeping the entry makes a
+            # re-creation VISIBLE, and that is all. It does not survive another stop: on a
+            # second undeploy there is no deployment task left to cancel, so nothing can
+            # re-wait the build task — the ObjectRef died with the submit frame that held it —
+            # and the entry is dropped. An earlier version of this line promised
+            # stoppability, which actively invited the one action that discards the very
+            # tracking it was keeping. The remedy for a re-creation after that point is the
+            # orphan sweep (`get_orphaned_applications`), which exists for exactly this: a
+            # Serve application this worker does not list. So the message names it.
             not_safely_gone = (
                 "the build task cancelled for it was never confirmed finished, so it may yet "
-                "re-create the application after this delete. Keeping it tracked so that a "
-                "re-creation stays visible and stoppable instead of becoming an orphan"
+                "re-create the application after this delete. Keeping it tracked so such a "
+                "re-creation is VISIBLE here rather than an orphan nobody can attribute. "
+                "Stopping it again drops this entry, after which the orphan sweep is what "
+                "reports a late re-creation"
             )
         else:
             not_safely_gone = None
