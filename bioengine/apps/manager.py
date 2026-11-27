@@ -1234,9 +1234,15 @@ class AppsManager:
             If no deployment task is active, this method does nothing.
             Uses a 60-second timeout for cancellation to complete.
         """
+        # Cancel the RAY task first, and unconditionally: it is the one that can re-create the
+        # application after teardown. `deployment_task.cancel()` below only cancels the coroutine
+        # awaiting it, which leaves the remote task running inside serve.run.
+        self.app_builder.cancel_inflight_build(application_id)
+
         deployment_task = self._deployed_applications[application_id]["deployment_task"]
         if not deployment_task:
-            # No active deployment task to cancel
+            # No active deployment task to cancel -- but the Ray task above may still have been
+            # in flight, which is why that call is not inside this guard.
             return
 
         self.logger.info(
