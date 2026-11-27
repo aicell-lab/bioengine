@@ -235,13 +235,24 @@ def test_h_a_bootstrap_that_fails_before_home_is_set_is_loud_and_then_repaired(
     """
     import bioengine
 
+    # The MODULE OBJECT, not a dotted string. `monkeypatch.setattr("a.b.c", ...)` resolves by
+    # getattr down the path, so it only works if `bioengine._app.replica_init` has already been
+    # imported by something earlier — and `bioengine/_app/__init__.py` does not import it.
+    # Running this file alone, an earlier arm happened to pull it in; running the WHOLE suite,
+    # it did not, and this arm failed with
+    #   AttributeError: module 'bioengine._app' has no attribute 'replica_init'
+    # while passing in every narrower selection. CI runs the whole suite, so the narrow runs
+    # were the misleading ones. Importing it here makes the arm independent of what ran before.
+    import bioengine._app.replica_init as replica_init_module
+
     monkeypatch.setenv("HOME", "/home/ray")
 
     def raises_before_setting_home():
         raise OSError(37, "No locks available")
 
     monkeypatch.setattr(
-        "bioengine._app.replica_init.setup_replica_environment",
+        replica_init_module,
+        "setup_replica_environment",
         raises_before_setting_home,
     )
     # The finder's loud branch: it must name HOME rather than failing silently.
