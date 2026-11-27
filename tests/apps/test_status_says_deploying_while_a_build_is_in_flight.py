@@ -93,7 +93,11 @@ class _Harness:
         m._deployed_applications = {}
         # The field under test. Initialised the way __init__ does, so the arms cannot pass by
         # the attribute merely existing on the instance.
-        m._deploying_application_ids = set()
+        #
+        # A MAPPING, not a set: it is application_id -> the version the caller asked for, so
+        # the status surface can name the version an in-flight update is heading for. The
+        # membership assertions below are unchanged -- `in` reads a dict's keys.
+        m._deploying_application_ids = {}
 
         self.manager = m
         self.in_build = asyncio.Event()
