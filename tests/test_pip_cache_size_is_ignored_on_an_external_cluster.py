@@ -70,7 +70,9 @@ def test_external_cluster_says_the_pip_cache_size_has_no_effect(captured):
     )
     said = hits[0]
     assert ENV_VAR in said, f"the message must name the variable to set: {said!r}"
-    assert "30" in said, f"the message must quote the value that is being ignored: {said!r}"
+    assert (
+        "30" in said
+    ), f"the message must quote the value that is being ignored: {said!r}"
 
 
 def test_the_message_names_where_the_value_must_actually_be_set(captured):
@@ -78,9 +80,9 @@ def test_the_message_names_where_the_value_must_actually_be_set(captured):
     RayCluster(mode="external-cluster", runtime_env_pip_cache_size_gb=30)
     said = next(m for m in _messages(captured) if NO_EFFECT in m)
     assert "pods" in said, f"it must point at the Ray pods: {said!r}"
-    assert "STARTING" in said, (
-        f"it must name the symptom an operator will actually see: {said!r}"
-    )
+    assert (
+        "STARTING" in said
+    ), f"it must name the symptom an operator will actually see: {said!r}"
 
 
 def test_a_bad_value_is_refused_in_external_cluster_mode_too(captured):
@@ -99,8 +101,12 @@ def test_the_warning_is_specific_to_external_cluster(captured, monkeypatch, tmp_
     of the message is asserted, so a construction failure here would surface as an error rather
     than as a vacuous pass.
     """
-    monkeypatch.setattr(RayCluster, "_find_ray_executable", lambda self: "/usr/bin/true")
-    monkeypatch.setattr(RayCluster, "_find_serve_executable", lambda self: "/usr/bin/true")
+    monkeypatch.setattr(
+        RayCluster, "_find_ray_executable", lambda self: "/usr/bin/true"
+    )
+    monkeypatch.setattr(
+        RayCluster, "_find_serve_executable", lambda self: "/usr/bin/true"
+    )
     try:
         # `head_num_cpus` must be positive in this mode, and the class says so by raising. Passing
         # it keeps this arm about the message rather than about an unrelated refusal.
@@ -113,6 +119,6 @@ def test_the_warning_is_specific_to_external_cluster(captured, monkeypatch, tmp_
             f"external-cluster message (that would be a vacuous pass): {type(exc).__name__}: {exc}"
         )
     msgs = _messages(captured)
-    assert not [m for m in msgs if NO_EFFECT in m], (
-        f"single-machine must not claim the parameter has no effect; it does: {msgs!r}"
-    )
+    assert not [
+        m for m in msgs if NO_EFFECT in m
+    ], f"single-machine must not claim the parameter has no effect; it does: {msgs!r}"
