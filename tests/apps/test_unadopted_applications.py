@@ -148,3 +148,33 @@ async def test_the_report_is_rebuilt_each_pass(monkeypatch):
     assert (
         "stray-app" not in mgr._unadopted_applications
     ), "the report is a snapshot of the current pass, not an append-only log"
+
+
+def test_the_report_is_withheld_from_the_anonymous_status_view():
+    """Declaring a field 'knowingly withheld' in a test literal is not a guarantee.
+
+    `unadopted_applications` names Ray Serve applications, and on a shared Ray cluster
+    that includes a SIBLING workspace's apps. `get_status` answers unauthenticated
+    probes, so the anonymous projection must actually drop it — asserted here against
+    the real projection rather than trusted because the field was left off a list.
+    """
+    from bioengine.worker.worker import (
+        PUBLIC_WORKER_STATUS_FIELDS,
+        public_worker_status,
+    )
+
+    full = {
+        "is_ready": True,
+        "admin_users": ["admin@example.invalid"],
+        "unadopted_applications": {"someone-elses-app": "belongs to a sibling worker"},
+    }
+    public = public_worker_status(full)
+
+    assert "unadopted_applications" not in public, (
+        "the anonymous health surface must not enumerate applications, including "
+        "another workspace's"
+    )
+    assert "unadopted_applications" not in PUBLIC_WORKER_STATUS_FIELDS
+    # positive control: the projection does let the public field through, so the
+    # absence above is the projection working and not an empty result.
+    assert public.get("is_ready") is True
