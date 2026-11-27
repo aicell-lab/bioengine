@@ -200,7 +200,7 @@ def region_index(
         )
     want = dict(planes or {})
 
-    # DECISION (#0908 clause 3): a plane named for a SPATIAL or CHANNEL axis, or
+    # DECISION: a plane named for a SPATIAL or CHANNEL axis, or
     # for an axis this layout does not have, is REFUSED -- not ignored.
     #
     # Those axes never reach `_plane_index`: y and x get the crop's slices and a
