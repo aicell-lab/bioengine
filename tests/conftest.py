@@ -311,6 +311,59 @@ def no_leaked_working_directory() -> Generator[None, None, None]:
         )
 
 
+PIP_CACHE_ENV_VAR = "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"
+
+
+@pytest.fixture(autouse=True)
+def restore_pip_cache_size_env() -> Generator[None, None, None]:
+    """Put ``RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB`` back after every test.
+
+    Constructing a ``RayCluster`` in ``single-machine`` or ``slurm`` mode exports this variable
+    into the pytest process, and nothing in the class removes it -- that is the worker applying
+    the cap, which is correct in production and a leak in a test. A construction that passes no
+    size at all exports the module default, so a test need not mention the variable to leak it:
+    ``tests/conftest.py``, ``test_ray_start_argv.py`` and ``test_head_memory_budget.py`` all do.
+
+    Every later test in the session then inherits a cap nobody set. Nothing fails today, which is
+    the problem -- the coupling is invisible, and the next test to depend on this variable would
+    be debugged against the wrong baseline.
+
+    NOT ``monkeypatch.delenv``: deleting a variable that is ABSENT records nothing to undo, so
+    monkeypatch has no teardown to run and whatever is exported afterwards simply stays. The
+    invariant is "unchanged", not "absent" -- a session that legitimately sets the variable must
+    not be disturbed.
+    """
+    before = os.environ.get(PIP_CACHE_ENV_VAR)
+    yield
+    if before is None:
+        os.environ.pop(PIP_CACHE_ENV_VAR, None)
+    else:
+        os.environ[PIP_CACHE_ENV_VAR] = before
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_leaked_pip_cache_size() -> Generator[None, None, None]:
+    """Fail the session if the pip cache size was left changed.
+
+    The per-test fixture above covers a construction inside a test. This covers the paths it
+    cannot see -- a session- or module-scoped fixture that constructs a cluster, which sets the
+    variable once and outlives every function-scoped teardown.
+
+    It is declared beside ``no_leaked_working_directory`` because it is the same kind of defect:
+    silent until something later reads the value, and then charged to whichever test happened to
+    be running, which passes again on its own.
+    """
+    entry = os.environ.get(PIP_CACHE_ENV_VAR)
+    yield
+    final = os.environ.get(PIP_CACHE_ENV_VAR)
+    if final != entry:
+        pytest.fail(
+            f"a test or fixture left {PIP_CACHE_ENV_VAR}={final!r}; the session started with "
+            f"{entry!r}. Constructing a RayCluster in single-machine or slurm mode exports it, "
+            "including when no size is passed (the module default). Restore it where it changes."
+        )
+
+
 @pytest.fixture(scope="session")
 def data_dir(workspace_folder: Path) -> Path:
     """Create and return BioEngine Worker data directory."""
@@ -338,6 +391,7 @@ def workspace_dir() -> Generator[Path, None, None]:
 @pytest.fixture(scope="session")
 def ray_address(worker_mode: str) -> Generator[str, None, None]:
     """Start a Ray cluster a BioEngine Worker can connect to."""
+    pip_cache_before = os.environ.get(PIP_CACHE_ENV_VAR)
     if worker_mode == "external-cluster":
         with tempfile.TemporaryDirectory(prefix=f"bioengine_test_ray_") as temp_dir:
 
@@ -358,6 +412,15 @@ def ray_address(worker_mode: str) -> Generator[str, None, None]:
 
             # Stop the Ray cluster after tests complete
             asyncio.run(ray_cluster.stop())
+
+            # ...and put the pip cache size back. Constructing the cluster above exported it
+            # for the whole session, which the running Ray processes read at startup and no
+            # longer need. Without this, `no_leaked_pip_cache_size` would fail the session on
+            # a legitimate session-scoped export rather than on a defect.
+            if pip_cache_before is None:
+                os.environ.pop(PIP_CACHE_ENV_VAR, None)
+            else:
+                os.environ[PIP_CACHE_ENV_VAR] = pip_cache_before
     else:
         # For single-machine or slurm modes, return no address
         yield None
