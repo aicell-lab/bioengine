@@ -1631,7 +1631,29 @@ class ProxyDeployment:
             # restored only the main service.
             if reuse_connection:
                 try:
-                    await self.server.unregister_service(f"{self.application_id}-rtc")
+                    # notify=False IS THE POINT, and the default is True.
+                    #
+                    # With notify=True hypha_rpc asks the SERVER to unregister
+                    # first and deletes the client-local ``_services`` entry
+                    # only afterwards. This path runs exactly when the probe
+                    # reported "Service not found" — i.e. when the server has
+                    # ALREADY forgotten us — so the server's unregister raises
+                    # KeyError, the local entry survives, and the
+                    # register_rtc_service below raises "already exists" again
+                    # into the warn-only handler. The repair would be a no-op
+                    # in precisely the situation it exists for.
+                    #
+                    # notify=False drops only the client-local entry, which is
+                    # the thing blocking re-registration; register_rtc_service
+                    # then re-notifies the server itself. Measured on a
+                    # throwaway hypha-server across BOTH scenarios — server
+                    # still holding the id, and server having forgotten it —
+                    # and only this form ends with both ids resolving. Found in
+                    # round-2 review: my first attempt measured only the
+                    # scenario where nothing was wrong.
+                    await self.server.unregister_service(
+                        f"{self.application_id}-rtc", notify=False
+                    )
                 except Exception as e:
                     # Nothing to drop is the normal case the first time, and a
                     # failure here only costs us the re-registration below,

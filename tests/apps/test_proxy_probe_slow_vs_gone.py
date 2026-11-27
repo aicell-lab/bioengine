@@ -355,3 +355,15 @@ def test_the_in_place_path_clears_the_rtc_registration_first() -> None:
     assert clear_at < rtc_at, "the -rtc entry must be dropped BEFORE re-registering"
     head = src[:rtc_at]
     assert "if reuse_connection:" in head
+    # AND it must be notify=False. Ordering alone is not enough, and a
+    # source-order check passed on the broken behaviour in round 1: with the
+    # default notify=True, hypha_rpc asks the SERVER first, which in this
+    # path has already forgotten the id, so it raises and the client-local
+    # entry — the thing actually blocking re-registration — survives.
+    # Measured both ways on a throwaway server in repro/rtc_server_forgot.py:
+    # notify=True leaves rtc unresolvable, notify=False leaves both resolving.
+    clear_call = src[clear_at : src.index(")", clear_at) + 1]
+    assert "notify=False" in clear_call, (
+        "the -rtc entry must be dropped CLIENT-LOCALLY (notify=False); the "
+        "server has already forgotten it on this path"
+    )
