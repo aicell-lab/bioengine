@@ -81,6 +81,12 @@ class _Stub:
         return self._runtime
 
 
+async def _done(value):
+    """`_Stub._prepare` is awaited, so a plain lambda has to return a
+    coroutine; this keeps the arms below to one line each."""
+    return value
+
+
 def _data():
     return {
         "patch_shape": [256, 256],
@@ -137,9 +143,9 @@ async def test_a_contended_run_says_the_slot_is_busy_WHILE_it_prepares():
         "while another run held the slot, the status carried no indication of "
         f"contention, so a caller cannot attribute a failure: {seen!r}"
     )
-    assert "another" in str(seen.get("slot_busy_message", "")).lower(), (
-        f"contention is flagged but not explained: {seen!r}"
-    )
+    assert (
+        "another" in str(seen.get("slot_busy_message", "")).lower()
+    ), f"contention is flagged but not explained: {seen!r}"
 
 
 @pytest.mark.asyncio
@@ -153,9 +159,9 @@ async def test_an_UNCONTENDED_run_is_not_flagged():
         return _data()
 
     await _run(_Stub(prepare), FREE)
-    assert seen.get("slot_busy", False) is False, (
-        f"an uncontended run was flagged as waiting for the slot: {seen!r}"
-    )
+    assert (
+        seen.get("slot_busy", False) is False
+    ), f"an uncontended run was flagged as waiting for the slot: {seen!r}"
 
 
 @pytest.mark.asyncio
@@ -176,9 +182,9 @@ async def test_a_FAILURE_while_the_slot_was_busy_says_so_in_the_message():
     assert st["status"] == "FAILED"
     msg = st["message"]
     assert "get_service" in msg, f"the underlying error was discarded: {msg}"
-    assert "slot" in msg.lower() or "another" in msg.lower(), (
-        f"a failure under contention does not mention the busy slot: {msg}"
-    )
+    assert (
+        "slot" in msg.lower() or "another" in msg.lower()
+    ), f"a failure under contention does not mention the busy slot: {msg}"
 
 
 @pytest.mark.asyncio
@@ -249,8 +255,107 @@ async def test_a_contended_run_STILL_reaches_QUEUED_before_it_waits():
         states.append(training.get_status(BUSY).get("status"))
         if "QUEUED" in states:
             break
-    assert "QUEUED" in states, (
-        f"a run waiting for a held slot never reported QUEUED: {sorted(set(states))}"
-    )
+    assert (
+        "QUEUED" in states
+    ), f"a run waiting for a held slot never reported QUEUED: {sorted(set(states))}"
     stub._training_sem.release()
     await asyncio.wait_for(task, timeout=5)
+
+
+# ── the annotation must not be able to cost more than itself ─────────────────
+#
+# The contention write is a LABEL: it carries no outcome, and the run is the
+# thing that matters. Two ways that balance can be got wrong, one arm each.
+#
+# The record lock made both reachable. `write_status` raises
+# `RunRecordLockTimeout` when the mutex cannot be taken and
+# `RunRecordUnreadable` when the file will not parse -- correct for a terminal
+# write, wrong for this one -- and a second writer for the record genuinely
+# exists in the process (`_runs_sync_loop`).
+
+
+@pytest.mark.asyncio
+async def test_a_lost_contention_write_does_not_disturb_the_run(monkeypatch):
+    """THE degraded path. `write_status_best_effort` returns False when the
+    mutex cannot be taken; the run must simply train, unlabelled."""
+    calls = []
+
+    def refuse(session_id, **fields):
+        calls.append(fields)
+        return False  # exactly what a lock timeout yields
+
+    monkeypatch.setattr(training, "write_status_best_effort", refuse)
+
+    runtime = _Runtime()
+    stub = _Stub(lambda _sid: _done(_data()), runtime=runtime)
+    await stub._training_sem.acquire()
+    task = asyncio.create_task(_run(stub, BUSY))
+    await asyncio.sleep(0)
+    stub._training_sem.release()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert calls, "the contention write never happened, so this arm proves nothing"
+    assert runtime.trained == [
+        BUSY
+    ], "a contention write that could not land stopped the run from training"
+
+
+@pytest.mark.asyncio
+async def test_a_RAISING_contention_write_is_still_recorded_as_a_failure(monkeypatch):
+    """THE fence. This arm is about WHERE the write sits, not which function it
+    calls: the write used to sit before `_run_training`'s `try`, so an exception
+    from it escaped with no handler in scope -- no FAILED record, the `finally`
+    skipped, the heartbeat task dangling, the session left in `_training_tasks`,
+    and the run stuck at PREPARING until the quiet-run sweep called it STOPPED.
+    A label must not be able to do that. Whatever the write raises, the run's
+    outcome has to be written somewhere a caller can read it."""
+
+    def boom(session_id, **fields):
+        raise RuntimeError("the record mutex could not be taken")
+
+    monkeypatch.setattr(training, "write_status_best_effort", boom)
+
+    stub = _Stub(lambda _sid: _done(_data()))
+    await stub._training_sem.acquire()
+    # BOUNDED, and not as hygiene. The slot is held and never released here, so
+    # a change that let the run past this write would reach `async with
+    # self._training_sem` and wait for ever -- and a mutant that HANGS is not a
+    # red arm, it is a gate that never reports. Measured: without this bound the
+    # mutation arm that restores the raising write sat in a container for nine
+    # minutes instead of failing in two seconds.
+    # No `pytest.raises`: under the fix `_run_training` CATCHES the write's
+    # exception and records FAILED, so it returns normally. A mutant that hangs
+    # instead trips the bound and the arm goes red, which is the point.
+    await asyncio.wait_for(_run(stub, BUSY), timeout=5)
+
+    st = training.get_status(BUSY)
+    assert st["status"] == "FAILED", (
+        f"the run left no terminal record, so it is indistinguishable from one "
+        f"that is still preparing: {st!r}"
+    )
+    assert st.get("terminated_by") == "entry"
+    assert BUSY not in stub._training_tasks
+
+
+@pytest.mark.asyncio
+async def test_the_contention_note_is_still_true_after_the_run_finishes():
+    """`slot_busy` records the state AT SUBMISSION and is never written back, so
+    whatever it says is still on the record of a COMPLETED run. The live answer
+    to "is it waiting?" is `status`, which reaches QUEUED on its own; a
+    present-tense note here reads as that and contradicts a finished run."""
+    runtime = _Runtime()
+    stub = _Stub(lambda _sid: _done(_data()), runtime=runtime)
+    await stub._training_sem.acquire()
+    task = asyncio.create_task(_run(stub, BUSY))
+    await asyncio.sleep(0)
+    stub._training_sem.release()
+    await asyncio.wait_for(task, timeout=5)
+
+    note = str(training.get_status(BUSY).get("slot_busy_message", ""))
+    assert note, "no contention note was recorded"
+    assert "started" in note, f"the note does not say WHEN the slot was held: {note}"
+    for present_tense in (" is preparing", "will train"):
+        assert present_tense not in note, (
+            f"the note is present-tense, so it still claims {present_tense.strip()!r} "
+            f"on a run that has finished: {note}"
+        )

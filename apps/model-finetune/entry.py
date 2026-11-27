@@ -1781,17 +1781,37 @@ class EntryApp:
         # TRAINING and deliberately exempts QUEUED, so a run marked QUEUED
         # before it prepares would make every stuck preparation immune to the
         # sweep -- and preparation is the phase that does the downloading.
+        #
+        # BEST-EFFORT, AND INSIDE THE TRY, for the reason the heartbeat above
+        # gives in full: `write_status` raises `RunRecordLockTimeout` when the
+        # record mutex cannot be taken and `RunRecordUnreadable` when the file
+        # will not parse, which is right for a write that carries an outcome and
+        # wrong for one that carries a label. Raised where this sits -- before
+        # the `try` -- the exception escaped `_run_training` with no handler in
+        # scope: no FAILED record, the `finally` skipped, the heartbeat task left
+        # dangling and the session in `_training_tasks` for ever, leaving the run
+        # at PREPARING until the quiet-run sweep called it STOPPED. That is the
+        # same unreadable outcome this change exists to remove, reached from the
+        # other side, and it would have fired only on the contended path -- the
+        # one path this is about. A second writer for this record genuinely
+        # exists in the process (`_runs_sync_loop`), so the lock is contendable.
         slot_busy = self._training_sem.locked()
-        if slot_busy:
-            training.write_status(
-                session_id,
-                slot_busy=True,
-                slot_busy_message=(
-                    "another fine-tuning holds the training slot; this run is "
-                    "preparing its data and will train when that one finishes"
-                ),
-            )
         try:
+            if slot_busy:
+                training.write_status_best_effort(
+                    session_id,
+                    slot_busy=True,
+                    # Past tense on purpose: the field records the state AT
+                    # SUBMISSION and is never written back, so it is still on the
+                    # record after the run has trained and completed. The live
+                    # answer to "is it waiting?" is `status`, which reaches
+                    # QUEUED further down; a present-tense sentence here reads as
+                    # that on a finished run and contradicts it.
+                    slot_busy_message=(
+                        "another fine-tuning held the training slot when this run "
+                        "started, so it prepared its data alongside that run"
+                    ),
+                )
             data = await self._prepare_training_data(
                 session_id, train_images, train_labels, val_images, val_labels, params
             )
