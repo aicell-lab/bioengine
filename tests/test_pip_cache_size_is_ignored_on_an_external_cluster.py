@@ -248,12 +248,13 @@ def test_the_value_is_actually_exported_in_a_mode_that_applies_it(
     The real export this triggers is undone by `no_cache_env_leak`, which `self_started` pulls
     in. That fixture restores the pre-test state EXPLICITLY rather than through
     `monkeypatch.delenv`, because deleting an absent variable records nothing to undo and so
-    undoes nothing -- see its docstring, and the arm at the end of this file that proves it.
+    undoes nothing -- see its docstring, and the module-scoped teardown at the end of this file
+    that proves it.
     """
     # NOT a leak detector: `no_cache_env_leak` has just removed the variable, so this cannot
     # fail while that fixture is in place. It is a guard against the fixture being REMOVED or
     # reordered — then a value left behind by an earlier test would make the assertion below pass
-    # reordered. Leak detection is the module-scoped
+    # without this construction having exported anything. Leak detection is the module-scoped
     # `_cache_variable_is_left_as_it_was_found` teardown at the end of the file.
     assert (
         ENV_VAR not in os.environ
