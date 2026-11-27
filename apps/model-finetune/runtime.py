@@ -1012,8 +1012,23 @@ class RuntimeApp:
         """
         if checkpoint is not None or not _generalist_uses_registry(model_type):
             return
+        import base_checkpoint_mirror as bcm
+
         try:
             out = await self.ensure_base_checkpoint(model_type)
+        except bcm.MirrorVerificationError:
+            # THE ONE FAILURE THAT IS NOT BEST-EFFORT, and it must come before
+            # the broad catch below because it would otherwise be swallowed by
+            # it: `MirrorVerificationError` subclasses `RuntimeError`.
+            #
+            # A review caught exactly that. The mirror served bytes that did not
+            # match a digest pinned in this repository, and this method logged
+            # "the load will use whatever is on disk" and returned normally --
+            # turning a refusal into a warning, on the one path where the whole
+            # point is to stop. `ensure_base_checkpoint` raises here rather than
+            # reporting, deliberately, because an unobtainable part is a
+            # REPORT and a part that arrived WRONG must stop everything.
+            raise
         except Exception as exc:  # noqa: BLE001 - see the docstring
             logger.warning(
                 "model-finetune: could not seed the base checkpoint for "

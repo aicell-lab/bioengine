@@ -236,7 +236,56 @@ def test_a_model_the_REGISTRY_has_NO_decoder_for_falls_back_to_AMG(
 # --------------------------------------------------------------------------
 
 
-def test_the_PREDICATE_asks_the_MIRROR_rather_than_a_second_list():
+def test_the_PREDICATE_FOLLOWS_the_MIRROR_when_the_mirror_MOVES(monkeypatch):
+    """The predicate must be DERIVED from the mirror, not a copy of it.
+
+    Comparing the predicate against `parts_for` with the mirror as it is cannot
+    establish that: a hard-coded `("vit_b_lm", "vit_t_lm")` satisfies it exactly,
+    because that pair EQUALS the mirror today. A review made this point and it is
+    right -- the old version of this arm passed against both implementations, so
+    it measured nothing about where the set comes from.
+
+    So the mirror is MOVED and the predicate is required to move with it. Both
+    directions, because one is not enough: a predicate returning True for
+    everything would follow the mirror gaining a type and fail only on the
+    removal, and one returning False for everything the reverse. Together they
+    leave no constant-valued implementation passing.
+
+    Measured against both implementations before being written: the derived one
+    passes, the hard-coded one fails on the first move.
+    """
+    import base_checkpoint_mirror as bcm
+    import runtime
+
+    ADDED = "vit_l_lm"  # a generalist the mirror does NOT hold today
+    REMOVED = "vit_b_lm"  # one it does
+    assert ADDED in runtime.ZOO_MODELS and REMOVED in runtime.ZOO_MODELS
+    assert not bcm.parts_for(ADDED), f"{ADDED} is mirrored now; pick another"
+    assert bcm.parts_for(REMOVED), f"{REMOVED} is not mirrored; pick another"
+
+    patched = dict(bcm.MIRROR_CHECKPOINTS)
+    patched[ADDED] = ("x", "y", 1)
+    patched[f"{ADDED}_decoder"] = ("x", "y", 1)
+    patched.pop(REMOVED, None)
+    patched.pop(f"{REMOVED}_decoder", None)
+    # monkeypatch so the mirror is restored even if an assertion below fails --
+    # a leaked mutation would silently corrupt every later arm in this session.
+    monkeypatch.setattr(bcm, "MIRROR_CHECKPOINTS", patched)
+
+    assert runtime._generalist_uses_registry(ADDED) is True, (
+        "the predicate did not follow the mirror GAINING a type, so it is not "
+        "derived from it"
+    )
+    assert runtime._generalist_uses_registry(REMOVED) is False, (
+        "the predicate did not follow the mirror LOSING a type, so it is not "
+        "derived from it"
+    )
+
+
+def test_the_PREDICATE_agrees_with_the_mirror_AS_IT_IS():
+    """The unmoved check, kept as well -- it is still worth asserting that the
+    predicate is correct today, it just cannot establish WHERE the set comes
+    from. That is the arm above."""
     import base_checkpoint_mirror as bcm
     import runtime
 
@@ -298,17 +347,63 @@ def test_the_SEED_is_a_NO_OP_for_an_unmirrored_type_and_for_a_checkpoint(monkeyp
     assert called == [MIRRORED], called
 
 
-def test_a_SEED_FAILURE_does_not_fail_the_request(monkeypatch):
-    """`ensure_base_checkpoint` reports an unobtainable part; the refusal a
-    caller deserves comes from the admission check, with the part named. A
-    raise here would fail annotation on a site whose cache already holds the
-    weights."""
+def _seed_inst(exc):
+    """A runtime whose `ensure_base_checkpoint` raises *exc*, and nothing else."""
     cls = _runtime_cls()
     inst = object.__new__(cls)
 
-    async def _boom(model_type, **kw):
-        raise RuntimeError("the mirror is unreachable")
+    async def _raise(model_type, **kw):
+        raise exc
 
-    inst.ensure_base_checkpoint = _boom
+    inst.ensure_base_checkpoint = _raise
+    return cls, inst
 
+
+def test_a_TRANSPORT_FAILURE_does_not_fail_the_request():
+    """`ensure_base_checkpoint` reports an unobtainable part; the refusal a
+    caller deserves comes from the admission check, with the part named. A
+    raise here would fail annotation on a site whose cache already holds the
+    weights.
+
+    The exception is a `ConnectionError` ON PURPOSE. An earlier version of this
+    arm raised a plain `RuntimeError`, which is `MirrorVerificationError`'s BASE
+    class -- so it did not merely miss the swallowed-fence defect below, it
+    CODIFIED it: a correct implementation that re-raised the fence error passed
+    this arm unchanged. Using a transport-shaped error means this case and the
+    fence case cannot be satisfied by one exception.
+    """
+    cls, inst = _seed_inst(ConnectionError("uk1s3 refused the connection"))
+    asyncio.run(cls._seed_generalist_base(inst, MIRRORED))  # must not raise
+
+
+def test_a_FENCE_FAILURE_PROPAGATES_rather_than_becoming_a_warning():
+    """The one seeding failure that is NOT best-effort.
+
+    `MirrorVerificationError` means the mirror served bytes that did not match a
+    digest pinned in this repository. `ensure_base_checkpoint` raises for it --
+    rather than reporting it like an unobtainable part -- precisely because it
+    must stop everything. Swallowing it here turned a refusal into a warning
+    reading "the load will use whatever is on disk", on the single path whose
+    whole purpose is to stop, and the load would then proceed on unverified
+    weights.
+
+    It subclasses `RuntimeError`, which is why the broad `except Exception`
+    caught it and why the re-raise has to come FIRST.
+    """
+    import base_checkpoint_mirror as bcm
+
+    cls, inst = _seed_inst(bcm.MirrorVerificationError("sha256 mismatch"))
+    with pytest.raises(bcm.MirrorVerificationError, match="sha256"):
+        asyncio.run(cls._seed_generalist_base(inst, MIRRORED))
+
+
+def test_a_PLAIN_RuntimeError_is_STILL_swallowed_so_the_fence_case_discriminates():
+    """The control that makes the arm above mean something.
+
+    `MirrorVerificationError`'s base class must still be best-effort. If a plain
+    `RuntimeError` propagated too, the fence arm would pass for the wrong reason
+    -- the repair would simply be catching less, not catching the right thing --
+    and the pair would no longer distinguish them.
+    """
+    cls, inst = _seed_inst(RuntimeError("something else went wrong"))
     asyncio.run(cls._seed_generalist_base(inst, MIRRORED))  # must not raise
