@@ -65,12 +65,12 @@ def test_an_aged_out_STAGED_path_names_the_lifetime_and_the_repair():
         _load(_Stub(), "temp/4f0e2a1c-0000-0000-0000-000000000000.png")
     msg = str(err.value)
     assert "about an hour" in msg, f"the lifetime is not given: {msg}"
-    assert "re-staged" in msg or "Stage it again" in msg, (
-        f"the repair is not stated: {msg}"
-    )
-    assert "get_upload_url" in msg, (
-        f"the message does not say which call produced this path: {msg}"
-    )
+    assert (
+        "re-staged" in msg or "Stage it again" in msg
+    ), f"the repair is not stated: {msg}"
+    assert (
+        "get_upload_url" in msg
+    ), f"the message does not say which call produced this path: {msg}"
     # The waiting cases are the ones that hit it, so they are named.
     assert "queued" in msg.lower(), f"the common cause is not named: {msg}"
 

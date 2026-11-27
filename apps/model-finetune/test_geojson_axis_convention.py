@@ -59,9 +59,9 @@ def test_y_increases_DOWNWARD_from_the_top_left():
         f"a polygon at y 2..20 painted rows {rows.min()}..{rows.max()}; y is not "
         f"measured downward from the top"
     )
-    assert cols.min() < 8 and cols.max() < 20, (
-        f"a polygon at x 5..15 painted columns {cols.min()}..{cols.max()}"
-    )
+    assert (
+        cols.min() < 8 and cols.max() < 20
+    ), f"a polygon at x 5..15 painted columns {cols.min()}..{cols.max()}"
 
 
 def test_the_pair_is_x_then_y_so_it_indexes_mask_y_x():
@@ -124,6 +124,6 @@ def test_the_convention_is_stated_where_the_API_is_described():
             f"{name}'s train_labels does not state the axis origin, which is the "
             f"one thing a caller cannot work out: {text}"
         )
-        assert "downward" in text.lower(), (
-            f"{name}'s train_labels does not state the y direction: {text}"
-        )
+        assert (
+            "downward" in text.lower()
+        ), f"{name}'s train_labels does not state the y direction: {text}"
