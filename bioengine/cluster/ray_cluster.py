@@ -35,6 +35,14 @@ from bioengine.utils import (
 )
 
 
+#: Ray's own fallback for a runtime_env plugin cache, in GB. MEASURED rather than taken from
+#: documentation: ``ray/_private/runtime_env/plugin.py`` composes the variable name from the plugin
+#: name and defaults it with ``float(os.environ.get(cache_size_env_var, 10))``, and
+#: ``ray/_private/runtime_env/uri_cache.py`` carries the same 10 GB as
+#: ``DEFAULT_MAX_URI_CACHE_SIZE_BYTES``. Read out of Ray 2.55.1 inside a live worker pod.
+RAY_DEFAULT_PIP_CACHE_SIZE_GB = 10
+
+
 class ProxyHandleAbsentError(RuntimeError):
     """The cached ``proxy_actor_handle`` is ``None``, so there is nothing to call.
 
@@ -332,6 +340,45 @@ class RayCluster:
                         "log_file": log_file,
                         "debug": bool(debug),
                     }
+                )
+        else:
+            # EXTERNAL CLUSTER: this parameter cannot be honoured from here, so say so instead of
+            # accepting a number that does nothing.
+            #
+            # `RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB` is read by the process running Ray's
+            # runtime_env agent. In single-machine and slurm modes that is a Ray this worker
+            # launches, so the export above reaches it. On an external cluster the Ray pods are
+            # KubeRay's and already running before the worker attaches, so the export would land in
+            # the wrong process and the pods keep Ray's built-in default.
+            #
+            # MEASURED on a live external-cluster site: with the variable unset on every Ray pod,
+            # two GPU-backed apps with 5.7-7.9 GB pip environments evicted each other continuously
+            # (21-22 deletes and 29-31 adds per pod in `runtime_env_setup-*.log`), and a deploy sat
+            # in DEPLOYING with its replicas STARTING and no error at all. Ray's fallback is 10 GB,
+            # read out of the code that builds the cache rather than inferred from that behaviour:
+            # `ray/_private/runtime_env/plugin.py` composes the variable name from the plugin name
+            # and defaults it to 10 — `float(os.environ.get(cache_size_env_var, 10))` — which holds
+            # exactly one of those environments.
+            #
+            # A WARNING RATHER THAN A REFUSAL, deliberately. Every external-cluster site running
+            # today has been running with the default, so refusing here would break working
+            # deployments to report a performance fault. What this removes is the silence: the
+            # operator is told the value is not in effect and what has to carry it.
+            if runtime_env_pip_cache_size_gb <= 0:
+                # Validated in every mode: a non-positive size is a caller error whether or not
+                # this mode can apply it, and it used to pass unchecked here.
+                raise ValueError("runtime_env_pip_cache_size_gb must be greater than 0")
+            if runtime_env_pip_cache_size_gb != RAY_DEFAULT_PIP_CACHE_SIZE_GB:
+                self.logger.warning(
+                    f"runtime_env_pip_cache_size_gb={runtime_env_pip_cache_size_gb} has NO EFFECT "
+                    f"in '{mode}' mode: the Ray pods are created by the cluster operator before "
+                    f"this worker attaches, so they keep Ray's default of "
+                    f"{RAY_DEFAULT_PIP_CACHE_SIZE_GB} GB. To raise it, set "
+                    f"RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB="
+                    f"{runtime_env_pip_cache_size_gb} on the Ray head and worker pods (in the "
+                    f"RayCluster spec). Until then, apps whose pip environments together exceed "
+                    f"{RAY_DEFAULT_PIP_CACHE_SIZE_GB} GB will evict each other and may never "
+                    f"finish deploying."
                 )
 
     def __del__(self):
