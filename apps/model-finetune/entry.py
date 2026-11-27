@@ -453,6 +453,16 @@ class _RecognisedRedeposit(Exception):
         self.existing = existing
 
 
+# Exactly what `get_upload_url` and `_put_temp_embedding` write: a `temp/`
+# segment holding a uuid4, then an extension. Anchored to a segment boundary so
+# `datasets/temp/<uuid>.npy` cannot match on the right of a longer path, and
+# requiring the UUID so a foreign `/temp/scan_001.tif` cannot match at all.
+_STAGED_PATH_RE = re.compile(
+    r"(?:^|/)temp/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.[A-Za-z0-9]+$"
+)
+
+
 def _staged_gone_message(source: str, status: int) -> str:
     """What to tell a caller whose staged input is no longer readable.
 
@@ -486,12 +496,21 @@ def _is_staged_source(source: str) -> bool:
     ``https://.../temp/<uuid>.npy?X-Amz-...`` and missed the staged branch
     entirely, getting a message with no lifetime and no remedy.
 
-    The staged marker is the ``temp/`` PATH SEGMENT, wherever it sits. The query
-    string is cut first, so a ``?prefix=temp/`` parameter on an unrelated URL
-    cannot masquerade as one.
+    NOT "has a ``/temp/`` segment" either, which is what this function said first
+    and which was worse than the bug it replaced. ``https://lab.example.org/temp/
+    scan_001.tif`` is somebody else's server, and an artifact path like
+    ``datasets/temp/a.npy`` is not staged at all -- both were being told, on a 403,
+    that their presigned signature had expired and that they should re-stage a file
+    they never staged. A confident wrong diagnosis, which is precisely what the
+    arms in this file's test call out.
+
+    So match WHAT THIS APP MINTS, not a word that happens to appear in a path.
+    Every staged path is written here as ``temp/<uuid4><ext>`` -- see
+    ``get_upload_url`` and ``_put_temp_embedding`` -- so the marker is a ``temp/``
+    segment followed by a UUID. The query string is cut first, so a
+    ``?prefix=temp/...`` parameter cannot masquerade as one either.
     """
-    path = source.split("?", 1)[0]
-    return path.startswith("temp/") or "/temp/" in path
+    return _STAGED_PATH_RE.search(source.split("?", 1)[0]) is not None
 
 
 @bioengine.app(
@@ -2548,9 +2567,8 @@ class EntryApp:
             "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
             "and y increasing DOWNWARD -- the raster convention, not y-up; y-up "
             "polygons rasterise mirrored and train silently on wrong masks. One "
-            "id per polygon PART, so each MultiPolygon part counts separately and an "
-            "interior ring adds none; "
-            "interior rings are ignored). "
+            "id per polygon PART, so each MultiPolygon part counts separately "
+            "and an interior ring adds none). "
             "AIS fine-tuning needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(

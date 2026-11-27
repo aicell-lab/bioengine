@@ -132,9 +132,8 @@ Two things expire, both an hour after you asked for the URL: the **object**,
 which `ttl` schedules for deletion, and the **URL itself**, whose signature has a
 separate `expires_in` defaulting to the same hour. So it is an upload deadline
 *and* a file lifetime — and raising `ttl` alone widens neither in a way a caller
-can use, because the signature still dies on the hour. Measured against the live store: of
-585 objects under `temp/`, 453 were under an hour old and 17 between one and 1.25
-hours, with **none at all** between 1.25 hours and 30 days.
+can use, because the signature still dies on the hour.
+
 
 Two consequences. Staging a dataset by minting many URLs up front and uploading
 them in a long sequential loop spends the window on the loop — the first files

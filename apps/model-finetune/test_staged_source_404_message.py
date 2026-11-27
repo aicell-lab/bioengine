@@ -36,7 +36,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-STAGED = "temp/6f1c0f7a-not-a-real-upload.npy"
+# A real uuid4 shape, because that is what `get_upload_url` writes and what the
+# staged predicate now requires. The earlier fixture was
+# `temp/6f1c0f7a-not-a-real-upload.npy`, which reads as staged to a human and is
+# not the shape the app mints -- so it passed the loose predicate and stopped
+# matching the moment the predicate got specific. A fixture that is not the real
+# shape can only test the code you imagined.
+STAGED = "temp/6f1c0f7a-1111-2222-3333-444455556666.npy"
 
 
 def _entry_instance(status_code: int, payload: bytes = b""):
@@ -184,7 +190,8 @@ async def test_an_unsupported_extension_still_fails_before_any_request() -> None
 # expired signature answers 403, which was not a FileNotFoundError at all.
 
 STAGED_URL = (
-    "https://s3.example.invalid/bucket/ws/temp/6f1c0f7a-not-a-real-upload.npy"
+    "https://s3.example.invalid/bucket/ws/temp/"
+    "6f1c0f7a-1111-2222-3333-444455556666.npy"
     "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=3600"
 )
 PLAIN_URL = "https://data.example.invalid/public/atlas/image.npy?download=1"
@@ -243,18 +250,68 @@ async def test_a_NON_staged_403_is_still_an_access_error() -> None:
     )
 
 
-def test_the_staged_marker_is_a_path_segment_not_a_query_parameter() -> None:
-    """`_is_staged_source` directly, including the way it could be fooled.
+FOREIGN_TEMP_URL = "https://lab.example.org/temp/scan_001.tif"
+ARTIFACT_TEMP_PATH = "datasets/temp/a.npy"
 
-    The query string is cut before the test, so an unrelated URL carrying
-    `?prefix=temp/` is not treated as staged. Without this, widening the check
-    from `startswith` to a substring would have quietly caught those too.
+
+def test_the_staged_marker_is_what_THIS_APP_mints_not_the_word_temp() -> None:
+    """`_is_staged_source` directly, including the ways it has been fooled.
+
+    The first version of this predicate accepted any `/temp/` path segment, which
+    was WORSE than the `startswith` bug it replaced: somebody else's
+    `https://lab.example.org/temp/scan_001.tif`, and an artifact path like
+    `datasets/temp/a.npy`, were both told on a 403 that their presigned signature
+    had expired and that they should re-stage a file they never staged. I had
+    guarded the trick I thought of -- `?prefix=temp/` in a query string -- and not
+    the one a reviewer found.
+
+    So the marker is the shape this app actually writes, `temp/<uuid4><ext>`, and
+    the foreign cases are asserted as NOT staged rather than left to inference.
     """
     import entry
 
-    assert entry._is_staged_source("temp/abc.npy")
+    # what the app mints: a bare path, and the proxy URL form that carries the
+    # workspace in front of the temp/ segment
+    assert entry._is_staged_source("temp/6f1c0f7a-1111-2222-3333-444455556666.npy")
     assert entry._is_staged_source(STAGED_URL)
+    assert entry._is_staged_source(
+        "https://hypha.example.invalid/s3/bucket/ws-1/temp/"
+        "6f1c0f7a-1111-2222-3333-444455556666.png"
+    )
+
+    # not ours, and the UUID is what separates them
+    assert not entry._is_staged_source(FOREIGN_TEMP_URL)
+    assert not entry._is_staged_source(ARTIFACT_TEMP_PATH)
     assert not entry._is_staged_source(PLAIN_URL)
     assert not entry._is_staged_source(
         "https://data.example.invalid/listing?prefix=temp/"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_temp_URL_403_is_NOT_reported_as_an_expired_signature() -> None:
+    """The regression a reviewer found, pinned at the level a caller sees it.
+
+    A 403 from somebody else's server is an access problem. Telling its caller
+    that a presigned signature ran out, and to re-stage, is a confident wrong
+    diagnosis -- and the predicate arm above would not have caught it reaching
+    this path, because the two can be wired together wrongly.
+    """
+    inst = _entry_instance(403)
+    with pytest.raises(Exception) as excinfo:
+        await inst._load_image_from_source(FOREIGN_TEMP_URL)
+    assert not isinstance(excinfo.value, FileNotFoundError), (
+        "a 403 on a foreign /temp/ URL must stay an access error: %r" % excinfo.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_temp_URL_404_gets_the_generic_message() -> None:
+    """And on 404 it must not claim a staging lifetime it knows nothing about."""
+    inst = _entry_instance(404)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await inst._load_image_from_source(FOREIGN_TEMP_URL)
+    msg = str(excinfo.value).lower()
+    assert "re-stage" not in msg and "1 hour" not in msg, (
+        "a foreign /temp/ URL must get the generic message: %r" % msg
     )
