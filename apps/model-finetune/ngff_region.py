@@ -720,6 +720,27 @@ def _length_checked_store_class() -> Any:
         async def delete(self, key: str) -> None:
             raise RegionSourceError("this store is read-only")
 
+        async def set_partial_values(self, key_start_values: Any) -> None:
+            """Refused, like `set` and `delete`, and PRESENT because zarr
+            requires it.
+
+            It is not optional cover for a method nobody calls. zarr 3.0.8
+            declares `set_partial_values` abstract on `zarr.abc.store.Store`, so
+            a subclass without it cannot be INSTANTIATED at all:
+
+                TypeError: Can't instantiate abstract class _LengthCheckedStore
+                           with abstract method set_partial_values
+
+            which this module then reports as `could not open '0' in <url>` --
+            a message that points at the network and not at this class. Measured
+            at zarr 3.0.8, the floor `requirements-entry.txt` declares: 18 of the
+            36 cases in the three region test files failed, i.e. every region
+            read. `supports_partial_writes` already answers False; that property
+            says what the store WOULD do, and says nothing about which methods
+            the ABC demands exist.
+            """
+            raise RegionSourceError("this store is read-only")
+
         def _no_listing(self) -> Any:
             # Listing is NOT supported, and saying so is deliberate: zarr
             # addresses the metadata key and each chunk key directly when opening
