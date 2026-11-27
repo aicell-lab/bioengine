@@ -764,7 +764,7 @@ class AppsManager:
         # build, so acquiring it in get_app_status would block every status call for the
         # length of a deploy. A set membership test runs to completion without awaiting, so
         # an unlocked read cannot observe a half-applied change.
-        self._deploying_application_ids = set()
+        self._deploying_application_ids = {}
 
         # Per-app auto-redeploy backoff state. Keyed by application_id; each
         # entry holds {consecutive_failures, next_attempt_at}. Cleared the
@@ -2185,6 +2185,23 @@ class AppsManager:
             status = application_details.get("status")
             message = application_details.get("message", "")
 
+            # An UPDATE is building while the old version still serves. Serve's status is
+            # TRUE here -- the application really is RUNNING at the old version -- so it is
+            # left alone: reporting DEPLOYING over a serving application would read as "not
+            # serving" and would replace a fact the caller needs with a different one. What
+            # was missing is that an update is in flight at all, so that is added to the
+            # message, naming both versions. Without it a caller whose update RPC timed out
+            # cannot tell a running update from one that never started.
+            if application_id in self._in_flight_deploys():
+                updating_to = self._in_flight_deploys().get(application_id) or "latest"
+                running_now = application_info.get("version") or "unknown"
+                message = (f"{message} " if message else "") + (
+                    f"An update to version {updating_to} is in progress; the running "
+                    f"version is {running_now}. A timeout from deploy_app does not mean "
+                    f"the update failed -- re-read this status rather than calling "
+                    f"deploy_app again."
+                )
+
             deployments = await self._get_deployment_status(
                 application_id=application_id,
                 application_details=application_details,
@@ -2198,6 +2215,19 @@ class AppsManager:
             if application_info["is_deployed"].is_set():
                 status = "UNHEALTHY"
                 message = f"Application '{application_id}' is marked as deployed but not found in Ray Serve status."
+                if application_id in self._in_flight_deploys():
+                    # An update is building and Ray Serve has gone quiet about the old
+                    # application. UNHEALTHY is still the honest status -- the worker does
+                    # believe it is deployed and Serve cannot see it -- but without naming
+                    # the update a caller reads a fault where there is a deployment in
+                    # progress, and this is the one window where the field alone was the
+                    # only hint.
+                    message = (
+                        f"{message} An update to version "
+                        f"{self._in_flight_deploys()[application_id]} is in progress, so "
+                        "this may be the deployment replacing it rather than a fault. A "
+                        "timeout from deploy_app does not mean the update failed."
+                    )
                 self.logger.warning(
                     f"Application '{application_id}' for artifact '{application_info['artifact_id']}' "
                     "is marked as deployed but not found in Ray Serve status."
@@ -2242,6 +2272,21 @@ class AppsManager:
                         "again, which would start a second deployment of the same "
                         "application."
                     )
+            elif application_id in self._in_flight_deploys():
+                # The delete-to-redeploy window of an UPDATE: the old deployment task has
+                # been cancelled and nulled, is_deployed has been cleared, and Ray Serve has
+                # no details yet -- so without this the status would read NOT_STARTED, "has
+                # not been deployed yet", for an application that IS deployed and is being
+                # updated. Never say that about an id this worker is actively building.
+                status = "DEPLOYING"
+                updating_to = self._in_flight_deploys().get(application_id) or "latest"
+                message = (
+                    f"Application '{application_id}' is mid-deployment: an update to "
+                    f"version {updating_to} is being applied and Ray Serve has no status "
+                    f"for it yet. A timeout from deploy_app does not mean the update "
+                    f"failed. Re-read this status rather than calling deploy_app again, "
+                    f"which would start a second deployment of the same application."
+                )
             else:
                 status = "NOT_STARTED"
                 message = f"Application '{application_id}' has not been deployed yet."
@@ -2305,6 +2350,12 @@ class AppsManager:
             "code_verified": code_verified,
             "pinned_version": pinned_version,
             "recovered_app": application_info["recovered_app"],
+            # The version an in-flight deploy is heading for, or None when no deploy for
+            # this application is mid-build. Never None while one IS in flight: a caller
+            # that named no version reads "latest", so this field alone answers "is a
+            # deploy in flight, and what is it heading for". The caller cannot derive it --
+            # `version` above is what is RUNNING, still the old one during an update.
+            "updating_to_version": self._in_flight_deploys().get(application_id),
             "status": status,
             "message": message,
             "deployments": deployments,
@@ -4059,8 +4110,13 @@ class AppsManager:
                 f"to roll forward."
             )
 
-    def _in_flight_deploys(self) -> set:
-        """The ids whose deploy is still inside the build, created on first use.
+    def _in_flight_deploys(self) -> dict:
+        """Mid-build deploys: application_id -> the version the caller asked for.
+
+        A mapping rather than a set because the status surface has to be able to say WHICH
+        version an update is heading for, and the resolved version does not exist until the
+        build finishes. The value is therefore the REQUESTED version, and ``None`` means the
+        caller named none and will get the artifact's latest.
 
         Lazily rather than relied upon from ``__init__``: ``AppsManager`` is also built with
         ``object.__new__`` and partially populated, in tests and on recovery paths that never
@@ -4070,7 +4126,7 @@ class AppsManager:
         """
         ids = getattr(self, "_deploying_application_ids", None)
         if ids is None:
-            ids = set()
+            ids = {}
             self._deploying_application_ids = ids
         return ids
 
@@ -4086,15 +4142,22 @@ class AppsManager:
         """
         marked = []
 
-        def mark(application_id: str) -> None:
-            self._in_flight_deploys().add(application_id)
+        def mark(application_id: str, requested_version: Optional[str]) -> None:
+            # Store "latest" rather than None when the caller named no version. The value is
+            # read back as "the version this deploy is heading for", and None there would be
+            # indistinguishable from "no deploy in flight" -- which is the common case for an
+            # update, since omitting the version is how a caller says "take the newest". No
+            # artifact version is literally "latest", so the sentinel cannot collide with a
+            # real one. The RESOLVED version is not available here: it does not exist until
+            # the build returns.
+            self._in_flight_deploys()[application_id] = requested_version or "latest"
             marked.append(application_id)
 
         try:
             yield mark
         finally:
             for application_id in marked:
-                self._in_flight_deploys().discard(application_id)
+                self._in_flight_deploys().pop(application_id, None)
 
     @schema_method
     async def deploy_app(
@@ -4479,7 +4542,7 @@ class AppsManager:
             # Mark the id as mid-build BEFORE the build starts. This window is the only
             # one in which a caller's deploy_app RPC can time out, and until the
             # registration below the application is tracked nowhere else.
-            mark_deploying(application_id)
+            mark_deploying(application_id, version)
 
             # Build the application first to validate format and catch errors early
             app = await self.app_builder.build(
