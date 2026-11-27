@@ -154,6 +154,10 @@ async def test_run_training_starts_and_cancels_the_heartbeat(monkeypatch) -> Non
 
     class _ColdStart:
         _training_tasks: dict = {}
+        # `_run_training` reads this before it prepares, to record whether
+        # another run already held the training slot. The app sets it in
+        # __init__, so a stub that drives `_run_training` needs one too.
+        _training_sem = asyncio.Semaphore(1)
 
         async def _preparing_heartbeat(self, sid, interval=60.0):
             await _heartbeat_of(self)(sid, interval=0.05)
