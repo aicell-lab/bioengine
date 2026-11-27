@@ -1241,3 +1241,80 @@ async def test_after_a_SECOND_stop_the_SWEEP_is_what_reports_a_late_recreation()
     assert any(
         APP in m for m in log.messages("error")
     ), "the sweep found it but said nothing an operator would see"
+
+
+@pytest.mark.asyncio
+async def test_TWO_CONCURRENT_undeploys_do_not_destroy_each_others_cancel_record(
+    monkeypatch,
+) -> None:
+    """Round-4 NEW-2: the race is in the MANAGER, and only an end-to-end arm can see it.
+
+    My round-3 arm drove ``AppBuilder.submit`` with two raw ``task.cancel()`` calls. That
+    fixed the builder half and passed — while the end-to-end outcome stayed wrong, because the
+    damage is done by the second ``_undeploy_application``, which that arm never ran. Review
+    traced it task by task:
+
+        undeploy #1  take(X) -> False   (its own leading drain, nothing yet recorded)
+        undeploy #2  take(X) -> True    (consumes #1's LIVE pre-wait record, value DISCARDED)
+        undeploy #1  take(X) -> False   (its real read finds nothing -> drops tracking)
+
+    So moving the record earlier is what exposed it to #2's drain. Both stops then conclude
+    the cancellation was confirmed and the application is untracked with its build task alive.
+
+    The fix is that a second teardown of an id already marked ``stopping`` is a no-op, so there
+    is no concurrent drain to lose the record to — and no second ``serve.delete`` either.
+
+    Everything real here except Ray: the shipped ``_undeploy_application``,
+    ``_cancel_deployment_process`` and ``AppBuilder.submit``.
+    """
+    log = _Logger()
+    ref = _Ref()
+    fake = _FakeRay(ref, wait_returns_done=False, block_wait=True)
+    monkeypatch.setattr(builder_mod, "ray", fake)
+    builder = _BuilderStub(log)
+
+    submit_task = asyncio.create_task(AppBuilder.submit(builder, _BuiltApp(), APP))
+    try:
+        await asyncio.wait_for(fake.get_started.wait(), timeout=5)
+
+        cluster = _ClusterStub(present_after_delete=[[]])
+        mgr = _ManagerStub(cluster, log)
+        mgr.app_builder = builder
+        mgr._deployed_applications = {
+            APP: {"auto_redeploy": True, "deployment_task": submit_task}
+        }
+        real_cancel = _real_or_missing("_cancel_deployment_process")
+        mgr._cancel_deployment_process = lambda application_id: real_cancel(
+            mgr, application_id=application_id
+        )
+        undeploy = _real_or_missing("_undeploy_application")
+
+        first = asyncio.create_task(undeploy(mgr, application_id=APP, user_id="u"))
+        # Wait until #1's cancellation has driven the builder INTO the bounded wait. #1 is now
+        # parked in _cancel_deployment_process until that wait returns: the exact window.
+        await asyncio.to_thread(fake.wait_entered.wait, 5)
+        assert fake.wait_entered.is_set(), (
+            "premise failed: the builder never reached the bounded wait, so there is no "
+            "window for a second stop to land in"
+        )
+
+        second = asyncio.create_task(undeploy(mgr, application_id=APP, user_id="u"))
+        await asyncio.sleep(0)  # let #2 run far enough to do whatever it is going to do
+        fake.release_wait.set()  # ...and only then let #1's wait finish
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=30)
+    finally:
+        fake.release_wait.set()
+        fake.release_get.set()
+
+    assert APP in mgr._deployed_applications, (
+        "a second concurrent stop consumed the first one's record of an unconfirmed build "
+        "cancellation, so both concluded the task was dead and the application is untracked "
+        "while a task that can re-create it is still alive"
+    )
+    assert cluster.deletes == 1, (
+        f"serve.delete was issued {cluster.deletes} times for one application; the second "
+        "teardown should have been a no-op"
+    )
+    assert any(
+        "already being undeployed" in m for m in log.messages("info")
+    ), f"the second stop was not reported as a no-op. info: {log.messages('info')}"

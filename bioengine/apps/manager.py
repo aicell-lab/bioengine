@@ -1528,6 +1528,38 @@ class AppsManager:
         self.logger.info(
             f"User '{user_id}' is starting undeployment of application '{application_id}'..."
         )
+
+        # ONE teardown per application at a time. A second undeploy that arrives while this
+        # one is in flight is a NO-OP, not a second teardown.
+        #
+        # This became reachable through an earlier fix on this branch: keeping the entry listed
+        # for the whole teardown means `stop_app` on a stopping id passes its guard, where
+        # before it raised "not currently deployed" because the entry had been popped. Two
+        # concurrent undeploys then did real damage to each other — not merely duplicated work:
+        #
+        #   * undeploy #2's leading drain below CONSUMED undeploy #1's live record of an
+        #     unconfirmed build cancellation, and threw the value away. Both then read an empty
+        #     record, both concluded the cancel was confirmed, and the application was
+        #     untracked with its build task still able to re-create it. Measured by review,
+        #     task by task, and it is this row's own orphan once more.
+        #   * #2 also calls `deployment_task.cancel()` again, delivering a second
+        #     CancelledError into the builder while it waits, and issues a second
+        #     `serve.delete` for an application already being deleted.
+        #
+        # The marker is set BEFORE the cancellation, not after. The cancel awaits the
+        # deployment task — measured at up to 60s — and a marker set afterwards leaves exactly
+        # that window unguarded, which is the window the race lives in.
+        application_info = self._deployed_applications.get(application_id)
+        if application_info is not None and application_info.get("stopping"):
+            self.logger.info(
+                f"Application '{application_id}' is already being undeployed, so this request "
+                "is a no-op. The teardown already in flight owns it."
+            )
+            return
+        if application_info is not None:
+            application_info["auto_redeploy"] = False
+            application_info["stopping"] = True
+
         # Clear any record left behind by an EARLIER cancellation of this id before asking
         # about this one. ``_cancel_deployment_process`` is also called on the update path,
         # which has no reason to act on the answer — an update re-creates the application in
@@ -1535,6 +1567,9 @@ class AppsManager:
         # the record would outlive its cause, and this stop would then read somebody else's
         # hazard and refuse to drop a tracking entry it should drop. Draining first makes what
         # is read below describe THIS teardown and nothing else.
+        #
+        # Safe to drain here ONLY because of the guard above: the record this consumes can no
+        # longer belong to a concurrent teardown of the same id, since there cannot be one.
         self.app_builder.take_unconfirmed_build_cancellation(application_id)
         await self._cancel_deployment_process(application_id=application_id)
         # Did that cancellation actually finish the build task? ``ray.cancel`` is a request,
@@ -1547,7 +1582,8 @@ class AppsManager:
             application_id
         )
 
-        # KEEP the tracking entry for the duration of the teardown, marked `stopping`.
+        # The tracking entry is KEPT for the duration of the teardown, marked `stopping` —
+        # done above, before the cancellation, so the guard covers the cancel window too.
         #
         # It used to be POPPED here, to stop a monitor tick re-adopting the app mid-stop and
         # redeploying it. That hazard is real, but popping is a heavier instrument than it
@@ -1562,10 +1598,6 @@ class AppsManager:
         # after it. For that whole period an application that is still running answered
         # "not here" to every API a caller has, which is this row's complaint in miniature,
         # produced by the stop itself.
-        application_info = self._deployed_applications.get(application_id)
-        if application_info is not None:
-            application_info["auto_redeploy"] = False
-            application_info["stopping"] = True
         self._redeploy_backoff.pop(application_id, None)
         self._missing_from_status.pop(application_id, None)
         self._deleted_pending_redeploy.discard(application_id)
