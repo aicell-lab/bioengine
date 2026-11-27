@@ -123,14 +123,16 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
   **micro-sam only** — cpsam has no encoder embedding or ONNX prompt decoder.
 - **`get_upload_url(file_type)`** Presigned S3 PUT URL for staging an input image
   (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`). **The one-hour
-  figure is the staged FILE's lifetime, not an upload deadline** — the file is
-  deleted about an hour after this call returns. See "Staged files" below.
+  figure covers BOTH the staged file and the URL** — the file is deleted about an
+  hour after this call returns, and the presigned signature expires on the same
+  clock. See "Staged files" below.
 
 **Staged files live about an hour, and the clock starts at `get_upload_url`.**
-The `ttl` that call passes to the storage service is not only a signature
-lifetime: the service schedules the object's **deletion** when the URL is minted.
-So a staged `file_path` stops existing roughly an hour after you asked for the
-URL, however long you then took to upload. Measured against the live store: of
+Two things expire, both an hour after you asked for the URL: the **object**,
+which `ttl` schedules for deletion, and the **URL itself**, whose signature has a
+separate `expires_in` defaulting to the same hour. So it is an upload deadline
+*and* a file lifetime — and raising `ttl` alone widens neither in a way a caller
+can use, because the signature still dies on the hour. Measured against the live store: of
 585 objects under `temp/`, 453 were under an hour old and 17 between one and 1.25
 hours, with **none at all** between 1.25 hours and 30 days.
 
@@ -204,11 +206,11 @@ launch instead of OOMing mid-train.
   `.geojson` FeatureCollection of polygons (rasterized to instances). Polygon
   coordinates are **image pixels in `(x, y)` order, origin at the top-left pixel
   and y increasing downward** — the raster convention, not y-up. One instance per
-  polygon **ring**, numbered from 1 in document order: a `Polygon` is one
-  instance, and **each part of a `MultiPolygon` is its own**, so the instance
-  count is per ring and not per feature. Interior rings (holes) are ignored — a
-  ring drawn inside a polygon is filled with the outer polygon's id, not cut out
-  of it. A
+  polygon **part**, numbered from 1 in document order: a `Polygon` is one
+  instance, and **each part of a `MultiPolygon` is its own**, so the count is per
+  part and not per feature. Only the outer ring of each part is drawn, so an
+  interior ring (a hole) **adds no instance**: it is filled with the outer id
+  rather than cut out, and a holed polygon is one instance, not two. A
   FeatureCollection that carries polygons but rasterizes to nothing is rejected
   rather than trained on; a **y-up** one is not, because it rasterizes mirrored
   with every polygon still inside the image, so nothing raises and the run trains

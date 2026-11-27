@@ -173,3 +173,88 @@ async def test_an_unsupported_extension_still_fails_before_any_request() -> None
     """
     with pytest.raises(ValueError, match="Unsupported file extension"):
         await _entry_instance(404)._load_image_from_source("temp/x.bmp")
+
+
+# --- the case the row is actually about -------------------------------------
+# `preflight_training_dataset(stage=True)` hands back presigned DOWNLOAD URLs,
+# not `temp/` paths, and the README tells callers to feed those to
+# `start_training`. A guard keyed on `startswith("temp/")` therefore missed the
+# one scenario this work exists for -- a dataset prepared and then left to wait --
+# and answered it with a message carrying no lifetime and no remedy. Worse, an
+# expired signature answers 403, which was not a FileNotFoundError at all.
+
+STAGED_URL = (
+    "https://s3.example.invalid/bucket/ws/temp/6f1c0f7a-not-a-real-upload.npy"
+    "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=3600"
+)
+PLAIN_URL = "https://data.example.invalid/public/atlas/image.npy?download=1"
+
+
+@pytest.mark.asyncio
+async def test_a_staged_DOWNLOAD_URL_gets_the_staging_message_on_404() -> None:
+    """The prepared-then-queued case, which arrives as a URL and not a path."""
+    inst = _entry_instance(404)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await inst._load_image_from_source(STAGED_URL)
+    msg = str(excinfo.value).lower()
+    assert "1 hour" in msg and "re-stage" in msg, (
+        "a staged path inside a presigned URL must get the lifetime and the "
+        "remedy, not the generic message: %r" % msg
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_expired_signature_403_is_a_FileNotFoundError_not_an_http_error() -> (
+    None
+):
+    """403 is what a dead presigned signature returns, and it must land here.
+
+    `_http_retry` retries 403 and then returns it, so before this the call fell
+    through to `raise_for_status()` and surfaced an `httpx.HTTPStatusError` --
+    a different exception type, with no staging wording, for the most likely
+    staging failure there is.
+    """
+    inst = _entry_instance(403)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await inst._load_image_from_source(STAGED_URL)
+    msg = str(excinfo.value).lower()
+    assert "403" in msg and "signature" in msg, (
+        "the 403 message must say the signature ran out, so a caller does not "
+        "go hunting for a permissions change: %r" % msg
+    )
+    assert "re-stage" in msg, msg
+
+
+@pytest.mark.asyncio
+async def test_a_NON_staged_403_is_still_an_access_error() -> None:
+    """CONTROL, and the reason the 403 branch is guarded rather than universal.
+
+    A 403 on somebody else's URL is an access problem. Reporting it as a missing
+    staged file would be a confident wrong diagnosis, and it would make the arm
+    above pass for the wrong reason -- so this asserts the opposite outcome on
+    the same status code.
+    """
+    inst = _entry_instance(403)
+    with pytest.raises(Exception) as excinfo:
+        await inst._load_image_from_source(PLAIN_URL)
+    assert not isinstance(excinfo.value, FileNotFoundError), (
+        "a non-staged 403 must not be reported as a missing staged file: %r"
+        % excinfo.value
+    )
+
+
+def test_the_staged_marker_is_a_path_segment_not_a_query_parameter() -> None:
+    """`_is_staged_source` directly, including the way it could be fooled.
+
+    The query string is cut before the test, so an unrelated URL carrying
+    `?prefix=temp/` is not treated as staged. Without this, widening the check
+    from `startswith` to a substring would have quietly caught those too.
+    """
+    import entry
+
+    assert entry._is_staged_source("temp/abc.npy")
+    assert entry._is_staged_source(STAGED_URL)
+    assert not entry._is_staged_source(PLAIN_URL)
+    assert not entry._is_staged_source(
+        "https://data.example.invalid/listing?prefix=temp/"
+    )

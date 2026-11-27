@@ -91,7 +91,7 @@ def test_geojson_instance_ids_start_at_one_in_document_order() -> None:
 
 
 def test_each_multipolygon_part_gets_its_own_instance_id() -> None:
-    """One id per POLYGON RING, not one per feature -- the docstring said feature.
+    """One id per POLYGON PART, not one per feature and not one per ring.
 
     `rasterize_geojson` increments `instance_id` inside the loop over a
     MultiPolygon's parts, so a single two-part feature yields two instances. The
@@ -121,7 +121,7 @@ def test_each_multipolygon_part_gets_its_own_instance_id() -> None:
     ids = sorted(int(v) for v in np.unique(mask) if v != 0)
     assert ids == [1, 2], (
         f"one feature with two MultiPolygon parts produced ids {ids}; the parts "
-        f"are numbered separately, so the count a caller sees is per ring"
+        f"are numbered separately, so the count a caller sees is per part"
     )
     assert int(mask[5, 5]) == 1 and int(mask[25, 25]) == 2
 

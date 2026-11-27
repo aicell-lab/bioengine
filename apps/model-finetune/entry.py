@@ -453,6 +453,47 @@ class _RecognisedRedeposit(Exception):
         self.existing = existing
 
 
+def _staged_gone_message(source: str, status: int) -> str:
+    """What to tell a caller whose staged input is no longer readable.
+
+    One place, because the same sentence has to serve a 404 (the object was
+    deleted) and a 403 (its presigned signature expired). Both run on the same
+    one-hour clock from the mint, both have the same remedy, and a caller cannot
+    act on the difference between them.
+    """
+    return (
+        f"Staged source '{source}' could not be read (HTTP {status}) and is most "
+        f"likely gone. A file staged with `get_upload_url` lasts about 1 hour from "
+        f"the moment that URL was MINTED, not from when the upload finished -- and "
+        f"the presigned URL itself expires on the same clock, so an HTTP 403 here "
+        f"means the signature ran out rather than the permissions changing. "
+        f"Anything that stages and then waits -- a run queued behind another one, a "
+        f"second pass after a long training, or a dataset prepared by "
+        f"`preflight_training_dataset` and submitted later -- must re-stage first. "
+        f"A path that was never uploaded, or a typo, answers with the same 404. "
+        f"Re-request an upload URL, re-upload, and submit promptly."
+    )
+
+
+def _is_staged_source(source: str) -> bool:
+    """Is this a file staged through ``get_upload_url``?
+
+    NOT ``startswith("temp/")``. That tested the shape I pictured rather than the
+    thing: ``preflight_training_dataset(stage=True)`` re-stages the prepared arrays
+    and hands back presigned DOWNLOAD URLs, not ``temp/`` paths -- and the README
+    tells callers to feed exactly those to ``start_training``. So the one case this
+    row is about, a dataset prepared and then left to wait, arrived as
+    ``https://.../temp/<uuid>.npy?X-Amz-...`` and missed the staged branch
+    entirely, getting a message with no lifetime and no remedy.
+
+    The staged marker is the ``temp/`` PATH SEGMENT, wherever it sits. The query
+    string is cut first, so a ``?prefix=temp/`` parameter on an unrelated URL
+    cannot masquerade as one.
+    """
+    path = source.split("?", 1)[0]
+    return path.startswith("temp/") or "/temp/" in path
+
+
 @bioengine.app(
     num_cpus=1,
     memory_mb=4 * 1024,
@@ -1099,21 +1140,29 @@ class EntryApp:
     ) -> Dict[str, str]:
         """Presigned S3 PUT URL for staging an input image or embedding.
 
-        THE HOUR IS THE FILE'S LIFETIME, AND IT STARTS HERE -- not when the PUT
-        lands. ``ttl`` below is not only a signature lifetime: the storage service
-        schedules the object's DELETION when the URL is minted, so a file staged
-        through this call stops existing about an hour after *this call*, however
-        long the caller then took to upload it.
+        TWO THINGS EXPIRE AN HOUR AFTER THIS CALL, and the clock starts HERE
+        rather than when the PUT lands:
 
-        That distinction is the one that costs time. Staging a dataset by minting
-        many URLs up front and uploading them in a long sequential loop spends the
-        window on the loop: the files staged first are already near the end of
-        their life when the last one lands. Mint each URL next to its own upload,
-        and anything that stages and then WAITS -- a run queued behind another, a
-        second evaluation pass after a long training -- must re-stage first.
+        * the OBJECT. ``ttl`` below is the storage service's deletion schedule --
+          it arranges for the staged file to be removed about an hour later.
+        * the URL. The signature has its own lifetime, ``expires_in``, which this
+          call does not pass and which defaults to the same hour. So the handout
+          is also an upload deadline.
 
-        The lifetime is ``ttl`` on the line below, in this repository: raising it
-        raises the window, at the cost of holding the staged bytes longer.
+        An earlier version of this docstring said ``ttl`` was "not only a
+        signature lifetime" and that raising it "raises the window". Both were
+        wrong: ``ttl`` is ONLY the deletion schedule, and raising it alone widens
+        nothing a caller can use, because the signature still dies on the hour.
+        Widening the real window means raising ``expires_in`` as well -- on
+        ``get_file`` too, since ``preflight_training_dataset`` hands back download
+        URLs minted with its default.
+
+        The distinction is what costs time. Staging a dataset by minting many URLs
+        up front and uploading them in a long sequential loop spends the window on
+        the loop: the files staged first are near the end of their life when the
+        last one lands. Mint each URL next to its own upload, and anything that
+        stages and then WAITS -- a run queued behind another, a second evaluation
+        pass after a long training -- must re-stage first.
         """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
@@ -1223,29 +1272,29 @@ class EntryApp:
             else (await self._get_download_url(source))
         )
         resp = await self._http_retry("GET", url)
+        # A STAGED SOURCE IS ANSWERED ON 403 AS WELL AS 404, and both get the
+        # lifetime and the repair. Two things expire on the same clock, an hour
+        # after `get_upload_url` minted the URL: the storage service schedules the
+        # object's deletion (`ttl`), and the presigned signature itself runs out
+        # (`expires_in`, which defaults to the same hour). A dead object answers
+        # 404; a dead signature answers 403, and `_http_retry` retries 403 and
+        # hands it back, so `raise_for_status()` below used to turn the single most
+        # likely staging failure into an `HTTPStatusError` that was not even a
+        # `FileNotFoundError`.
+        #
+        # Measured against the live store: of 585 objects under `temp/`, 453 were
+        # under an hour old, 17 between one and 1.25 hours, and NONE between 1.25
+        # hours and 30 days -- an app staging hundreds an hour cannot leave that
+        # range empty unless they are removed.
+        #
+        # A 403 on a NON-staged source keeps its old behaviour deliberately: that
+        # is an access problem, not a lifetime one, and must not be dressed up as a
+        # missing file.
+        if resp.status_code in (403, 404) and _is_staged_source(source):
+            raise FileNotFoundError(_staged_gone_message(source, resp.status_code))
         if resp.status_code == 404:
-            # A staged path gets the lifetime and the repair, because the single
-            # most likely cause here is that the file has been deleted: the
-            # storage service schedules deletion when `get_upload_url` mints the
-            # URL, about an hour ahead, so the clock runs from the MINT and not
-            # from the upload. Measured against the live store: of 585 objects
-            # under `temp/`, 453 were under an hour old, 17 between one and 1.25
-            # hours, and NONE between 1.25 hours and 30 days -- an app staging
-            # hundreds an hour cannot leave that range empty unless they are
-            # removed. A typo and a never-written path answer identically, so
-            # those stay in the message; what the message must not do is leave a
-            # caller who waited believing their inputs are still there.
-            if source.startswith("temp/"):
-                raise FileNotFoundError(
-                    f"Staged source '{source}' could not be read (HTTP 404) and has "
-                    f"most likely been deleted: a file staged with `get_upload_url` "
-                    f"lives about 1 hour from the moment that URL was MINTED, not "
-                    f"from when the upload finished. So anything that stages and "
-                    f"then waits -- a run queued behind another one, a second pass "
-                    f"after a long training -- must re-stage first. A path that was "
-                    f"never uploaded, or a typo, answers with the same 404. "
-                    f"Re-request an upload URL, re-upload, and submit promptly."
-                )
+            # A typo and a never-written path answer identically here, so the
+            # message offers both rather than asserting one.
             raise FileNotFoundError(
                 f"Source '{source}' could not be read (HTTP 404). It may never have "
                 f"been uploaded, may have been removed, or may be a mistyped path -- "
@@ -2499,7 +2548,8 @@ class EntryApp:
             "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
             "and y increasing DOWNWARD -- the raster convention, not y-up; y-up "
             "polygons rasterise mirrored and train silently on wrong masks. One "
-            "id per polygon RING, so each MultiPolygon part counts separately; "
+            "id per polygon PART, so each MultiPolygon part counts separately and an "
+            "interior ring adds none; "
             "interior rings are ignored). "
             "AIS fine-tuning needs DENSE labels — annotate all objects per image.",
         ),
@@ -2510,7 +2560,7 @@ class EntryApp:
             None,
             description="Validation labels; same forms as train_labels, including "
             "a .geojson FeatureCollection read under the same convention "
-            "((x, y), origin top-left, y downward, one id per ring).",
+            "((x, y), origin top-left, y downward, one id per polygon part).",
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
@@ -2827,7 +2877,7 @@ class EntryApp:
             "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
             "coordinates are image pixels (x, y), origin TOP-LEFT and y "
             "increasing DOWNWARD -- the raster convention; y-up polygons "
-            "rasterise mirrored. One id per polygon RING, so each MultiPolygon "
+            "rasterise mirrored. One id per polygon PART, so each MultiPolygon "
             "part counts separately; interior rings are ignored).",
         ),
         val_images: Optional[List[str]] = Field(
@@ -2837,7 +2887,8 @@ class EntryApp:
             None,
             description="Optional validation label sources, paired with val_images; "
             "same forms as train_labels, .geojson included and read under the same "
-            "convention ((x, y), origin top-left, y downward, one id per ring).",
+            "convention ((x, y), origin top-left, y downward, one id per "
+            "polygon part).",
         ),
         enable_clahe: bool = Field(
             False,
