@@ -1080,30 +1080,67 @@ class AppBuilder:
         # module top-level imports ``hypha_rpc`` crashes the unpickle.
         # Sanitising dict args to primitives here keeps the
         # worker↔cluster RPC contract pure-data and cluster-env-agnostic.
+        # The ObjectRef is held in a NAME rather than inlined into ``ray.get``,
+        # because cancelling the caller has to be able to reach the Ray task.
+        # ``.remote(...)`` submits it immediately and ``asyncio.to_thread`` only
+        # WAITS for it, so cancelling this coroutine stops the wait and leaves
+        # the task running on the cluster — where it finishes by calling
+        # ``serve.run`` and re-creating the application.
+        #
+        # That is not hypothetical. Measured on a Kubernetes site: an operator
+        # undeployed an app whose build was in flight, the worker logged
+        # "Deployment task ... was cancelled", deleted the Serve application
+        # ("Deleted Ray Serve application ... in 0.03 seconds") and cleared its
+        # own tracking — and four seconds later this task reconnected and
+        # registered its replicas. Ray Serve then held an application the
+        # worker did not list, pinning 2 GPUs that nothing could attribute or
+        # free, because every tool that could have freed it works from the
+        # worker's list.
+        ref = ray.remote(
+            # max_calls=1: same reason as the introspect task — a fresh
+            # process guarantees the deployment class is imported from the
+            # refreshed source, not a stale sys.modules entry cached on a
+            # reused worker (the class is cloudpickled by value to the
+            # replicas, so the build worker's import is what they run).
+            num_cpus=0,
+            max_calls=1,
+            runtime_env=built_app.runtime_env,
+        )(build_and_run_application).remote(
+            _ensure_jsonable(built_app.spec),
+            _ensure_jsonable(built_app.translated_kwargs),
+            _ensure_jsonable(built_app.proxy_args),
+            application_id,
+            f"/{application_id}",
+            built_app.bioengine_uri,
+            built_app.proxy_pip,
+            built_app.user_replica_framework_pip,
+            _ensure_jsonable(built_app.replica_env_vars),
+            built_app.proxy_memory_in_gb,
+            _ensure_jsonable(built_app.scaling),
+        )
         try:
-            await asyncio.to_thread(
-                ray.get,
-                # max_calls=1: same reason as the introspect task — a fresh
-                # process guarantees the deployment class is imported from the
-                # refreshed source, not a stale sys.modules entry cached on a
-                # reused worker (the class is cloudpickled by value to the
-                # replicas, so the build worker's import is what they run).
-                ray.remote(num_cpus=0, max_calls=1, runtime_env=built_app.runtime_env)(
-                    build_and_run_application
-                ).remote(
-                    _ensure_jsonable(built_app.spec),
-                    _ensure_jsonable(built_app.translated_kwargs),
-                    _ensure_jsonable(built_app.proxy_args),
-                    application_id,
-                    f"/{application_id}",
-                    built_app.bioengine_uri,
-                    built_app.proxy_pip,
-                    built_app.user_replica_framework_pip,
-                    _ensure_jsonable(built_app.replica_env_vars),
-                    built_app.proxy_memory_in_gb,
-                    _ensure_jsonable(built_app.scaling),
-                ),
+            await asyncio.to_thread(ray.get, ref)
+        except asyncio.CancelledError:
+            # force=True kills the worker process running the task. A plain
+            # cancel only interrupts between lines of Python, and this task
+            # spends its time inside ``serve.run``, so the gentler form can
+            # return while the application is already being created.
+            self.logger.info(
+                f"Deployment of '{application_id}' was cancelled; cancelling the "
+                "in-flight build task so it cannot re-create the application."
             )
+            try:
+                ray.cancel(ref, force=True)
+            except Exception as cancel_error:
+                # Reported, never swallowed: if the task outlives this, the
+                # caller's own post-delete check is what catches it, and that
+                # check needs to know this failed.
+                self.logger.warning(
+                    f"Could not cancel the build task for '{application_id}': "
+                    f"{cancel_error}. The application may be re-created after "
+                    "deletion; the undeploy re-checks Ray Serve for exactly this."
+                )
+            raise
         except ray.exceptions.RayTaskError as exc:
             cause = exc.cause if isinstance(exc.cause, Exception) else exc
             raise BioEngineUserError(str(cause)) from exc

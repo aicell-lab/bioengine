@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from haikunator import Haikunator
 from hypha_rpc import connect_to_server
@@ -1262,6 +1262,58 @@ class AppsManager:
                 "Proceeding anyway."
             )
 
+    async def _serve_application_names(self) -> Optional[Set[str]]:
+        """Every application name Ray Serve currently holds.
+
+        ``None`` means the question could not be answered — Serve was
+        unreachable — which is deliberately NOT the same value as "Serve holds
+        nothing". Returning an empty set on failure would let a caller conclude
+        that an application is gone because the status call broke.
+        """
+        try:
+            serve_status = await self.ray_cluster.call_with_reconnect(serve.status)
+            return set(serve_status.applications or {})
+        except Exception as status_error:
+            self.logger.warning(
+                f"Could not read Ray Serve's application list: {status_error}"
+            )
+            return None
+
+    async def _serve_application_exists(self, application_id: str) -> bool:
+        """Whether Ray Serve still holds ``application_id``.
+
+        Unreadable Serve status answers ``False``: this guards a delete that
+        already reported success, and treating "cannot tell" as "still there"
+        would make every undeploy during a Serve hiccup keep a tracking entry
+        for an application that is actually gone.
+        """
+        names = await self._serve_application_names()
+        return bool(names and application_id in names)
+
+    async def get_orphaned_applications(self) -> List[str]:
+        """Applications Ray Serve holds that this worker does not list.
+
+        An orphan is invisible to ``get_app_status`` and cannot be reached by
+        ``stop_app``, so it holds its CPUs and GPUs with no API route to free
+        them, and no watcher can attribute them. Surfacing the comparison is
+        what stops that state being silent — it was found by hand, on a site
+        where an orphan had pinned 2 of 3 GPUs.
+
+        An unreadable Serve status yields an empty list rather than claiming
+        every tracked application is orphaned.
+        """
+        names = await self._serve_application_names()
+        if names is None:
+            return []
+        orphans = sorted(names - set(self._deployed_applications))
+        if orphans:
+            self.logger.error(
+                "Ray Serve is holding application(s) this worker does not track: "
+                f"{orphans}. They cannot be seen by get_app_status or stopped by "
+                "stop_app, and they still hold their resources."
+            )
+        return orphans
+
     async def _undeploy_application(
         self,
         application_id: str,
@@ -1329,6 +1381,39 @@ class AppsManager:
             self.logger.error(
                 f"Error clearing application replica history for '{application_id}': {e}"
             )
+
+        if not delete_failed:
+            # A SUCCESSFUL delete is not proof the application is gone. The build
+            # runs as a Ray task, and cancelling the deployment coroutine races
+            # it: if the task gets to ``serve.run`` after this delete, Ray Serve
+            # ends up holding an application that was just dropped from tracking
+            # above. Measured on a Kubernetes site — deleted in 0.03s, re-created
+            # by the surviving build task four seconds later, then invisible to
+            # every API that works from this list while holding 2 GPUs.
+            #
+            # So the delete is VERIFIED rather than assumed, and a reappearance
+            # is deleted again.
+            if await self._serve_application_exists(application_id):
+                self.logger.warning(
+                    f"Application '{application_id}' is present in Ray Serve again "
+                    "after a successful delete, which means an in-flight build "
+                    "re-created it. Deleting it a second time."
+                )
+                try:
+                    await self.ray_cluster.call_with_reconnect(
+                        serve.delete, application_id
+                    )
+                except Exception as second_delete_err:
+                    self.logger.error(
+                        f"Second delete of '{application_id}' failed: "
+                        f"{second_delete_err}"
+                    )
+                if await self._serve_application_exists(application_id):
+                    # Still there. Keeping it tracked is the whole point: an
+                    # application Ray Serve holds and this worker does not list
+                    # cannot be seen by get_app_status or stopped by stop_app, so
+                    # it holds its resources with no route to release them.
+                    delete_failed = True
 
         if delete_failed and application_info is not None:
             # The app is still running in Ray Serve. Leaving it untracked makes it
