@@ -601,3 +601,201 @@ def test_start_training_REFUSES_WITHOUT_EVER_ASKING_FOR_THE_GPU(tmp_path, monkey
         "the GPU gate was asked even though the base checkpoint is "
         "unavailable — the caller queued for a slot before being told no"
     )
+
+
+# ── the mirror fallback AT THE ADMISSION PATH ────────────────────────────────
+#
+# A review found the fallback had no production caller: the method existed and
+# its own tests called it directly, so every method-level arm passed while a
+# real run was still refused before the mirror was ever consulted. These arms
+# drive `_refuse_unavailable_base_checkpoint` itself, which is the only thing
+# that can tell "wired" from "written".
+
+
+class _DispatchRuntime:
+    """A fake runtime whose methods differ, and whose probe answer can CHANGE.
+
+    The existing `_FakeRuntime` routes every attribute to one callable, which
+    cannot express "the status says unreachable, then the mirror seeds, then
+    the status says cached" -- and that transition is the whole behaviour under
+    test.
+    """
+
+    def __init__(self, caps, handlers):
+        self._caps = caps
+        self._handlers = handlers
+        self.calls = []
+
+    async def ping(self):
+        return {"status": "ok", "capabilities": list(self._caps)}
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        async def _call(*a, **k):
+            self.calls.append(name)
+            if name not in self._handlers:
+                raise AttributeError("'RuntimeApp' object has no attribute %r" % name)
+            return self._handlers[name](*a, **k)
+
+        return _call
+
+
+def _unreachable_parts(model_type):
+    return {
+        "model_type": model_type,
+        "parts": {
+            "encoder": {"cached": False, "reachable": False, "url": "https://up/e"},
+            "decoder": {"cached": False, "reachable": False, "url": "https://up/d"},
+        },
+        "probe_error": None,
+    }
+
+
+def _cached_parts(model_type):
+    return {
+        "model_type": model_type,
+        "parts": {
+            "encoder": {"cached": True, "reachable": None, "url": None},
+            "decoder": {"cached": True, "reachable": None, "url": None},
+        },
+        "probe_error": None,
+    }
+
+
+def test_the_ADMISSION_PATH_SEEDS_FROM_THE_MIRROR_then_ADMITS_the_run():
+    """The arm the review asked for by name.
+
+    Unreachable upstream and nothing cached: the old behaviour refuses here.
+    With the fallback wired, the admission path seeds from the mirror,
+    RE-PROBES, and admits.
+    """
+    state = {"seeded": False}
+
+    def _status(model_type):
+        return (
+            _cached_parts(model_type)
+            if state["seeded"]
+            else _unreachable_parts(model_type)
+        )
+
+    def _ensure(model_type, **kw):
+        state["seeded"] = True
+        return {
+            "model_type": model_type,
+            "source": "mirror",
+            "parts": {},
+            "installed": [
+                {"name": model_type, "sha256": "a" * 64, "bytes": 123},
+                {"name": f"{model_type}_decoder", "sha256": "b" * 64, "bytes": 45},
+            ],
+            "unavailable": [],
+            "error": None,
+        }
+
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={"base_checkpoint_status": _status, "ensure_base_checkpoint": _ensure},
+    )
+    cls, inst = _entry_instance(rt)
+    # Must NOT raise: this is the run being admitted.
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert "ensure_base_checkpoint" in rt.calls, rt.calls
+    # RE-PROBED rather than trusting the seeding result: the question is what
+    # the cache now holds, and the probe is the only authority on that.
+    assert rt.calls.count("base_checkpoint_status") >= 2, rt.calls
+
+
+def test_a_fallback_that_INSTALLS_NOTHING_leaves_the_run_REFUSED():
+    """Fail-closed. The cheap way to pass the arm above is to admit whenever the
+    fallback was *attempted*, which would admit every run on a site where the
+    mirror has nothing to offer."""
+
+    def _ensure(model_type, **kw):
+        return {
+            "model_type": model_type,
+            "source": "unavailable",
+            "parts": {},
+            "installed": [],
+            "unavailable": [model_type],
+            "error": None,
+        }
+
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={
+            "base_checkpoint_status": _unreachable_parts,
+            "ensure_base_checkpoint": _ensure,
+        },
+    )
+    cls, inst = _entry_instance(rt)
+    with pytest.raises(ValueError):
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert "ensure_base_checkpoint" in rt.calls, rt.calls
+
+
+def test_a_fallback_that_RAISES_leaves_the_run_REFUSED_not_crashed():
+    """A fence rejection arrives here as a plain RPC error. It must land as the
+    ORIGINAL refusal -- a run admitted because the mirror blew up would be the
+    worst of both."""
+
+    def _ensure(model_type, **kw):
+        raise RuntimeError("sha256 does not match the pinned ...")
+
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={
+            "base_checkpoint_status": _unreachable_parts,
+            "ensure_base_checkpoint": _ensure,
+        },
+    )
+    cls, inst = _entry_instance(rt)
+    with pytest.raises(ValueError):
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+
+
+def test_a_replica_that_does_NOT_advertise_the_fallback_is_not_asked_for_it():
+    """The capability gate, in the direction that matters during a rollout: an
+    older replica must not have a method it lacks called on it, because the
+    handle answers for ANY public name and the call would fail at the far end."""
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status"],  # no ensure_base_checkpoint
+        handlers={"base_checkpoint_status": _unreachable_parts},
+    )
+    cls, inst = _entry_instance(rt)
+    with pytest.raises(ValueError):
+        asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert "ensure_base_checkpoint" not in rt.calls, rt.calls
+
+
+def test_an_UPSTREAM_REACHABLE_run_never_reaches_the_fallback_AT_THE_CALL_SITE():
+    """Clause 3 at the real call site, not only in the method-level test.
+
+    The review's point: "deNBI still uses upstream first" was true only because
+    nothing called the fallback. Now that something does, the rule has to hold
+    HERE -- a reachable part must be admitted without the mirror being asked.
+    """
+
+    def _reachable(model_type):
+        return {
+            "model_type": model_type,
+            "parts": {
+                "encoder": {"cached": False, "reachable": True, "url": "https://up/e"},
+                "decoder": {"cached": True, "reachable": None, "url": None},
+            },
+            "probe_error": None,
+        }
+
+    rt = _DispatchRuntime(
+        caps=["base_checkpoint_status", "ensure_base_checkpoint"],
+        handlers={
+            "base_checkpoint_status": _reachable,
+            "ensure_base_checkpoint": lambda *a, **k: pytest.fail(
+                "the mirror was consulted for a run upstream can serve"
+            ),
+        },
+    )
+    cls, inst = _entry_instance(rt)
+    asyncio.run(cls._refuse_unavailable_base_checkpoint(inst, "vit_b_lm"))
+    assert "ensure_base_checkpoint" not in rt.calls, rt.calls

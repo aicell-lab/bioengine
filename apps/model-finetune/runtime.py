@@ -58,7 +58,7 @@ _ZOO_BASE_URL = "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io"
 BASE_CHECKPOINT_PROBE_TIMEOUT_S = 3.0
 
 # Methods a caller may rely on being present. Advertised through `ping`.
-RUNTIME_CAPABILITIES = ("base_checkpoint_status",)
+RUNTIME_CAPABILITIES = ("base_checkpoint_status", "ensure_base_checkpoint")
 
 
 def _url_reachable(url: str, timeout_s: float) -> bool:
@@ -560,10 +560,22 @@ class RuntimeApp:
             out["source"] = "upstream" if any_fetch else "cache"
             return out
 
+        # RE-CHECK THE DISK before fetching. The probe's answer is a moment
+        # old, and another run on this same replica may have seeded the file
+        # since -- the cache is shared by every run in the app, so two
+        # admissions racing would otherwise both download 375 MB.
+        still_missing = set(bcm.missing_parts(root, model_type))
         # Only now is the mirror involved, and only for these names.
-        mirrored = [n for n in need if n in bcm.MIRROR_CHECKPOINTS]
-        out["unavailable"] = sorted(set(need) - set(mirrored))
+        mirrored = [
+            n for n in need if n in bcm.MIRROR_CHECKPOINTS and n in still_missing
+        ]
+        out["unavailable"] = sorted(
+            set(need) - set(n for n in need if n in bcm.MIRROR_CHECKPOINTS)
+        )
         if not mirrored:
+            # Either nothing is mirrored, or it arrived while we were asking.
+            if not out["unavailable"]:
+                out["source"] = "cache"
             return out
 
         resolve = resolve_mirror_urls or self._mirror_urls
@@ -575,6 +587,11 @@ class RuntimeApp:
                 type(exc).__name__,
                 exc,
             )
+            # NAMED, not just counted. Leaving these out of `unavailable`
+            # meant a caller that words its refusal from that list printed an
+            # EMPTY list while refusing -- a refusal that cannot say what it
+            # could not get is the failure this preflight exists to remove.
+            out["unavailable"] = sorted(set(out["unavailable"]) | set(mirrored))
             return out
 
         for name in mirrored:
