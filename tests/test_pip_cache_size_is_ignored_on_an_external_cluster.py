@@ -34,6 +34,7 @@ away.
 from __future__ import annotations
 
 import logging
+import os
 
 import pytest
 
@@ -218,6 +219,35 @@ def test_no_ignored_message_in_a_mode_that_applies_the_value(
     assert not hits, (
         f"{mode} mode DOES export the value, so it must not claim the value is ignored: "
         f"{[(logging.getLevelName(r.levelno), r.getMessage()) for r in hits]!r}"
+    )
+
+
+@pytest.mark.parametrize("mode", MODES_THAT_APPLY_THE_VALUE)
+def test_the_value_is_actually_exported_in_a_mode_that_applies_it(
+    mode, captured, self_started, monkeypatch
+):
+    """The one thing the other arms never check: that the EXPORT happens.
+
+    Every other arm here reads the log message or the status field, and both of those are computed
+    from the mode. So narrowing the export guard alone — leaving `applied` reporting True while
+    nothing is written to the environment — passed the whole suite: a worker would claim the cap
+    was applied while Ray never saw it. `os.environ` is the only witness that can tell the claim
+    from the act.
+
+    The variable is recorded with monkeypatch before construction (`self_started` does this via
+    `no_cache_env_leak`) so the real export this triggers does not leak into later tests.
+    """
+    assert ENV_VAR not in os.environ, (
+        f"{ENV_VAR} was already set before construction, so finding it afterwards would prove "
+        "nothing; the no_cache_env_leak fixture is supposed to have removed it"
+    )
+
+    self_started(mode, runtime_env_pip_cache_size_gb=PASSED_SIZE)
+
+    assert os.environ.get(ENV_VAR, "<ABSENT>") == str(PASSED_SIZE), (
+        f"{mode} mode reports the cap as applied but did not export {ENV_VAR}; Ray reads the cap "
+        f"from the environment, so an unexported value is not applied. os.environ has "
+        f"{os.environ.get(ENV_VAR, '<ABSENT>')!r}"
     )
 
 
