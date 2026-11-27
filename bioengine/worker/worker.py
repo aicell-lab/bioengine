@@ -2281,6 +2281,27 @@ class BioEngineWorker:
             "client_id": self.client_id,
             "ray_cluster": ray_cluster_status,
             "admin_users": self.admin_users,
+            # Ray Serve apps running on this cluster that the worker did NOT
+            # adopt, mapped to why. A skipped app keeps running and keeps its
+            # GPUs while being absent from get_app_status, so without this it
+            # is attributable to nothing — which is how a throwaway held 2 of
+            # KTH's 3 GPUs with no surface naming it.
+            #
+            # Deliberately NOT in PUBLIC_WORKER_STATUS_FIELDS: it names
+            # applications, including a sibling workspace's, and get_status is
+            # reachable unauthenticated.
+            # getattr, not a subscript or a bare attribute: the same reason the
+            # `is_ready` line above uses `.get` — this endpoint answers
+            # unauthenticated probes, so it must not raise if the apps manager
+            # is absent or has not completed initialisation yet.
+            "unadopted_applications": dict(
+                getattr(
+                    getattr(self, "apps_manager", None),
+                    "_unadopted_applications",
+                    {},
+                )
+                or {}
+            ),
             "geo_location": self.geo_location,
             "is_ready": (
                 self.is_ready.is_set()

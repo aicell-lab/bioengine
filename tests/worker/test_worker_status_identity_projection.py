@@ -101,7 +101,14 @@ async def test_every_field_in_the_payload_has_been_decided():
     fails when a *new* field appears in the admin payload, so whoever adds one
     has to say out loud whether it is public."""
     full = await bare_worker().get_status(context=ADMIN)
-    undecided = set(full) - set(PUBLIC_WORKER_STATUS_FIELDS) - {"admin_users"}
+    # Knowingly withheld from the anonymous view, each for its own reason:
+    #   admin_users            — the worker's admin allowlist (see the module docstring).
+    #   unadopted_applications — names Ray Serve applications this worker did not adopt,
+    #                            which on a shared Ray cluster includes a SIBLING
+    #                            workspace's apps. The health surface should not enumerate
+    #                            another workspace's deployments to anonymous callers.
+    withheld = {"admin_users", "unadopted_applications"}
+    undecided = set(full) - set(PUBLIC_WORKER_STATUS_FIELDS) - withheld
     assert not undecided, (
         f"{sorted(undecided)} is in the get_status payload but neither in "
         "PUBLIC_WORKER_STATUS_FIELDS nor knowingly withheld"
