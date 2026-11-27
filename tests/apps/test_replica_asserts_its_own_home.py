@@ -126,11 +126,20 @@ def test_b_the_repair_is_reported_at_error_level(env, monkeypatch):
 def test_c_a_correct_home_is_left_alone_and_says_nothing(env, monkeypatch):
     """Silence requires BOTH variables already correct: TMPDIR is part of the same per-app
     contract, so an arm that sets only HOME legitimately sees a TMPDIR repair and is not a test
-    of 'says nothing'."""
+    of 'says nothing'.
+
+    It also requires ``tempfile``'s cache to agree. This arm used to set only the variables and
+    leave the cache at whatever the test session had warmed — which is a process that WOULD
+    write to the old directory, and since the detection step started asking ``tempfile``
+    (review's R4-2) that is correctly reported rather than passed over. Clearing the cache here
+    is what makes this arm a healthy replica instead of the stale-cache case its own sibling
+    arm now pins.
+    """
     good = env / "home"
     (env / "tmp").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(good))
     monkeypatch.setenv("TMPDIR", str(env / "tmp"))
+    tempfile.tempdir = None  # resolve from TMPDIR, i.e. nothing stale to report
     log = _Recorder()
     _ensure_working_directory(log)
     assert Path(os.environ["HOME"]).resolve() == good.resolve()
@@ -395,3 +404,178 @@ def test_l_an_uncreatable_directory_IS_reported_as_unchanged(env, monkeypatch):
         f"say so: {errs!r}"
     )
     assert os.environ["HOME"] == "/home/ray", "premise: the assignment never ran"
+
+
+def test_m_an_unwritable_target_is_refused_because_tempfile_is_what_is_ASKED(
+    env, monkeypatch
+):
+    """Found by review (R4-1): the previous arm pinned the cache CLEAR, not the READ.
+
+    Changing the re-read back to ``Path(os.environ[var])`` while keeping the clear left every
+    arm green, because clearing alone makes the repair take in the ordinary case. So the arm
+    has to use a case where the two answers DIFFER.
+
+    This is that case, and it is reachable: the per-app ``tmp`` exists but is not writable.
+    ``tempfile`` tests its candidates by actually writing, so it SKIPS an unwritable directory
+    and falls back to ``/tmp`` — while ``os.environ["TMPDIR"]`` happily reads back the value
+    just assigned. Reading the variable therefore reports "TMPDIR repaired to <app>/tmp" for a
+    process whose every temporary file still lands in ``/tmp``: the false success this whole
+    verify step exists to prevent.
+    """
+    monkeypatch.setenv("HOME", str(env / "home"))
+    monkeypatch.setenv("TMPDIR", "/nonexistent-ro")
+    target = env / "tmp"
+    target.mkdir(parents=True, exist_ok=True)
+    target.chmod(0o555)  # exists, and this process cannot write in it
+    try:
+        log = _Recorder()
+        _ensure_working_directory(log)
+        errs = " ".join(_errors(log))
+
+        assert Path(tempfile.gettempdir()).resolve() != target.resolve(), (
+            "premise failed: tempfile accepted an unwritable directory, so this arm is not in "
+            f"the case it is about (gettempdir={tempfile.gettempdir()!r})"
+        )
+        assert "could NOT repair TMPDIR" in errs, (
+            "the repair did NOT take — tempfile skips an unwritable candidate — and saying it "
+            f"did is the false success this step exists to catch. errors: {errs!r}"
+        )
+        assert (
+            "TMPDIR repaired to" not in errs
+        ), f"a repair that did not happen was reported as done: {errs!r}"
+        assert (
+            str(Path(tempfile.gettempdir())) in errs
+        ), f"the message must name what the process will actually use: {errs!r}"
+    finally:
+        target.chmod(0o755)
+
+
+def test_n_a_correct_variable_with_a_STALE_cache_is_still_reported(env, monkeypatch):
+    """Found by review (R4-2): the DETECTION step read the variable, so this case was silent.
+
+    On the hook-only path ``replica_init`` assigns ``TMPDIR`` in-process, and if anything has
+    already resolved a temporary directory, ``tempfile`` keeps handing out the old one. The
+    variable then looks perfect, the old early-return matched, and nothing was logged at all —
+    while every temporary file still went to ``/tmp``. The docstring claims this function
+    covers "a future delivery path failing silently"; this was that path, failing silently.
+    """
+    monkeypatch.setenv("HOME", str(env / "home"))
+    target = env / "tmp"
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TMPDIR", str(target))  # the variable is CORRECT
+    tempfile.tempdir = "/tmp"  # ...and the cache is stale, as a warm process's would be
+    assert tempfile.gettempdir() == "/tmp", "premise: the cache must start stale"
+
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+
+    assert Path(tempfile.gettempdir()).resolve() == target.resolve(), (
+        f"the stale cache was never refreshed, so the replica still writes to "
+        f"{tempfile.gettempdir()!r} despite a correct TMPDIR"
+    )
+    assert "TMPDIR" in errs, (
+        "a replica that would write to the wrong directory was told nothing, because the "
+        f"check compared the variable instead of what the process uses. errors: {errs!r}"
+    )
+    # The message must name BOTH values, because here they DISAGREE: the variable is correct
+    # and the resolved directory is not. Naming only the variable produced "TMPDIR was
+    # <target>, not <target>" — a sentence true about nothing, which sends the reader to look
+    # at an environment variable that is already right.
+    assert (
+        str(target) in errs and "/tmp" in errs
+    ), f"the message names only one of the two disagreeing values: {errs!r}"
+    assert (
+        "would resolve to" in errs
+    ), f"the message does not say that the resolved value is the problem: {errs!r}"
+
+
+def test_o_a_fully_healthy_process_is_still_silent(env, monkeypatch):
+    """The control: when the variable AND what the process will use are both right, say nothing.
+
+    A check that fires always tells you nothing, and both arms below assert a report, so
+    without this one "report everything" would satisfy them.
+    """
+    good_home = env / "home"
+    good_tmp = env / "tmp"
+    good_tmp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(good_home))
+    monkeypatch.setenv("TMPDIR", str(good_tmp))
+    tempfile.tempdir = str(good_tmp)
+
+    log = _Recorder()
+    _ensure_working_directory(log)
+
+    assert not _errors(
+        log
+    ), f"a healthy replica must say nothing, got: {_errors(log)!r}"
+    assert tempfile.tempdir == str(good_tmp), (
+        "the cache was cleared on a process that needed no repair, which discards a value an "
+        f"app may have set on purpose (now {tempfile.tempdir!r})"
+    )
+
+
+def test_p_a_DELIBERATE_cache_pointing_elsewhere_is_reported_not_silently_dropped(
+    env, monkeypatch
+):
+    """Enumerating the (variable, cache) states turned this up, and it decides a design choice.
+
+    TMPDIR is correct and ``tempfile.tempdir`` points somewhere else — an app's own choice, or
+    a cache warmed before the variable was set. The process WILL write to that other place, so
+    this replica is not healthy and the per-app contract is not being met.
+
+    Detection asks ``tempfile`` without clearing, so the mismatch is seen and REPORTED, then
+    repaired. Clearing the cache at detection instead would re-resolve from the (correct)
+    variable, conclude all is well, and discard the app's directory with no message at all —
+    the same silence R4-2 was about, one level along.
+    """
+    good_tmp = env / "tmp"
+    good_tmp.mkdir(parents=True, exist_ok=True)
+    elsewhere = env / "deliberate"
+    elsewhere.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(env / "home"))
+    monkeypatch.setenv("TMPDIR", str(good_tmp))  # the variable is RIGHT
+    tempfile.tempdir = str(elsewhere)  # ...and the process will use somewhere else
+
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+
+    assert "TMPDIR" in errs, (
+        "the process would write outside the per-app directory and was told nothing; a silent "
+        f"correction here is indistinguishable from a silent LOSS of the app's own choice"
+    )
+    assert (
+        Path(tempfile.gettempdir()).resolve() == good_tmp.resolve()
+    ), f"after the repair the process still uses {tempfile.gettempdir()!r}"
+
+
+def test_q_a_WRONG_variable_masked_by_a_correct_cache_is_still_repaired(
+    env, monkeypatch
+):
+    """The other blind spot the enumeration found, and it is mine, not review's.
+
+    Checking only what the process will USE — review's R4-2 prescription taken literally —
+    goes silent when TMPDIR is wrong but ``tempfile``'s cache happens to hold the right
+    directory. This process looks fine; but ``os.environ["TMPDIR"]`` is what every CHILD
+    process and every library reading the environment inherits, so it stays wrong for them.
+
+    So the check requires both, and neither half subsumes the other.
+    """
+    good_tmp = env / "tmp"
+    good_tmp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(env / "home"))
+    monkeypatch.setenv("TMPDIR", "/nonexistent-wrong")  # the variable is WRONG
+    tempfile.tempdir = str(good_tmp)  # ...and the cache masks it
+
+    log = _Recorder()
+    _ensure_working_directory(log)
+    errs = " ".join(_errors(log))
+
+    assert "TMPDIR" in errs, (
+        "a wrong TMPDIR was passed over because the cache happened to be right, so every "
+        f"child process inherits it. errors: {errs!r}"
+    )
+    assert (
+        Path(os.environ["TMPDIR"]).resolve() == good_tmp.resolve()
+    ), f"TMPDIR was left at {os.environ['TMPDIR']!r}, which children would inherit"

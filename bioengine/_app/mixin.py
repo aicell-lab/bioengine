@@ -224,7 +224,7 @@ def _ensure_working_directory(logger: logging.Logger) -> None:
         _ensure_home_under_app_dir(workdir, logger)
 
 
-def _effective_value(var: str) -> Path:
+def _effective_value(var: str, *, refresh: bool = False) -> Path:
     """What this process will ACTUALLY use for ``var``, not what was just written to it.
 
     The difference is the whole point of the verify step, and it is real for one of the two
@@ -247,10 +247,29 @@ def _effective_value(var: str) -> Path:
       check: it holds the contract "a repair is verified, never assumed" in place for whoever
       edits this next, and its arm has to monkeypatch ``Path.home`` to fire it. Labelled as
       such rather than justified by a fallback that does not apply.
+
+    ``refresh`` says whether to CLEAR the cache before asking:
+
+    * ``False`` — the DETECTION read. It answers "what would this process use right now", which
+      is the question the early-return needs: a variable that is already correct while the cache
+      is stale is still a replica that writes to the wrong place, and comparing ``os.environ``
+      there reported nothing at all. Measured by review on the hook-only path, where
+      ``replica_init`` assigns ``TMPDIR`` in-process after something has already warmed
+      ``tempfile``: zero ERROR lines, ``TMPDIR`` correct in the environment, and
+      ``gettempdir()`` still ``/tmp``.
+    * ``True`` — the read after a repair, which must also MAKE the repair take.
+
+    Not clearing on the detection read is deliberate. ``tempfile.tempdir`` holding a value is
+    indistinguishable through the public API from an app having set it on purpose, so clearing
+    it on every replica start would overwrite that choice even when nothing is wrong. On the
+    REPAIR path it is still overwritten — an app that points ``tempfile`` outside the per-app
+    directory loses that, exactly as it loses a ``TMPDIR`` pointing elsewhere, because forcing
+    the per-app directory is this function's job.
     """
     if var == "HOME":
         return Path.home()
-    tempfile.tempdir = None
+    if refresh:
+        tempfile.tempdir = None
     return Path(tempfile.gettempdir())
 
 
@@ -312,20 +331,53 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
 
     for var, target in (("HOME", app_dir / "home"), ("TMPDIR", app_dir / "tmp")):
         current = os.environ.get(var)
+        effective = None
         try:
-            ok = current is not None and Path(current).resolve() == target.resolve()
+            # DETECTED through what the process will USE, not through the variable. Comparing
+            # os.environ here meant a replica whose TMPDIR was right but whose `tempfile`
+            # cache was stale matched, returned early, and was never told — while every
+            # temporary file it created still went to the old directory.
+            # BOTH must be right, and neither check subsumes the other. Enumerating the
+            # (variable, cache) states showed each single check has its own blind spot:
+            #
+            #  * the VARIABLE alone misses a correct variable with a stale `tempfile` cache —
+            #    the hook-only path, where every temporary file still goes to the old
+            #    directory while nothing is logged (review's R4-2);
+            #  * the EFFECTIVE value alone misses a WRONG variable that the cache happens to
+            #    mask. That one is not harmless: `os.environ["TMPDIR"]` is what every child
+            #    process and every library reading the environment inherits, so it stays
+            #    wrong for them while this process looks fine.
+            effective = _effective_value(var)
+            ok = (
+                current is not None
+                and Path(current).resolve() == target.resolve()
+                and effective.resolve() == target.resolve()
+            )
         except OSError:
             ok = False
         if ok:
             continue
+
+        # Name BOTH values when they disagree. The decision above is made on the EFFECTIVE
+        # value, so a message that printed only the variable could read "TMPDIR was <target>,
+        # not <target>" — true about nothing and pointing the reader at the wrong thing. That
+        # is the same class of defect as the repair message review rejected earlier on this
+        # branch, and it appeared the moment detection stopped reading the variable.
+        was = current if current else "<unset>"
+        if (
+            current is not None
+            and effective is not None
+            and str(effective) != str(Path(current))
+        ):
+            was = f"{current}, which this process would resolve to {effective},"
         # `setdefault` is deliberately NOT used: a TMPDIR that is present but points somewhere
         # unwritable is exactly the case worth repairing, and setdefault would leave it alone.
         logger.error(
-            "BioEngine: %s was %s, not %s, in the process that serves this replica. Repairing it "
+            "BioEngine: %s was %s not %s, in the process that serves this replica. Repairing it "
             "now; a write under it would otherwise have failed against a path this process cannot "
             "write, and the cause would have looked like an application bug.",
             var,
-            current if current else "<unset>",
+            was,
             target,
         )
         # Create first, assign second. Assigning a variable to a directory that does not exist
@@ -346,7 +398,7 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
 
         try:
             os.environ[var] = str(target)
-            observed = _effective_value(var)
+            observed = _effective_value(var, refresh=True)
             match = observed.resolve() == target.resolve()
         except OSError as exc:
             failed.append(
@@ -369,7 +421,7 @@ def _ensure_home_under_app_dir(app_dir: Path, logger: logging.Logger) -> None:
                 (
                     var,
                     f"{var} was set to {target}, but the value this process will actually use "
-                    f"is still {observed}. The variable changed; what reads it did not, so a "
+                    f"is {observed}. The variable changed; what reads it did not, so a "
                     "write under it still lands in the wrong place",
                 )
             )
