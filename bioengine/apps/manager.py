@@ -2213,8 +2213,11 @@ class AppsManager:
                 # NOT_STARTED message says the application "has not been deployed yet", which
                 # invites a retry -- and a second deploy racing the first is what leaves an
                 # application running in Serve that the worker no longer tracks.
-                # DEPLOYING is already in this method's documented state list; until now it
-                # was documented and never emitted.
+                # DEPLOYING is Ray Serve's own ApplicationStatus value, and this method
+                # already passes it straight through whenever Serve reports it (see the
+                # `if application_details:` branch above). It is reused here for the window
+                # where Serve has no details yet but this worker knows a deployment task is
+                # running, so no value new to callers appears on this field.
                 status = "DEPLOYING"
                 shortfall = application_info.get("resource_shortfall")
                 if shortfall:
