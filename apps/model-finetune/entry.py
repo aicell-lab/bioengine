@@ -1097,25 +1097,7 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL for staging an input image or embedding.
-
-        THE STAGED FILE ITSELF LASTS ABOUT AN HOUR FROM THIS CALL, which is not
-        the same statement as the URL lasting an hour and is the one that catches
-        people out. The clock starts when this method mints the URL, not when
-        your PUT lands: `ttl=3600` below is passed to `put_file`, which schedules
-        the object's deletion at mint time. So minting many URLs up front and
-        then uploading -- the natural way to stage a dataset -- spends part of
-        the hour before the first byte moves. A fresh download URL is minted on
-        every read, so an expired signature is not what bites: the object is
-        gone. Measured by a caller: a `start_training` submitted 74
-        minutes after staging, and an `infer` on a path staged 80 minutes
-        earlier, both failed with "does not exist or has expired".
-
-        So anything that stages a dataset and then WAITS -- a run queued behind
-        another one, a second evaluation pass after a long training -- must
-        re-stage before it uses these paths. Staging is cheap; discovering this
-        an hour into an experiment is not.
-        """
+        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1225,20 +1207,6 @@ class EntryApp:
         )
         resp = await self._http_retry("GET", url)
         if resp.status_code == 404:
-            # A staged path gets the lifetime and the repair, because "does not
-            # exist or has expired" leaves a caller unable to tell which, and
-            # the answer decides what they do next. The retry loop above has
-            # already exhausted its backoff on this 404, so a transient miss is
-            # not what this is.
-            if source.startswith("temp/"):
-                raise FileNotFoundError(
-                    f"Staged source '{source}' is gone. A file staged with "
-                    f"get_upload_url lasts about an hour, so a dataset staged "
-                    f"before a long wait -- a run queued behind another one, a "
-                    f"second pass after a training -- has to be re-staged "
-                    f"before it can be used. Stage it again and retry with the "
-                    f"new file_path."
-                )
             raise FileNotFoundError(f"Source '{source}' does not exist or has expired.")
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
@@ -2556,19 +2524,14 @@ class EntryApp:
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). "
-            "GeoJSON coordinates are image pixels [x, y] with the origin at the TOP-LEFT and y increasing DOWNWARD (so y is the row index); a y-up file rasterises vertically mirrored and nothing can detect it. "
-            "AIS fine-tuning "
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
             "needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
             None, description="Optional validation images; same forms as train_images."
         ),
         val_labels: Optional[List[Union[np.ndarray, str]]] = Field(
-            None,
-            description="Validation labels, in the same forms as train_labels and "
-            "read by the same loader — including the .geojson axis convention: "
-            "[x, y] in image pixels, origin TOP-LEFT, y increasing DOWNWARD.",
+            None, description="Validation labels."
         ),
         model_type: ModelType = Field(
             "vit_l_lm",
@@ -2882,17 +2845,14 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). "
-            "GeoJSON coordinates are image pixels [x, y] with the origin at the TOP-LEFT and y increasing DOWNWARD (so y is the row index); a y-up file rasterises vertically mirrored and nothing can detect it.",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."
         ),
         val_labels: Optional[List[str]] = Field(
             None,
-            description="Optional validation label sources, paired with val_images. "
-            "A .geojson label follows the same convention as train_labels: [x, y] "
-            "in image pixels, origin TOP-LEFT, y increasing DOWNWARD.",
+            description="Optional validation label sources, paired with val_images.",
         ),
         enable_clahe: bool = Field(
             False,

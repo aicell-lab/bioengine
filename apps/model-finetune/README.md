@@ -121,15 +121,8 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
   per session, run with `onnxruntime-web`, decode each box locally using the
   `compute_embedding` features. `compute_embedding` and `get_onnx_model` are
   **micro-sam only** — cpsam has no encoder embedding or ONNX prompt decoder.
-- **`get_upload_url(file_type)`** Presigned S3 PUT URL for staging an input image
-  (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`). **The staged
-  OBJECT is deleted about an hour after this call, not just the signature**, and
-  the clock starts when the URL is minted rather than when your upload lands —
-  `ttl=3600` is passed to `put_file`, which schedules the deletion at mint time.
-  So minting many URLs up front and then uploading spends part of the hour before
-  the first byte moves, and anything that stages a dataset and then waits (a run
-  queued behind another, a second evaluation pass after a long training) must
-  re-stage first. A gone staged path fails with a message that says so.
+- **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
+  an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
 
 **Embedding reuse (Leg B).** Encode once, reuse the embedding for both the
 in-browser interactive decoder and automatic segmentation without a second
@@ -190,14 +183,7 @@ launch instead of OOMing mid-train.
   Starts a background fine-tuning session and returns immediately with the
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
-  `.geojson` FeatureCollection of polygons (rasterized to instances). **A
-  `.geojson` label is read as `[x, y]` in image pixels, origin TOP-LEFT, y
-  increasing DOWNWARD** — the raster convention, not the y-up one GIS readers
-  assume. A y-up file rasterises vertically mirrored *in silence*: every polygon
-  still lands on the canvas, the instance count is right, and training succeeds
-  having learnt mirrored cells, so nothing can detect it for you. Ids run from 1
-  per polygon PART, so a two-part MultiPolygon is two instances, and interior
-  rings are ignored (a polygon with a hole is filled solid).
+  `.geojson` FeatureCollection of polygons (rasterized to instances).
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).

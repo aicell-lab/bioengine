@@ -2372,29 +2372,9 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per POLYGON PART, ids from 1 in document order — not one per
-    feature. A MultiPolygon of two parts yields two ids (measured: ids [1, 2]),
-    because the counter advances per part, and interior rings are ignored, so a
-    polygon with a hole is filled solid. Both matter to a caller counting
-    instances: a two-part feature is two objects here and one object in the
-    file it came from.
-
-    THE AXIS CONVENTION, which GeoJSON itself does not fix and which nothing
-    here can detect a violation of. Coordinates are IMAGE PIXELS as ``[x, y]``
-    with the origin at the TOP-LEFT and **y increasing DOWNWARD** -- the raster
-    convention, so ``y`` is the row index and the pair maps to ``mask[y][x]``.
-    That is what the pairs below mean when they reach PIL, whose drawing origin
-    is the top-left, and it is the bioimage.io colab polygon convention this was
-    ported from (cellpose-finetuning's ``_rasterize_geojson_to_tiff``).
-
-    It is NOT the y-up convention that GIS GeoJSON readers assume. A y-up file
-    rasterises VERTICALLY MIRRORED, and that is silent: every polygon still
-    lands inside the canvas, the instance count is right, the mask is non-empty,
-    so the empty-mask guard in the caller does not fire and training reports
-    success having learnt mirrored cells. A caller reported exactly that risk
-    and rasterised locally to avoid it. There is no way to tell the two apart
-    from one file -- a mirrored annotation is a perfectly plausible annotation
-    -- so the convention has to be stated rather than validated.
+    One instance per Polygon/MultiPolygon feature, ids from 1 in document order;
+    coordinates are image-pixel (x, y). Ported from cellpose-finetuning's
+    ``_rasterize_geojson_to_tiff`` (the bioimage.io colab polygon convention).
     """
     from PIL import Image as PILImage, ImageDraw
 
