@@ -386,3 +386,77 @@ def test_the_README_documents_the_contention_fields():
     text = (Path(__file__).with_name("README.md")).read_text(encoding="utf-8")
     assert len(text) > 5000, f"README read implausibly short ({len(text)})"
     assert "slot_busy" in text, "the README does not document the contention fields"
+
+
+# ── the note has to survive the field's length limit ─────────────────────────
+#
+# Found in review, and it was the ordinary case rather than an edge one. The
+# note was appended and the whole string THEN clipped to the status field's
+# limit, so the note -- sitting at the clipped end -- vanished for any
+# underlying error longer than about 630 characters, while the README and
+# get_training_status both promise a failure under contention carries it. A
+# Hypha RemoteException's traceback is routinely longer than that.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n", [10, 700, 790, 2000, 20000])
+async def test_the_contention_note_survives_however_long_the_error_is(n):
+    """Parametrised over the boundary, not just past it.
+
+    10 and 700 passed before the fix and must keep passing; 790 and up are the
+    regression. Covering both sides is what stops a future change trading one
+    for the other.
+    """
+
+    async def prepare(_session_id):
+        raise RuntimeError("E" * n)
+
+    stub = _Stub(prepare)
+    await stub._training_sem.acquire()
+    await _run(stub, BUSY)
+
+    st = training.get_status(BUSY)
+    assert st["status"] == "FAILED"
+    msg = st["message"]
+    assert "held the training slot" in msg, (
+        f"a {n}-character error lost the contention note entirely; the note is "
+        f"what the README and get_training_status promise is there "
+        f"(message was {len(msg)} chars)"
+    )
+    # The field limit is still respected -- the fix must not have bought the
+    # note by writing an unbounded message.
+    assert (
+        len(msg) <= _status_limit()
+    ), f"the message is {len(msg)} chars, over the limit"
+    # And the error itself still leads, so the diagnostic is not sacrificed.
+    assert msg.startswith("EEE"), f"the underlying error no longer leads: {msg[:60]!r}"
+
+
+def _status_limit():
+    """The limit, tolerating its absence.
+
+    Read with a default because this test must be runnable against the code
+    BEFORE the constant existed -- that is the only way its red check means
+    anything. Reading it as a hard attribute made every parametrisation fail on
+    AttributeError against the pre-fix tree, including the two cases that were
+    supposed to PASS there, which turned a precise red check into a uniform one
+    that proved nothing.
+    """
+    import entry
+
+    return getattr(entry, "_STATUS_MESSAGE_LIMIT", 800)
+
+
+@pytest.mark.asyncio
+async def test_an_uncontended_long_error_is_clipped_and_carries_no_note():
+    """The control. Keeping the note must not mean inventing one, and an
+    uncontended failure must still be clipped to the limit."""
+
+    async def prepare(_session_id):
+        raise RuntimeError("E" * 2000)
+
+    await _run(_Stub(prepare), FREE)
+    st = training.get_status(FREE)
+    msg = st["message"]
+    assert "held the training slot" not in msg
+    assert len(msg) == _status_limit()

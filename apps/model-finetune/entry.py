@@ -60,6 +60,17 @@ _ENABLED_BACKENDS = _parse_backends(os.getenv("MODEL_FINETUNE_BACKENDS"))
 _MAX_CONCURRENT_TRAINING = max(
     1, int(os.getenv("MODEL_FINETUNE_MAX_CONCURRENT_TRAINING", "1") or "1")
 )
+
+# How much of a failure message is kept in a session's status document. Named
+# because the failure path now has to fit two things inside it -- the underlying
+# error and the contention note -- and a bare literal at the truncation site is
+# a bare literal at the truncation site hides a limit two strings must
+# share. `train_worker.py` and
+# `train_worker_cellpose.py` clip to the same 800 with their own literals; they
+# run as separate processes and write a single string, so they are left alone
+# rather than made to import this, but the number is the same by intent.
+_STATUS_MESSAGE_LIMIT = 800
+
 RuntimeApp = None
 CellposeRuntime = None
 if "microsam" in _ENABLED_BACKENDS:
@@ -1777,6 +1788,13 @@ class EntryApp:
         # contended") and would need a write per sample; `status` already
         # reaches QUEUED for the live state, and the failure note is attached
         # from this same reading, so the two agree by construction.
+        #
+        # `locked()` is ALL slots held, not one. At the default cap of 1 that
+        # is the same statement; above it, a run starting beside N-1 training
+        # runs reads false, which is the right answer to "was a slot free at
+        # submission" and
+        # is why the field is described as every slot being held rather than
+        # as the slot.
         slot_busy = self._training_sem.locked()
         try:
             if slot_busy:
@@ -1895,15 +1913,40 @@ class EntryApp:
             # as an unrelated RPC fault. Note this does NOT claim the contention
             # caused the failure -- it says a slot was busy at the time, which is
             # the fact the caller was missing.
-            if slot_busy:
-                safe = (
-                    f"{safe} [another fine-tuning held the training slot when "
-                    f"this run started, so it was preparing data alongside a "
-                    f"run in progress; that may or may not be related]"
-                )
-            logger.error(f"Training session {session_id} failed: {safe}")
+            # THE NOTE IS KEPT BY TRUNCATING THE ERROR, NOT THE WHOLE STRING.
+            #
+            # Appending and then slicing to the field's limit loses whichever end
+            # the slice drops, and the note is at that end: it is ~170
+            # characters, so any underlying error longer than ~630 cut it off
+            # COMPLETELY while the README and get_training_status both promise a
+            # failure under contention carries it. Measured on the harness
+            # below: an error of 700 characters kept the note, 790 and 2000
+            # stored an 800-character message with none of it. A Hypha
+            # RemoteException's traceback is routinely past 630, so that was the
+            # ordinary case rather than an edge.
+            #
+            # The error keeps the front, which is where its type and message
+            # are, and the note is always whole -- reversing which half is
+            # sacrificed, because a truncated diagnostic is still a diagnostic
+            # and a truncated note is nothing.
+            note = (
+                " [another fine-tuning held the training slot when this run "
+                "started, so it was preparing data alongside a run in progress; "
+                "that may or may not be related]"
+            )
+            logged = f"{safe}{note}" if slot_busy else safe
+            logger.error(f"Training session {session_id} failed: {logged}")
+            if slot_busy and len(note) < _STATUS_MESSAGE_LIMIT:
+                room = _STATUS_MESSAGE_LIMIT - len(note)
+                message = f"{safe[:room]}{note}"
+            else:
+                # No contention, or a note that cannot fit at all: the error
+                # alone, clipped as before. The guard is not decoration -- a
+                # later edit lengthening the note past the limit would otherwise
+                # produce a message with no error text in it.
+                message = safe[:_STATUS_MESSAGE_LIMIT]
             training.write_status(
-                session_id, status="FAILED", message=safe[:800], terminated_by="entry"
+                session_id, status="FAILED", message=message, terminated_by="entry"
             )
         finally:
             preparing_hb.cancel()
@@ -2989,7 +3032,8 @@ class EntryApp:
     ) -> Dict[str, Any]:
         """Fine-tuning session status (PREPARING/QUEUED/TRAINING/COMPLETED/FAILED/
         STOPPED), elapsed time, and whether the checkpoint is servable. QUEUED
-        means another fine-tuning holds the single training slot.
+        means every training slot is held by another fine-tuning (one slot by
+        default; MODEL_FINETUNE_MAX_CONCURRENT_TRAINING raises it).
 
         `slot_busy` is true when another run held that slot at the moment this
         one started, with `slot_busy_message` saying so in words. It is the
