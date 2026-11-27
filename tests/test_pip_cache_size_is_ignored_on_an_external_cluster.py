@@ -270,15 +270,81 @@ def test_the_value_is_actually_exported_in_a_mode_that_applies_it(
 
 
 @pytest.mark.parametrize("mode", MODES_THAT_APPLY_THE_VALUE)
-def test_status_reports_applied_in_a_mode_that_applies_the_value(
+def test_status_reports_the_size_in_every_mode_that_exports_it(
     mode, captured, self_started
 ):
+    """Common to both self-started modes: the size itself is reported back.
+
+    What DIFFERS between them is where the cap reaches, which the two arms below pin separately.
+    This arm deliberately asserts nothing about `applied` or `state`, because a single expectation
+    for both modes is what previously let slurm claim the cap was cluster-wide.
+    """
     cluster = self_started(mode, runtime_env_pip_cache_size_gb=PASSED_SIZE)
 
     cache = cluster.status["runtime_env_pip_cache"]
-    assert cache.get("applied", "<ABSENT>") is True, cache
-    assert cache["state"] == "applied", cache
     assert cache["size_gb"] == PASSED_SIZE, cache
+    assert cache["requested"] == PASSED_SIZE, cache
+
+
+def test_single_machine_reports_the_cap_as_cluster_wide(captured, self_started):
+    """One host, so exporting it here really does govern every Ray process in the cluster."""
+    cluster = self_started("single-machine", runtime_env_pip_cache_size_gb=PASSED_SIZE)
+
+    cache = cluster.status["runtime_env_pip_cache"]
+    assert cache.get("applied", "<ABSENT>") is True, cache
+    assert cache["scope"] == "cluster", cache
+    assert cache["state"] == "applied", cache
+    assert cache["detail"] is None, cache
+
+
+def test_slurm_reports_the_cap_as_reaching_the_head_node_only(captured, self_started):
+    """The defect this row exists for: slurm exports the value and governs the HEAD ONLY.
+
+    `slurm_workers.py` launches the compute-node raylets under `apptainer exec --cleanenv`, which
+    starts from an empty environment and is handed back only SLURM_JOB_ID and PYTHONNOUSERSITE.
+    So every compute node keeps Ray's own 10 GB however large a value was passed, and a status
+    field saying a bare `applied: true` tells an operator something false about the nodes their
+    replicas actually run on.
+    """
+    cluster = self_started("slurm", runtime_env_pip_cache_size_gb=PASSED_SIZE)
+
+    cache = cluster.status["runtime_env_pip_cache"]
+    assert cache.get("applied", "<ABSENT>") is False, (
+        "`applied` means in force for the WHOLE cluster, and on slurm the compute nodes are on a "
+        f"different cap: {cache}"
+    )
+    assert cache["scope"] == "head-only", cache
+    assert cache["state"] == "applied on the head node only", cache
+    detail = cache["detail"] or ""
+    assert "--cleanenv" in detail, f"the detail must name the mechanism: {detail!r}"
+    assert "10 GB" in detail, (
+        f"it must name what the compute nodes actually use, which is the figure to size scratch "
+        f"from: {detail!r}"
+    )
+
+
+def test_the_slurm_and_single_machine_readings_are_not_the_same(captured, self_started):
+    """Guards against the two collapsing back into one answer.
+
+    They were one answer before this change, and the wrong one for slurm. An arm per mode would
+    both pass if someone unified them on the single-machine wording and updated each arm to
+    match; this one fails unless they genuinely differ.
+    """
+    sm = self_started(
+        "single-machine", runtime_env_pip_cache_size_gb=PASSED_SIZE
+    ).status["runtime_env_pip_cache"]
+    sl = self_started("slurm", runtime_env_pip_cache_size_gb=PASSED_SIZE).status[
+        "runtime_env_pip_cache"
+    ]
+
+    assert (sm["scope"], sm["applied"], sm["state"]) != (
+        sl["scope"],
+        sl["applied"],
+        sl["state"],
+    ), (
+        "single-machine and slurm report the cap identically, but the cap does not reach the same "
+        f"nodes in the two modes: single-machine={sm}, slurm={sl}"
+    )
 
 
 # --- 4. the status surface ----------------------------------------------------------------------
@@ -296,6 +362,7 @@ def test_status_reports_not_applied_on_an_external_cluster(captured):
     # An absent key and a False value are indistinguishable through `.get()`, so compare against
     # a sentinel rather than letting a missing field read as a passing assertion.
     assert cache.get("applied", "<ABSENT>") is False, cache
+    assert cache["scope"] == "none", cache
     assert cache["state"] == "not applied", cache
     assert cache["requested"] == PASSED_SIZE, cache
     assert cache["size_gb"] == PASSED_SIZE, cache
@@ -328,6 +395,54 @@ def test_the_module_still_agrees_about_which_modes_apply_the_value():
         "the worker's SELF_STARTED_MODES no longer matches the modes these arms cover: "
         f"module says {tuple(SELF_STARTED_MODES)!r}, arms cover "
         f"{MODES_THAT_APPLY_THE_VALUE!r}. If that change is intended, update both."
+    )
+
+
+# --- 6. the head-only claim, tied to the thing that makes it true -------------------------------
+
+
+def test_the_cap_is_not_forwarded_into_the_slurm_container(tmp_path):
+    """`status` claims the compute nodes are on Ray's default. This is why.
+
+    Nothing else connects that claim to the job script. If someone adds
+    `--env=RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB=...` to the apptainer arguments in
+    `slurm_workers.py`, the compute nodes WOULD get the cap and `status` would go on reporting
+    "applied on the head node only" -- the same defect this row fixed, turned around, with no arm
+    going red. This reads the generated batch script and asserts the cap is absent from it.
+
+    It deliberately asserts the ABSENCE of a forward, alongside the presence of `--cleanenv`: the
+    absence alone would also hold if the apptainer invocation disappeared entirely, which would
+    mean something quite different.
+    """
+    from bioengine.cluster.slurm_workers import SlurmWorkers
+
+    class _RayCluster:
+        address = "ray://head.example:10001"
+
+    workers = SlurmWorkers(
+        ray_cluster=_RayCluster(),
+        worker_workspace_dir=str(tmp_path),
+        image="ghcr.io/aicell-lab/bioengine-worker:test",
+    )
+    script = open(
+        workers._create_sbatch_script(
+            num_gpus=1,
+            num_cpus=4,
+            mem_in_gb_per_cpu=8,
+            time_limit="1:00:00",
+            further_slurm_args=[],
+        ),
+        encoding="utf-8",
+    ).read()
+
+    assert "--cleanenv" in script, (
+        "the container no longer starts from a cleaned environment, so the head-only claim in "
+        "`status` may no longer hold for the reason it gives"
+    )
+    assert ENV_VAR not in script, (
+        f"{ENV_VAR} is now forwarded into the SLURM container, so the compute nodes DO get the "
+        "cap -- but `status` still reports 'applied on the head node only'. Update the scope "
+        "reporting as well as the job script."
     )
 
 
