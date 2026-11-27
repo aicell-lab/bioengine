@@ -44,6 +44,15 @@ from bioengine.cluster.ray_cluster import (
     RayCluster,
 )
 
+# Spelled out HERE, deliberately, rather than parametrizing over the module's own
+# ``SELF_STARTED_MODES``. Importing the tuple and parametrizing over it makes the arms
+# agree with the code even when both are wrong: shrinking the module tuple to
+# ``("single-machine",)`` would silently COLLECT ZERO slurm cases, so the arm that guards
+# slurm is deleted by the very bug it guards against, and the suite still reports green.
+# The modes are a fact about the worker, so the test states the fact and then checks that
+# the module still agrees with it.
+MODES_THAT_APPLY_THE_VALUE = ("single-machine", "slurm")
+
 IGNORED = "is IGNORED in"
 ENV_VAR = "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB"
 PASSED_SIZE = 42
@@ -197,7 +206,7 @@ def test_a_value_nobody_passed_does_not_raise_an_alarm(captured):
 # --- 3. the modes that DO apply it stay quiet ---------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", SELF_STARTED_MODES)
+@pytest.mark.parametrize("mode", MODES_THAT_APPLY_THE_VALUE)
 def test_no_ignored_message_in_a_mode_that_applies_the_value(
     mode, captured, self_started
 ):
@@ -212,7 +221,7 @@ def test_no_ignored_message_in_a_mode_that_applies_the_value(
     )
 
 
-@pytest.mark.parametrize("mode", SELF_STARTED_MODES)
+@pytest.mark.parametrize("mode", MODES_THAT_APPLY_THE_VALUE)
 def test_status_reports_applied_in_a_mode_that_applies_the_value(
     mode, captured, self_started
 ):
@@ -248,7 +257,7 @@ def test_status_reports_not_applied_on_an_external_cluster(captured):
 # --- 5. a bad value is refused everywhere -------------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", ["external-cluster", *SELF_STARTED_MODES])
+@pytest.mark.parametrize("mode", ["external-cluster", *MODES_THAT_APPLY_THE_VALUE])
 @pytest.mark.parametrize("bad", [0, -5])
 def test_a_bad_value_is_refused_in_every_mode(mode, bad, captured, self_started):
     """The validation used to live inside the branch that consumes the value, so an
@@ -258,3 +267,17 @@ def test_a_bad_value_is_refused_in_every_mode(mode, bad, captured, self_started)
             RayCluster(mode=mode, runtime_env_pip_cache_size_gb=bad)
         else:
             self_started(mode, runtime_env_pip_cache_size_gb=bad)
+
+
+def test_the_module_still_agrees_about_which_modes_apply_the_value():
+    """Guards the guard. These arms spell the modes themselves so that shrinking
+    ``SELF_STARTED_MODES`` cannot delete the slurm case by emptying a parametrize list. That
+    protection is only worth anything if something still notices when the module's own tuple
+    stops matching — otherwise the code could quietly drop slurm while every arm above kept
+    testing a mode the worker no longer treats that way.
+    """
+    assert tuple(SELF_STARTED_MODES) == MODES_THAT_APPLY_THE_VALUE, (
+        "the worker's SELF_STARTED_MODES no longer matches the modes these arms cover: "
+        f"module says {tuple(SELF_STARTED_MODES)!r}, arms cover "
+        f"{MODES_THAT_APPLY_THE_VALUE!r}. If that change is intended, update both."
+    )

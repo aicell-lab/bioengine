@@ -324,7 +324,7 @@ class RayCluster:
                 self.logger.debug(unapplied, self._runtime_env_pip_cache_size_gb, mode)
 
         # Additional configuration for starting a Ray cluster
-        if mode in ["single-machine", "slurm"]:
+        if mode in SELF_STARTED_MODES:
             # Find and store Ray executable path
             self.ray_exec_path = self._find_ray_executable()
             self.serve_exec_path = self._find_serve_executable()
@@ -484,16 +484,28 @@ class RayCluster:
         # `requested` is None when nobody passed a value, which is NOT the same as having
         # passed the default — telling those apart is what lets the startup message be an
         # error for a value somebody chose and silence for one nobody did.
+        #
+        # Read through `getattr`, for the same reason the `co_tenancy_warnings` line above
+        # does: this property is also called on instances built with `RayCluster.__new__`,
+        # which never ran `__init__` and so carry none of these attributes. Reading them
+        # directly turned two unrelated tests into AttributeErrors. `applied` falls back to
+        # deriving the answer from the mode rather than to a constant, because a hardcoded
+        # default would report a self-started cluster as "not applied".
+        pip_cache_applied = getattr(self, "_runtime_env_pip_cache_applied", None)
+        if pip_cache_applied is None:
+            pip_cache_applied = self.mode in SELF_STARTED_MODES
         status["runtime_env_pip_cache"] = {
-            "size_gb": self._runtime_env_pip_cache_size_gb,
-            "requested": self._runtime_env_pip_cache_requested,
-            "applied": self._runtime_env_pip_cache_applied,
-            "state": (
-                "applied" if self._runtime_env_pip_cache_applied else "not applied"
+            "size_gb": getattr(
+                self,
+                "_runtime_env_pip_cache_size_gb",
+                DEFAULT_RUNTIME_ENV_PIP_CACHE_SIZE_GB,
             ),
+            "requested": getattr(self, "_runtime_env_pip_cache_requested", None),
+            "applied": pip_cache_applied,
+            "state": ("applied" if pip_cache_applied else "not applied"),
             "detail": (
                 None
-                if self._runtime_env_pip_cache_applied
+                if pip_cache_applied
                 else (
                     f"the Ray pods in {self.mode} mode are created by the cluster operator, so "
                     "RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB has to be set on those pods and cannot be "
