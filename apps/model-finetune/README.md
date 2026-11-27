@@ -124,6 +124,19 @@ For the per-caller run listing, and what an id does and does not grant, see `lis
 - **`get_upload_url(file_type)`** Presigned S3 PUT URL (1-hour TTL) for staging
   an input image (`.npy`/`.png`/`.tif`/`.jpg`) or an embedding bundle (`.npz`).
 
+**Staged files: the hour is on the URL, not on the file.** The PUT URL
+`get_upload_url` hands back is good for one hour — upload within it, or request
+another. The **object** it uploads to is not on a timer: once the PUT has landed,
+the returned `file_path` stays readable, and a run that waits its turn in the
+training queue does not lose its inputs by waiting. So a `404` on a staged path
+is not a file that "timed out"; the usual cause is a PUT attempted after its URL
+had run out, which is easy to do when a dataset is staged by minting many URLs
+up front and uploading them in a long sequential loop — mint each URL next to
+its own upload. Presigned **download** URLs (what `preflight_training_dataset`
+and `compute_embedding(return_url=True)` return) are a separate, shorter-lived
+thing; pass the `file_path` instead of a download URL where a call accepts it,
+and the app mints a fresh one at read time.
+
 **Embedding reuse (Leg B).** Encode once, reuse the embedding for both the
 in-browser interactive decoder and automatic segmentation without a second
 encoder pass:
@@ -184,10 +197,13 @@ launch instead of OOMing mid-train.
   status (incl. `session_id`). `train_images` are arrays / URLs / `get_upload_url`
   paths; `train_labels` are dense instance masks (`.tif`/`.png`/`.npy`) or a
   `.geojson` FeatureCollection of polygons (rasterized to instances). Polygon
-  coordinates are **image pixels in `(x, y)` order** — x horizontal, y vertical,
-  origin at the top-left pixel — one instance per `Polygon`/`MultiPolygon`
-  feature, numbered from 1 in document order. A FeatureCollection that carries
-  polygons but rasterizes to nothing is rejected rather than trained on.
+  coordinates are **image pixels in `(x, y)` order, origin at the top-left pixel
+  and y increasing downward** — the raster convention, not y-up. One instance per
+  `Polygon`/`MultiPolygon` feature, numbered from 1 in document order. A
+  FeatureCollection that carries polygons but rasterizes to nothing is rejected
+  rather than trained on; a **y-up** one is not, because it rasterizes mirrored
+  with every polygon still inside the image, so nothing raises and the run trains
+  on wrong masks. Flip y before uploading if your annotator writes y-up.
   `n_objects_per_batch`/`patch_size` are micro-sam knobs; `diam_mean` (mean object
   diameter, px) is the cellpose knob (cpsam and cpdino alike). Only one session
   trains at a time across both backends (`QUEUED` while another holds the slot).
@@ -219,7 +235,9 @@ launch instead of OOMing mid-train.
   source is reported per-pair as `{ok: false, error}` rather than failing the batch.
   With `stage=True` (default) the prepared arrays are re-staged into the app's temp
   store and the returned `train_images`/`train_labels` URL lists feed straight into
-  `start_training` (call it promptly — staged URLs are short-lived). `enable_clahe`
+  `start_training` (call it promptly — those are presigned **download URLs** and
+  they are short-lived, though the objects behind them are not: see
+  "Staged files" below). `enable_clahe`
   applies contrast-limited adaptive histogram equalisation while staging (forces
   `stage` on) — reintroducing the old Cellpose app's CLAHE as an explicit opt-in for
   low-contrast fluorescence. Returns `{ok, train_pair_count, train_pair_ok,

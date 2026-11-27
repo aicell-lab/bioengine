@@ -2372,9 +2372,23 @@ def polygon_coordinate_bounds(payload: Any) -> Optional[Dict[str, float]]:
 def rasterize_geojson(payload: Dict[str, Any], width: int, height: int) -> np.ndarray:
     """Rasterize a GeoJSON FeatureCollection of polygons to a uint16 instance mask.
 
-    One instance per Polygon/MultiPolygon feature, ids from 1 in document order;
-    coordinates are image-pixel (x, y). Ported from cellpose-finetuning's
-    ``_rasterize_geojson_to_tiff`` (the bioimage.io colab polygon convention).
+    One instance per Polygon/MultiPolygon feature, ids from 1 in document order.
+
+    COORDINATES ARE IMAGE PIXELS ``(x, y)`` WITH THE ORIGIN AT THE TOP-LEFT AND
+    ``y`` INCREASING DOWNWARD -- the raster convention. That is not a choice made
+    here: the coordinates below go to PIL's ``ImageDraw.polygon`` on a
+    ``(width, height)`` canvas unchanged, and that is what PIL does.
+
+    Saying the DIRECTION matters, and an earlier version of this docstring said
+    only "image-pixel (x, y)". A y-UP annotation set (origin bottom-left, as
+    several GIS and plotting tools emit) rasterises VERTICALLY MIRRORED and
+    trains on wrong masks without raising anything -- every polygon still lands
+    inside the image, so no bounds check fires and the mask is not empty. There
+    is no runtime signal to notice, which is why the convention is written here,
+    in both RPC schemas and in the README rather than only in this file.
+
+    Ported from cellpose-finetuning's ``_rasterize_geojson_to_tiff`` (the
+    bioimage.io colab polygon convention).
     """
     from PIL import Image as PILImage, ImageDraw
 

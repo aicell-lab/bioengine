@@ -1097,7 +1097,21 @@ class EntryApp:
             "to store yourself and feed to infer).",
         ),
     ) -> Dict[str, str]:
-        """Presigned S3 PUT URL (1-hour TTL) for staging an input image or embedding."""
+        """Presigned S3 PUT URL for staging an input image or embedding.
+
+        THE ONE-HOUR TTL IS ON THE URL, NOT ON THE FILE. The handout below is
+        good for one hour: upload within it, or re-request a URL. Once the PUT
+        has landed, the object itself persists -- the temp store has no
+        short-lifetime policy, so a path staged hours or days earlier is still
+        readable, and a run that waits its turn in the training queue does not
+        lose its inputs by waiting.
+
+        So a 404 on a staged path is not evidence that it "expired": the usual
+        cause is that the PUT was attempted after its URL had run out, which is
+        easy to do when a dataset is staged by minting many URLs up front and
+        uploading them in a long sequential loop. Mint each URL next to its own
+        upload.
+        """
         file_path = f"temp/{uuid.uuid4()}{file_type}"
         upload_url = await self._s3.put_file(file_path=file_path, ttl=3600)
         return {"upload_url": upload_url, "file_path": file_path}
@@ -1218,7 +1232,10 @@ class EntryApp:
                 f"been uploaded, may have been removed, or the upload may have been "
                 f"attempted after its staging URL expired -- `get_upload_url` returns "
                 f"a presigned PUT valid for 1 hour, and a 404 cannot distinguish "
-                f"these. Re-request an upload URL and re-upload before training."
+                f"these. What it is NOT is the staged file timing out: once a PUT "
+                f"has landed the object is not removed on a timer, so a run that "
+                f"waited its turn in the training queue did not lose its inputs by "
+                f"waiting. Re-request an upload URL and re-upload before training."
             )
         resp.raise_for_status()
         buffer = BytesIO(resp.content)
@@ -2464,8 +2481,11 @@ class EntryApp:
         train_labels: List[Union[np.ndarray, str]] = Field(
             ...,
             description="Dense instance-label masks paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection). AIS fine-tuning "
-            "needs DENSE labels — annotate all objects per image.",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y) with the ORIGIN AT THE TOP-LEFT "
+            "and y increasing DOWNWARD -- the raster convention, not y-up; y-up "
+            "polygons rasterise mirrored and train silently on wrong masks). "
+            "AIS fine-tuning needs DENSE labels — annotate all objects per image.",
         ),
         val_images: Optional[List[Union[np.ndarray, str, Dict[str, Any]]]] = Field(
             None, description="Optional validation images; same forms as train_images."
@@ -2785,7 +2805,10 @@ class EntryApp:
         train_labels: List[str] = Field(
             ...,
             description="Instance-label mask sources paired 1:1 with train_images "
-            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection).",
+            "(.tif/.png/.npy, or a .geojson polygon FeatureCollection whose "
+            "coordinates are image pixels (x, y), origin TOP-LEFT and y "
+            "increasing DOWNWARD -- the raster convention; y-up polygons "
+            "rasterise mirrored).",
         ),
         val_images: Optional[List[str]] = Field(
             None, description="Optional validation image sources."
