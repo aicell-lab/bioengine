@@ -4287,8 +4287,23 @@ class AppsManager:
         4. Updates last_updated_at and last_updated_by timestamps
         5. Redeploys with new configuration
 
-        The deployment runs asynchronously - this method returns immediately after starting
-        the deployment process. Use get_app_status() to monitor deployment progress and health.
+        The deployment finishes in the background, but this method is NOT immediate, and
+        it holds the deployment lock for everything below — so a call also waits out any
+        other caller's deploy_app in full, which on a busy worker is the likeliest reason
+        for a slow one. Awaited before the background task is created, in this order: the
+        in-flight deployment of this application_id is cancelled if there is one (up to
+        60 s, update path only), the application is BUILT, the running Serve application is
+        deleted if its source changed (update path only), and cluster resources are
+        checked. A caller can therefore see its own RPC time out while the deployment goes
+        on to SUCCEED. Treat a timeout here as "unknown, probably still running" rather
+        than redeploying.
+
+        Pass your own application_id to make that survivable: a retry then resolves to an
+        update of the same application, and get_app_status(application_ids=[...]) can be
+        read for what actually happened. With application_id omitted, every attempt
+        generates a fresh random id, so a retry after a timeout leaves a SECOND instance
+        running — and the first one's id was only in the return value the timeout
+        discarded.
 
         Resource Management:
         - Automatically scales Ray cluster if needed (SLURM mode)
