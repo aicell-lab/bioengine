@@ -271,7 +271,14 @@ async def test_a_refused_version_does_NOT_move_the_artifact_first() -> None:
             logger=_logger(),
         )
 
-    assert "greater" in str(err.value).lower() or "version" in str(err.value).lower()
+    # Review nit, taken: the previous check was `"greater" in msg or "version" in msg`,
+    # which would accept almost any error this function can raise -- including the
+    # "missing a 'version' field" one, which is a different refusal entirely. Assert the
+    # phrase the monotonicity guard actually emits, and the offending version, so the arm
+    # cannot pass on the wrong refusal.
+    msg = str(err.value)
+    assert "must be strictly greater than the highest existing version" in msg, msg
+    assert "1.5.0" in msg, f"the refusal does not name the version it rejected: {msg}"
     assert "set_parent" not in am.calls, (
         f"the artifact was MOVED before the version check refused the upload, so a "
         f"refused call still relocated it: {am.calls}"
