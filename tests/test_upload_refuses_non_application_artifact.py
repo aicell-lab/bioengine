@@ -207,6 +207,44 @@ async def test_stage_artifact_does_NOT_DELETE_a_dataset_at_the_same_alias():
 
 
 @pytest.mark.asyncio
+async def test_a_manifest_id_of_applications_cannot_delete_the_COLLECTION_itself():
+    """The worst case: `id: applications` targets the collection that indexes every app.
+
+    ``artifact_id`` is ``f"{ws}/{alias}"`` and ``collection_id`` is ``f"{ws}/applications"``,
+    so this alias makes the two equal. The collection's own ``parent_id`` is None, which is
+    != the collection id, so the placement check fires on the collection itself. "applications"
+    is a legal manifest id -- lowercase, no underscore, a valid identifier -- so nothing
+    upstream rejects it.
+
+    Measured live on an unfixed tree in a personal workspace: the collection (42 children)
+    was deleted, the apps were ORPHANED rather than destroyed, and the upload then failed
+    with a RuntimeError about creating the artifact, so the operator sees an error that says
+    nothing about what was lost. ``list_apps`` enumerates this exact collection, so
+    ``bioengine apps list`` goes empty while the app artifacts still exist, detached.
+    """
+    collection = _FakeArtifact("collection", None)
+    am = _FakeArtifactManager(collection)
+
+    error = None
+    try:
+        await stage_artifact(
+            artifact_manager=am,
+            workspace=WORKSPACE,
+            manifest={**_manifest(), "id": "applications"},
+        )
+    except ValueError as e:
+        error = e
+
+    assert (
+        am.deleted == []
+    ), f"stage_artifact DELETED the applications collection: {am.deleted}"
+    assert error is not None, "the upload was accepted against the collection itself"
+    assert "'collection'" in str(
+        error
+    ), f"the refusal should name the artifact type it found: {error}"
+
+
+@pytest.mark.asyncio
 async def test_a_wrong_collection_APPLICATION_is_still_migrated():
     """The behaviour the fix must preserve, so the guard cannot be over-broad.
 
