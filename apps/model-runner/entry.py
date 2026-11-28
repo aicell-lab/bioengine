@@ -50,7 +50,6 @@ from runtime import (
     resolve_conda_binary,
 )
 
-
 logger = logging.getLogger("ray.serve")
 logger.setLevel("INFO")
 
@@ -96,6 +95,188 @@ def _read_pip(name: str) -> List[str]:
         for line in text.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+
+
+def _declared_axis_sizes(input_spec: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Normalise ONE RDF input entry into a per-axis size description.
+
+    Returns a list, one entry per declared axis, in axis order::
+
+        {"id": "y", "fixed": 512}            # must be exactly 512
+        {"id": "y", "min": 64, "step": 16}   # min + n*step, n >= 0
+        {"id": "b", "any": True}             # nothing declared, or not parseable
+
+    or ``None`` when the entry cannot be read at all — which is the signal to
+    check NOTHING rather than to guess.
+
+    Both spec formats are handled because the Zoo serves both, and reading one
+    through the other's shape is how #0958 broke six models:
+
+    * **0.4** carries a STRING ``axes`` ("bcyx") plus a separate ``shape``, which
+      is either a fixed list ``[1, 1, 512, 512]`` or ``{"min": [...],
+      "step": [...]}``. A ``step`` of 0 means that axis is fixed at ``min``.
+    * **0.5** carries ``axes`` as a LIST of objects, each with its own ``size``:
+      an int (fixed), ``{"min":, "step":}``, or a REFERENCE to another tensor's
+      axis (``{"axis_id":, "tensor_id":}``), which this cannot resolve and
+      therefore reports as unconstrained.
+    """
+    axes = input_spec.get("axes")
+    if axes is None:
+        return None
+
+    # ---- 0.5: a list of axis objects, each carrying its own size ----
+    if isinstance(axes, list):
+        out: List[Dict[str, Any]] = []
+        for axis in axes:
+            if not isinstance(axis, dict):
+                return None
+            aid = str(axis.get("id") or axis.get("type") or "?")
+            size = axis.get("size")
+            if isinstance(size, bool):
+                return None
+            if isinstance(size, int):
+                out.append({"id": aid, "fixed": int(size)})
+            elif isinstance(size, dict) and "min" in size and "step" in size:
+                try:
+                    out.append(
+                        {"id": aid, "min": int(size["min"]), "step": int(size["step"])}
+                    )
+                except (TypeError, ValueError):
+                    return None
+            else:
+                # Absent, or a reference to another tensor's axis: unconstrained
+                # as far as this check is concerned.
+                out.append({"id": aid, "any": True})
+        return out
+
+    # ---- 0.4: string axes + a separate shape ----
+    if isinstance(axes, str):
+        ids = list(axes)
+        shape = input_spec.get("shape")
+        if isinstance(shape, list):
+            if len(shape) != len(ids):
+                return None
+            try:
+                return [{"id": i, "fixed": int(s)} for i, s in zip(ids, shape)]
+            except (TypeError, ValueError):
+                return None
+        if isinstance(shape, dict) and "min" in shape:
+            mins = shape.get("min")
+            steps = shape.get("step")
+            if not isinstance(mins, list) or len(mins) != len(ids):
+                return None
+            if steps is not None and (
+                not isinstance(steps, list) or len(steps) != len(ids)
+            ):
+                return None
+            out = []
+            try:
+                for idx, aid in enumerate(ids):
+                    lo = int(mins[idx])
+                    st = int(steps[idx]) if steps is not None else 0
+                    # step 0 is how 0.4 spells "this axis is fixed at min".
+                    out.append(
+                        {"id": aid, "fixed": lo}
+                        if st == 0
+                        else {"id": aid, "min": lo, "step": st}
+                    )
+            except (TypeError, ValueError):
+                return None
+            return out
+        # Axes are known but no shape is declared: axis COUNT is still checkable.
+        return [{"id": i, "any": True} for i in ids]
+
+    return None
+
+
+def _nearest_valid_sizes(lo: int, step: int, n: int) -> List[int]:
+    """The valid sizes either side of ``n`` on the ``lo + k*step`` grid."""
+    if n <= lo:
+        return [lo]
+    k = (n - lo) // step
+    below = lo + k * step
+    return [below] if below == n else [below, below + step]
+
+
+def _input_fit_error(
+    model_rdf: Dict[str, Any], arrays: Dict[str, "np.ndarray"]
+) -> Optional[str]:
+    """Why these arrays cannot fit this model, or ``None`` if they might.
+
+    #1103. ``infer`` used to queue any array it could decode and only discover a
+    shape mismatch after the model download and the queue wait — measured at
+    334 s for a 2-D ``.npy`` sent to a 4-axis model, which spends a screening
+    batch to learn something knowable up front. The model's declared input sizes
+    are in the RDF, which is a small YAML next to the weights, so the answer is
+    available before anything is enqueued.
+
+    FAILS OPEN, deliberately and in every unclear case: a missing RDF field, an
+    unrecognised spec layout, a size that is a reference to another tensor, a
+    name this cannot match to a declared input — all return ``None``, meaning
+    "queue it and let the runtime decide". A pre-check that guesses would refuse
+    work the model would in fact have accepted, which is strictly worse than the
+    slow failure it replaces. The only refusals are ones this can show.
+    """
+    inputs = model_rdf.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        return None
+
+    # One unnamed array against a single-input model is the common case; match
+    # by position. Anything else matches by the input's declared id/name, and a
+    # key this cannot place is left alone.
+    def _spec_for(key: str, index: int) -> Optional[Dict[str, Any]]:
+        if len(inputs) == 1 and (len(arrays) == 1 or key == SINGLE_INPUT_KEY):
+            return inputs[0] if isinstance(inputs[0], dict) else None
+        for spec in inputs:
+            if not isinstance(spec, dict):
+                continue
+            if key in (spec.get("id"), spec.get("name")):
+                return spec
+        return None
+
+    for index, (key, array) in enumerate(arrays.items()):
+        shape = getattr(array, "shape", None)
+        if shape is None:
+            continue
+        spec = _spec_for(key, index)
+        if spec is None:
+            continue
+        declared = _declared_axis_sizes(spec)
+        if declared is None:
+            continue
+
+        label = spec.get("id") or spec.get("name") or key
+
+        if len(shape) != len(declared):
+            axis_ids = ",".join(str(a["id"]) for a in declared)
+            return (
+                f"Input {label!r} has {len(shape)} axes {tuple(shape)}, but the "
+                f"model declares {len(declared)} ({axis_ids}). Reshape the array "
+                f"to {len(declared)} axes before submitting — a singleton batch "
+                f"or channel axis is usually what is missing."
+            )
+
+        for extent, axis in zip(shape, declared):
+            if axis.get("any"):
+                continue
+            if "fixed" in axis:
+                if int(extent) != int(axis["fixed"]):
+                    return (
+                        f"Input {label!r} axis {axis['id']!r} is {int(extent)}, but "
+                        f"the model declares a fixed {int(axis['fixed'])}. Valid "
+                        f"size: {int(axis['fixed'])}."
+                    )
+                continue
+            lo, step = int(axis["min"]), int(axis["step"])
+            if int(extent) < lo or (int(extent) - lo) % step != 0:
+                options = _nearest_valid_sizes(lo, step, int(extent))
+                nearest = " or ".join(str(o) for o in options)
+                return (
+                    f"Input {label!r} axis {axis['id']!r} is {int(extent)}, which is "
+                    f"not on the model's grid (min {lo}, step {step}). Nearest "
+                    f"valid size: {nearest}."
+                )
+    return None
 
 
 @bioengine.app(
@@ -3548,6 +3729,33 @@ class EntryDeployment:
                     f"Input {key!r} did not resolve to a numpy array (got "
                     f"{type(value).__name__})."
                 )
+
+        # #1103: refuse an input that cannot fit this model BEFORE queueing it.
+        # The declared sizes live in the RDF, a small YAML beside the weights, so
+        # this costs one HTTP GET rather than the model download plus the queue
+        # wait that used to precede the same refusal — measured at 334 s for a
+        # 2-D array sent to a 4-axis model.
+        #
+        # Both halves fail OPEN. An RDF this cannot fetch, and an RDF whose
+        # layout ``_input_fit_error`` cannot read, both queue the job exactly as
+        # before: a pre-check that refuses on a guess would reject work the model
+        # would have accepted, which is worse than the slow failure it replaces.
+        try:
+            model_rdf = await self.get_model_rdf(model_id=model_id)
+        except Exception as rdf_error:
+            logger.warning(
+                f"⚠️ Could not read the RDF for '{model_id}' before queueing, so "
+                f"the input fit was not pre-checked: {rdf_error}"
+            )
+            model_rdf = None
+        if isinstance(model_rdf, dict):
+            fit_error = _input_fit_error(model_rdf, inputs)
+            if fit_error:
+                logger.info(
+                    f"⛔ Refusing inference for '{model_id}' before queueing: "
+                    f"{fit_error}"
+                )
+                raise ValueError(fit_error)
 
         job = self._new_infer_job(
             model_id=model_id, return_download_url=bool(return_download_url)
