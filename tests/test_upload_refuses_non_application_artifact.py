@@ -1,0 +1,234 @@
+"""An upload must not delete an artifact that is not a BioEngine application.
+
+``stage_artifact`` resolves the manifest's ``id`` to ``<workspace>/<alias>`` across the
+whole workspace, while applications live in ``<workspace>/applications``. The placement
+check that follows therefore sees non-application artifacts too -- a dataset, a model, a
+collection -- and used to delete every one of them to "recreate" it in the right place.
+
+Two layers of arms, deliberately:
+
+* The ``_enforce_replaceable_artifact`` arms pin the decision itself. They are cheap and
+  need no Hypha server, matching ``test_artifact_version_guard.py``.
+* The ``stage_artifact`` arms drive the real call site through a fake artifact manager and
+  assert on whether ``delete`` was called. Those are the ones that go RED against the
+  unfixed code: a pure-helper arm cannot, because on unfixed code the helper does not
+  exist and the module fails to import, which is a collection ERROR and not a failure.
+"""
+
+import pytest
+
+from bioengine.utils.artifact_utils import (
+    _APPLICATION_ARTIFACT_TYPE,
+    _enforce_replaceable_artifact,
+    stage_artifact,
+)
+
+WORKSPACE = "ws"
+COLLECTION = f"{WORKSPACE}/applications"
+ALIAS = "my-thing"
+ARTIFACT_ID = f"{WORKSPACE}/{ALIAS}"
+
+
+def _manifest(version="1.0.0"):
+    return {
+        "id": ALIAS,
+        "name": "My Thing",
+        "description": "d",
+        "type": "ray-serve",
+        "entry": "pkg.mod:Cls",
+        "version": version,
+    }
+
+
+class _FakeArtifact:
+    """Stands in for what ``artifact_manager.read`` returns.
+
+    Attribute access, not a dict: the call site uses ``getattr(existing_artifact, ...)``,
+    so a dict fixture would make every ``getattr`` fall to its default and the arm would
+    pass for the wrong reason.
+    """
+
+    def __init__(self, artifact_type, parent_id, versions=None):
+        self.id = ARTIFACT_ID
+        self.alias = ALIAS
+        self.type = artifact_type
+        self.parent_id = parent_id
+        self.config = {}
+        self.versions = versions if versions is not None else []
+        self.manifest = {}
+
+
+class _FakeArtifactManager:
+    """Records the calls that matter and fails loudly on the ones that should not happen."""
+
+    def __init__(self, existing):
+        self._existing = existing
+        self.deleted = []
+        self.created = []
+        self.edited = []
+
+    async def read(self, artifact_id):
+        if self._existing is None:
+            raise KeyError(f"Artifact with ID '{artifact_id}' does not exist.")
+        return self._existing
+
+    async def delete(self, artifact_id=None, **kw):
+        self.deleted.append(artifact_id)
+
+    async def create(self, **kw):
+        self.created.append(kw)
+        return _FakeArtifact(kw.get("type"), kw.get("parent_id"))
+
+    async def edit(self, **kw):
+        self.edited.append(kw)
+        return _FakeArtifact(
+            _APPLICATION_ARTIFACT_TYPE, COLLECTION, versions=self._existing.versions
+        )
+
+
+# --------------------------------------------------------------------------- #
+# the decision, in isolation
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "artifact_type",
+    ["dataset", "model", "collection", "generic", "", None],
+)
+def test_a_non_application_artifact_is_REFUSED(artifact_type):
+    """Anything that is not an application artifact must raise, including no type at all.
+
+    Parametrised over the type because that is the input the guard reads; the constant it
+    compares against is asserted separately below, so this does not police its own value.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _enforce_replaceable_artifact(
+            artifact_id=ARTIFACT_ID,
+            artifact_type=artifact_type,
+            current_parent_id=f"{WORKSPACE}/datasets",
+            collection_id=COLLECTION,
+        )
+    msg = str(excinfo.value)
+    # The message has to be actionable: name the id, say it would be destroyed, and say
+    # what to do. A bare "refused" would satisfy pytest.raises and help nobody.
+    assert ARTIFACT_ID in msg
+    assert "DELETE" in msg
+    assert "manifest.yaml" in msg
+    assert repr(artifact_type) in msg
+
+
+def test_an_application_artifact_in_the_wrong_collection_is_ALLOWED():
+    """The migration path this guard must not break."""
+    _enforce_replaceable_artifact(
+        artifact_id=ARTIFACT_ID,
+        artifact_type=_APPLICATION_ARTIFACT_TYPE,
+        current_parent_id=f"{WORKSPACE}/something-else",
+        collection_id=COLLECTION,
+    )
+
+
+def test_the_guard_compares_against_the_type_the_code_actually_WRITES():
+    """Pins the constant to the literal ``create`` uses, in the same module.
+
+    Without this, the guard and the create path could drift apart and every arm above
+    would still pass -- they all speak through the same constant.
+    """
+    import inspect
+
+    from bioengine.utils import artifact_utils
+
+    src = inspect.getsource(artifact_utils.stage_artifact)
+    assert f'"type": "{_APPLICATION_ARTIFACT_TYPE}"' in src, (
+        "stage_artifact no longer creates artifacts with type "
+        f"{_APPLICATION_ARTIFACT_TYPE!r}; the guard is comparing against a dead value."
+    )
+    # And it is the ARTIFACT type, not the manifest's. If these ever coincide the
+    # distinction that made this bug subtle has been lost.
+    assert _APPLICATION_ARTIFACT_TYPE != "ray-serve"
+
+
+# --------------------------------------------------------------------------- #
+# the real call site -- these go RED on the unfixed code
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_stage_artifact_does_NOT_DELETE_a_dataset_at_the_same_alias():
+    """The regression. On unfixed code the dataset is deleted and this arm fails."""
+    dataset = _FakeArtifact("dataset", f"{WORKSPACE}/datasets")
+    am = _FakeArtifactManager(dataset)
+
+    with pytest.raises(ValueError, match="not a BioEngine application"):
+        await stage_artifact(
+            artifact_manager=am,
+            workspace=WORKSPACE,
+            manifest=_manifest(),
+        )
+
+    assert am.deleted == [], (
+        "stage_artifact deleted a non-application artifact: " f"{am.deleted}"
+    )
+    assert am.created == [], "it also recreated it as an application"
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_collection_APPLICATION_is_still_migrated():
+    """The behaviour the fix must preserve, so the guard cannot be over-broad.
+
+    This passes both before and after the fix. It is here so that "refuse everything"
+    is not an accepted answer to this issue.
+    """
+    strayed_app = _FakeArtifact(_APPLICATION_ARTIFACT_TYPE, f"{WORKSPACE}/elsewhere")
+    am = _FakeArtifactManager(strayed_app)
+
+    await stage_artifact(
+        artifact_manager=am,
+        workspace=WORKSPACE,
+        manifest=_manifest(),
+    )
+
+    assert am.deleted == [ARTIFACT_ID], (
+        "the strayed application was not deleted and recreated; the migration path "
+        f"regressed (deleted={am.deleted})"
+    )
+    assert am.created, "it was not recreated in the applications collection"
+    assert am.created[0]["parent_id"] == COLLECTION
+
+
+@pytest.mark.asyncio
+async def test_an_application_ALREADY_in_the_collection_is_never_deleted():
+    """The common path: edited in place, so the version guard still gets to run."""
+    app = _FakeArtifact(
+        _APPLICATION_ARTIFACT_TYPE, COLLECTION, versions=[{"version": "0.9.0"}]
+    )
+    am = _FakeArtifactManager(app)
+
+    await stage_artifact(
+        artifact_manager=am,
+        workspace=WORKSPACE,
+        manifest=_manifest("1.0.0"),
+    )
+
+    assert am.deleted == []
+    assert am.edited, "the existing artifact was not edited in place"
+
+
+@pytest.mark.asyncio
+async def test_the_version_guard_still_fires_for_an_artifact_in_the_collection():
+    """Shows the delete is not silently bypassing the monotonicity check.
+
+    This is the protection the old code skipped in exactly the destructive case: the
+    version guard only runs for an artifact the caller KEEPS.
+    """
+    app = _FakeArtifact(
+        _APPLICATION_ARTIFACT_TYPE, COLLECTION, versions=[{"version": "2.0.0"}]
+    )
+    am = _FakeArtifactManager(app)
+
+    with pytest.raises(ValueError, match="strictly greater"):
+        await stage_artifact(
+            artifact_manager=am,
+            workspace=WORKSPACE,
+            manifest=_manifest("1.0.0"),
+        )
+    assert am.deleted == []
