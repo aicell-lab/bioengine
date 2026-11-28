@@ -623,29 +623,49 @@ async def stage_artifact(
                 current_parent_id=current_parent_id,
                 collection_id=collection_id,
             )
+            # REFUSE BEFORE TOUCHING IT. The version gate runs here, on the versions from
+            # the read above, and NOT after the move.
+            #
+            # Running it after would mean an upload that is REFUSED for a non-increasing
+            # version has ALREADY relocated someone's artifact: the caller gets a
+            # ValueError and the artifact has silently changed collection. That is exactly
+            # the harm this function refuses to do to a dataset, done to an application
+            # instead, so the ordering is the whole point rather than a detail.
+            #
+            # Checking first costs nothing: ``set_parent`` preserves committed versions
+            # (measured in a throwaway workspace -- two versions and their payloads
+            # byte-identical afterwards), so the pre-move versions ARE the post-move
+            # versions.
+            _enforce_version_increases(
+                new_version=manifest_version,
+                existing_versions=[
+                    v["version"]
+                    for v in (getattr(existing_artifact, "versions", None) or [])
+                ],
+                artifact_id=artifact_id,
+            )
             logger.info(
                 f"Application '{artifact_id}' sits outside the applications collection "
                 f"(current: {_describe_collection(current_parent_id)}, expected: "
                 f"'{collection_id}'). Moving it in; its committed versions and their "
                 "files are preserved."
             )
-            # A TRUE MOVE, not a rebuild. ``set_parent`` was measured in a throwaway
-            # workspace to leave committed versions and their payloads byte-identical.
-            # The delete-and-recreate this replaces destroyed the version history AND
-            # skipped the version-increase check, because that check runs only in the
-            # ``if existing_artifact:`` branch below, which a recreated artifact never
-            # reached.
-            #
-            # The re-read is therefore not cosmetic: it keeps ``existing_artifact``
-            # truthy, so a migrated application is version-gated like any other. That is
-            # deliberate. An app that strayed is still an app with a published lineage,
-            # and letting a move reset its version floor would reopen the hole from the
-            # other side.
+            # A TRUE MOVE, not a rebuild. The delete-and-recreate this replaces destroyed
+            # the version history AND skipped the version-increase check, because that
+            # check runs only in the ``if existing_artifact:`` branch below, which a
+            # recreated artifact never reached.
             #
             # ``set_parent`` takes the parent POSITIONALLY -- ``parent_id=`` raises
             # TypeError.
             await artifact_manager.set_parent(artifact_id, collection_id)
-            existing_artifact = await artifact_manager.read(artifact_id)
+            # NO re-read. An earlier revision re-read the artifact here and claimed the
+            # re-read was load-bearing. It is not: removing it leaves every arm green,
+            # which review demonstrated by mutation, so the claim was untested. The
+            # handle from the read above is the one the edit below needs -- `edit` is
+            # keyed by artifact_id, not by the handle, and `set_parent` preserves both
+            # `config` and the committed versions. Using the PRE-move config is also the
+            # more faithful thing, since the point of reading it is to preserve what was
+            # there. One fewer RPC, and one fewer sentence that no test could falsify.
 
         if existing_artifact:
             # Edit existing artifact — preserve existing config, then apply overrides

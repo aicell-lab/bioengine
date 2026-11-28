@@ -245,3 +245,62 @@ def test_the_refusal_message_does_not_print_a_bare_None() -> None:
     assert _describe_collection(None) == "no collection (root level)"
     assert _describe_collection(COLLECTION) == f"'{COLLECTION}'"
     assert "None" not in _describe_collection(None)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_version_does_NOT_move_the_artifact_first() -> None:
+    """The ordering arm. RED before the repair, and the repair is the point of it.
+
+    A strayed application at 1.0.0 and 2.0.0, uploaded with manifest 1.5.0, must be
+    REFUSED for the non-increasing version -- and must still be where it was. Before the
+    repair the move happened first, so the caller got a ValueError while the artifact had
+    already silently changed collection: exactly the harm this function refuses to do to a
+    dataset, done to an application instead.
+
+    The `set_parent` assertion is what makes this arm bite. Asserting only the ValueError
+    passes on the broken ordering, because the broken ordering also raises.
+    """
+    rec = _Record(atype="application", parent_id=None, versions=LINEAGE)
+    am = _FakeArtifactManager(rec)
+
+    with pytest.raises(ValueError) as err:
+        await stage_artifact(
+            artifact_manager=am,
+            workspace=WS,
+            manifest=_manifest(version="1.5.0"),
+            logger=_logger(),
+        )
+
+    assert "greater" in str(err.value).lower() or "version" in str(err.value).lower()
+    assert "set_parent" not in am.calls, (
+        f"the artifact was MOVED before the version check refused the upload, so a "
+        f"refused call still relocated it: {am.calls}"
+    )
+    assert am.store[AID].parent_id is None, (
+        f"the refused upload left the artifact in a different collection: "
+        f"{am.store[AID].parent_id!r}"
+    )
+    assert am.store[AID].payloads == LINEAGE, "the refused upload altered the lineage"
+
+
+@pytest.mark.asyncio
+async def test_a_migrated_application_IS_version_gated() -> None:
+    """Finding 2's arm: the gating claim was untested, so a mutation disabling it passed.
+
+    A strayed application at 2.0.0 uploaded with manifest 2.0.0 must be refused. Without
+    this, turning the gate off for exactly the migrated case left all arms green -- every
+    other arm feeds 3.0.0, which is above the lineage and so never exercises the gate.
+    """
+    rec = _Record(
+        atype="application", parent_id=None, versions={"2.0.0": b"payload-v2"}
+    )
+    am = _FakeArtifactManager(rec)
+
+    with pytest.raises(ValueError):
+        await stage_artifact(
+            artifact_manager=am,
+            workspace=WS,
+            manifest=_manifest(version="2.0.0"),
+            logger=_logger(),
+        )
+    assert "set_parent" not in am.calls, f"refused, but moved anyway: {am.calls}"
