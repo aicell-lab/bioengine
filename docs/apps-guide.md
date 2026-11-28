@@ -888,6 +888,21 @@ Hypha's own `put_file` *will* overwrite a committed path silently, so immutabili
 invariant of the upload path rather than a guarantee of the platform. Bypass `upload_app` and
 you lose it.
 
+**The manifest `id` is resolved against the whole workspace, not just the app collection.**
+`stage_artifact` builds the artifact id as `<workspace>/<manifest id>`
+(`validate_artifact_id`), while apps live in `<workspace>/applications`. So the id can already
+be held by something that is not an app at all — a dataset, a model, a collection — and
+`bioengine apps list` cannot show you, because it enumerates only the app collection. An
+upload onto such an id is **refused**, at any version: the artifact is left alone and the
+error names it and tells you to change the `id`. Only an artifact that is itself an app, but
+sits outside the app collection, is moved into it (deleted and recreated there), which is a
+migration rather than a loss. An absent or unrecognised artifact type is refused too — this
+fails closed on purpose, because refusing a migration costs a message while allowing one
+wrongly costs data.
+
+Note that refusal is what makes the id safe, not any check you can run beforehand: `validate`
+is offline and has no workspace, so it can only warn.
+
 **A running app redeployed without a version keeps the version it is running.**
 `deploy_app` resolves an omitted `version` to `"inherited"` for an `application_id` that is
 already running — not to `latest` — and returns that in `version_source`. So an upload cannot

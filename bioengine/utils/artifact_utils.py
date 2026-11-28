@@ -29,6 +29,16 @@ _COLLISION_ADVICE = (
     "committed version is never withdrawn."
 )
 
+# The artifact ``type`` every BioEngine application carries. Set on create (see
+# ``stage_artifact``), and the only value for which replacing an artifact that sits
+# outside the applications collection is a migration rather than destruction.
+#
+# NOTE: this is the *artifact* type, not the manifest's. A manifest declares
+# ``type: ray-serve`` (``validate_manifest``) while the artifact wrapping it is typed
+# ``application`` — read live from two published apps to confirm, because mistaking one
+# for the other here would refuse every legitimate migration instead of allowing it.
+_APPLICATION_ARTIFACT_TYPE = "application"
+
 
 def _enforce_version_increases(
     new_version: Optional[str],
@@ -70,6 +80,43 @@ def _enforce_version_increases(
             f"'{highest_str}' (existing: {existing_versions}). "
             f"{_COLLISION_ADVICE}"
         )
+
+
+def _enforce_replaceable_artifact(
+    artifact_id: str,
+    artifact_type: Optional[str],
+    current_parent_id: Optional[str],
+    collection_id: str,
+) -> None:
+    """Refuse to delete an artifact that is not a BioEngine application.
+
+    ``stage_artifact`` resolves the manifest's ``id`` to ``<workspace>/<alias>`` across
+    the WHOLE workspace, but applications live in ``<workspace>/applications``. So an
+    upload can find an artifact at that alias which is not an application at all -- a
+    dataset, a model, a collection. Recreating it in the right collection is only
+    sensible when it IS an application that has strayed; for anything else the delete
+    destroys unrelated work, and the version-monotonicity guard cannot protect it
+    because that guard only runs for an artifact the caller keeps.
+
+    Raises:
+        ValueError: If the existing artifact is not an application artifact. An absent
+            or unrecognised type also raises: this fails CLOSED, because the cost of
+            refusing a migration is a message, and the cost of allowing one wrongly is
+            someone else's data.
+    """
+    if artifact_type == _APPLICATION_ARTIFACT_TYPE:
+        return
+
+    raise ValueError(
+        f"Cannot upload to '{artifact_id}': an artifact already exists at that id and "
+        f"it is not a BioEngine application (artifact type: {artifact_type!r}). It is "
+        f"in collection {current_parent_id!r} rather than '{collection_id}', so "
+        f"uploading here would DELETE it. The manifest's 'id' is resolved against the "
+        f"whole workspace, not only the applications collection, so an id that no "
+        f"application uses can still be taken. Choose a different 'id' in "
+        f"manifest.yaml. If that artifact really is obsolete, delete it deliberately "
+        f"first -- this upload will not do it for you."
+    )
 
 
 def latest_committed_version(artifact: Dict[str, Any]) -> Optional[str]:
@@ -555,6 +602,14 @@ async def stage_artifact(
         # Check if artifact is in the correct collection
         current_parent_id = getattr(existing_artifact, "parent_id", None)
         if current_parent_id != collection_id:
+            # Only an application artifact may be recreated here. Anything else at this
+            # alias belongs to someone's other work, and the delete below is final.
+            _enforce_replaceable_artifact(
+                artifact_id=artifact_id,
+                artifact_type=getattr(existing_artifact, "type", None),
+                current_parent_id=current_parent_id,
+                collection_id=collection_id,
+            )
             logger.info(
                 f"Artifact '{artifact_id}' exists but is in wrong collection "
                 f"(current: {current_parent_id}, expected: {collection_id}). "
