@@ -14,4 +14,4 @@ Must stay in lock-step with ``pyproject.toml``'s ``version`` field.
 The ``version-check.yml`` CI workflow enforces the match.
 """
 
-__version__ = "0.16.141"
+__version__ = "0.16.142"
