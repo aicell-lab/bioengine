@@ -66,6 +66,14 @@ class _FakeArtifactManager:
         self.deleted = []
         self.created = []
         self.edited = []
+        self.set_parent_calls = []
+
+    async def set_parent(self, *args, **kwargs):
+        # The migration path moves a strayed application instead of rebuilding it. The
+        # parent is positional: `parent_id=` raises TypeError on the deployed manager.
+        self.set_parent_calls.append((args, kwargs))
+        if self._existing is not None and args:
+            self._existing.parent_id = args[-1]
 
     async def read(self, artifact_id):
         if self._existing is None:
@@ -260,10 +268,14 @@ async def test_a_manifest_id_of_applications_cannot_delete_the_COLLECTION_itself
 
 @pytest.mark.asyncio
 async def test_a_wrong_collection_APPLICATION_is_still_migrated():
-    """The behaviour the fix must preserve, so the guard cannot be over-broad.
+    """The behaviour the guard must not swallow: a strayed APPLICATION is still migrated.
 
-    This passes both before and after the fix. It is here so that "refuse everything"
-    is not an accepted answer to this issue.
+    Here so that "refuse everything" is not an accepted answer to this issue. What it must
+    NOT pin is HOW the migration happens -- this arm used to require
+    ``deleted == [ARTIFACT_ID]``, i.e. it asserted the delete-and-recreate that destroyed
+    the artifact's version history, so the arm itself defended the data loss. The migration
+    is now a move; the version-preservation arms live in
+    ``test_strayed_application_is_migrated_not_recreated.py``.
     """
     strayed_app = _FakeArtifact(_APPLICATION_ARTIFACT_TYPE, f"{WORKSPACE}/elsewhere")
     am = _FakeArtifactManager(strayed_app)
@@ -274,12 +286,14 @@ async def test_a_wrong_collection_APPLICATION_is_still_migrated():
         manifest=_manifest(),
     )
 
-    assert am.deleted == [ARTIFACT_ID], (
-        "the strayed application was not deleted and recreated; the migration path "
-        f"regressed (deleted={am.deleted})"
+    assert am.set_parent_calls, (
+        "the strayed application was not migrated at all; the migration path regressed "
+        "into refusing it"
     )
-    assert am.created, "it was not recreated in the applications collection"
-    assert am.created[0]["parent_id"] == COLLECTION
+    assert (
+        am.deleted == []
+    ), f"the strayed application was DELETED rather than moved (deleted={am.deleted})"
+    assert am.created == [], "it was recreated, which loses its version history"
 
 
 @pytest.mark.asyncio

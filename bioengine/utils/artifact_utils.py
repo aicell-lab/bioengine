@@ -107,11 +107,21 @@ def _enforce_replaceable_artifact(
     if artifact_type == _APPLICATION_ARTIFACT_TYPE:
         return
 
+    # An artifact at the workspace root has `parent_id` None, which is the COMMON case for
+    # the thing this guard protects -- a dataset or model uploaded straight into the
+    # workspace. Interpolating it rendered "in collection None", which reads like a bug in
+    # the error rather than a fact about the artifact, in the one message whose whole job is
+    # to be believed.
+    where = (
+        "at the workspace root"
+        if current_parent_id is None
+        else f"in collection '{current_parent_id}'"
+    )
     raise ValueError(
         f"Cannot upload to '{artifact_id}': an artifact already exists at that id and "
         f"it is not a BioEngine application (artifact type: {artifact_type!r}). It is "
-        f"in collection {current_parent_id!r} rather than '{collection_id}', so "
-        f"uploading here would DELETE it. The manifest's 'id' is resolved against the "
+        f"{where} rather than in '{collection_id}', so uploading here would DELETE it. "
+        f"The manifest's 'id' is resolved against the "
         f"whole workspace, not only the applications collection, so an id that no "
         f"application uses can still be taken. Choose a different 'id' in "
         f"manifest.yaml. If that artifact really is obsolete, delete it deliberately "
@@ -602,8 +612,8 @@ async def stage_artifact(
         # Check if artifact is in the correct collection
         current_parent_id = getattr(existing_artifact, "parent_id", None)
         if current_parent_id != collection_id:
-            # Only an application artifact may be recreated here. Anything else at this
-            # alias belongs to someone's other work, and the delete below is final.
+            # Only an application artifact may be moved here. Anything else at this alias
+            # belongs to someone's other work, and this must not touch it at all.
             _enforce_replaceable_artifact(
                 artifact_id=artifact_id,
                 artifact_type=getattr(existing_artifact, "type", None),
@@ -611,12 +621,26 @@ async def stage_artifact(
                 collection_id=collection_id,
             )
             logger.info(
-                f"Artifact '{artifact_id}' exists but is in wrong collection "
+                f"Application '{artifact_id}' is in the wrong collection "
                 f"(current: {current_parent_id}, expected: {collection_id}). "
-                "Deleting and recreating..."
+                "Moving it into the applications collection, keeping its versions."
             )
-            await artifact_manager.delete(artifact_id=artifact_id)
-            existing_artifact = None
+            # MOVE it, do not delete-and-recreate it. `set_parent` relocates the artifact
+            # with its committed version history and its file content intact; deleting and
+            # recreating at the same alias destroyed both, while leaving an artifact that
+            # still resolved at that id -- so the loss was invisible to anyone who checked
+            # by reading the id back.
+            #
+            # The parent is passed POSITIONALLY on purpose: `set_parent(artifact_id,
+            # parent_id=...)` raises `TypeError: unexpected keyword argument 'parent_id'`
+            # against the deployed artifact manager.
+            await artifact_manager.set_parent(artifact_id, collection_id)
+            # Re-read so everything below sees the moved artifact rather than the stale
+            # pre-move handle. Keeping `existing_artifact` set is also what puts a migrated
+            # application back under the version-monotonicity guard: the delete path used to
+            # drop it to None, which skipped that check entirely and let an upload silently
+            # replace a published release that had strayed.
+            existing_artifact = await artifact_manager.read(artifact_id)
 
         if existing_artifact:
             # Edit existing artifact — preserve existing config, then apply overrides
