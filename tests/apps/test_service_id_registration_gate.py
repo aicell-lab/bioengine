@@ -579,9 +579,12 @@ async def test_the_probe_does_not_re_register_an_app_that_deregistered_itself() 
 
 @pytest.mark.asyncio
 async def test_a_failing_probe_does_not_assert_the_app_as_registered() -> None:
-    # The probe is what establishes the address still resolves. When it fails
-    # the replica rebuilds its client instead, and must not claim reachability
-    # it has just failed to confirm.
+    # The probe is what establishes the address still resolves. When Hypha
+    # answers that the service is gone, the replica asks for a repair instead —
+    # since #1061 that repair is an in-place re-assert on the live connection
+    # rather than a client rebuild — and either way it must not claim
+    # reachability it has just failed to confirm. That last part is the
+    # invariant this case exists for, and it is unchanged.
     class _AmnesiacServer:
         async def get_service_info(self, sid):
             raise KeyError(f"Service not found: {sid}@*")
@@ -597,7 +600,8 @@ async def test_a_failing_probe_does_not_assert_the_app_as_registered() -> None:
 
     await inst._maintenance_tick()
 
-    assert inst._connection_lost is True
+    assert inst._registration_absent is True
+    assert inst._connection_lost is False
     assert actor.get_service_registration(APP_ID) is False
 
 
