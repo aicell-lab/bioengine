@@ -303,11 +303,19 @@ async def test_a_migrated_application_IS_version_gated() -> None:
     )
     am = _FakeArtifactManager(rec)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as err:
         await stage_artifact(
             artifact_manager=am,
             workspace=WS,
             manifest=_manifest(version="2.0.0"),
             logger=_logger(),
         )
+    # Same tightening as the arm above, and for the same reason: a bare
+    # `pytest.raises(ValueError)` accepts ANY refusal this path can raise, including the
+    # "manifest is missing a 'version' field" one. Review caught that I had tightened one
+    # of the two arms and left its twin loose -- the inconsistency was the defect, since
+    # the loose twin would have accepted a mutation the tight one rejects.
+    msg = str(err.value)
+    assert "must be strictly greater than the highest existing version" in msg, msg
+    assert "2.0.0" in msg, f"the refusal does not name the version it rejected: {msg}"
     assert "set_parent" not in am.calls, f"refused, but moved anyway: {am.calls}"
