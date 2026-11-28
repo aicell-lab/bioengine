@@ -317,5 +317,10 @@ async def test_a_migrated_application_IS_version_gated() -> None:
     # the loose twin would have accepted a mutation the tight one rejects.
     msg = str(err.value)
     assert "must be strictly greater than the highest existing version" in msg, msg
-    assert "2.0.0" in msg, f"the refusal does not name the version it rejected: {msg}"
+    # Deliberately NO version-string assertion here, unlike the ordering arm above.
+    # Review caught that `"2.0.0" in msg` was vacuous in this fixture: the arm's whole point
+    # is that the manifest version EQUALS the highest existing one, so the rejected version
+    # and the existing version are the same string and the message prints both. Nothing about
+    # that assertion could fail. The ordering arm uses 1.5.0 against 2.0.0, where naming the
+    # rejected version does discriminate, and that is where the check belongs.
     assert "set_parent" not in am.calls, f"refused, but moved anyway: {am.calls}"
