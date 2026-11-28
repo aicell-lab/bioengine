@@ -166,9 +166,23 @@ def test_the_validate_note_describes_the_REFUSAL_not_a_deletion():
 
     assert "refuses outright" in out, out
     assert "WHOLE workspace" in out, out
-    # the retired claims
-    assert "DELETES that artifact" not in out, out
     assert "has to be free in" not in out, out
+
+    # POLICY REFINED after this arm was written: the note may now say an OLD WORKER deletes,
+    # because stating the refusal unconditionally misled a reader whose worker still deletes.
+    # So a blanket `"DELETES that artifact" not in out` is no longer the right assertion -- it
+    # was this arm's original form and it failed the moment the caveat gained the worker
+    # boundary. What must hold is that any deletion claim is VERSION-QUALIFIED: it is a
+    # statement about a specific worker range, never about the command's own behaviour.
+    if "DELETES that artifact" in out:
+        assert "0.16.141" in out, (
+            "the note says an upload DELETES the artifact without naming the worker range "
+            "that does it, which is the unconditional claim this arm exists to prevent"
+        )
+        assert "bioengine_version" in out, (
+            "the note describes a destructive worker without telling the reader how to check "
+            "which worker they have"
+        )
 
 
 # --------------------------------------------------------------------------- #

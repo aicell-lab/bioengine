@@ -93,6 +93,15 @@ def require_worker(worker_service_id, token, server_url):
 # ── Local manifest validation ─────────────────────────────────────────────────
 
 
+# The worker release boundary for a non-application id collision. `apps validate` is OFFLINE,
+# so its text is decided by the INSTALLED CLI and says nothing about the worker the user will
+# upload to. Stating the refusal unconditionally told a reader with a current CLI and an older
+# worker that they were protected when they were not, which is the wrong direction: the older
+# worker deletes their artifact. Named here so a test pins the boundary rather than the prose.
+_FIRST_REFUSING_WORKER = "0.16.142"
+_LAST_DELETING_WORKER = "0.16.141"
+
+
 def _validate_manifest_or_exit(manifest_path: Path) -> dict:
     """Read ``manifest_path`` and run ``validate_manifest``, exit on failure."""
     import yaml
@@ -183,8 +192,13 @@ def validate(app_dir):
         f"If an APPLICATION holds '{app_id}', `bioengine apps upload` refuses the bundle "
         f"unless the manifest version is higher than every version that id already "
         f"carries — and if the lineage is not yours, the id itself is what has to change.\n"
-        f"If something that is NOT an application holds it — a dataset, a model — upload "
-        f"refuses outright, at any version, rather than replacing it.\n"
+        f"If something that is NOT an application holds it — a dataset, a model — whether "
+        f"the upload is refused depends on the WORKER you upload to: a worker at "
+        f"{_FIRST_REFUSING_WORKER} or later refuses outright, at any manifest version, and "
+        f"leaves the artifact alone. A worker at or below {_LAST_DELETING_WORKER} DELETES "
+        f"that artifact and recreates it as an app. This command is offline, so it cannot "
+        f"tell which you have: run `bioengine call <worker-service-id> get_status` and read "
+        f"bioengine_version.\n"
         f"So `bioengine apps list` does not settle this on its own: it shows only the "
         f"application collection. The ids from `bioengine apps status` are APPLICATION ids "
         f"of running deployments, a different namespace again: an id absent there can "
