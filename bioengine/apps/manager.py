@@ -4971,6 +4971,31 @@ class AppsManager:
                 status = await get_app_status(application_ids=["app1"])
                 app = status["app1"]
 
+            Four top-level fields carry versions, and they answer different questions. The
+            one that misleads is ``running_version``, whose ``None`` does not mean what it
+            looks like:
+
+            ``version`` is the version this worker was asked to deploy. **This is the answer
+            to "which version is deployed".**
+
+            ``running_version`` is the version BAKED INTO the entry deployment's running
+            replica, read out of band so that a replica Ray Serve reused across a version
+            bump cannot read as healthy. It is ``None`` whenever no replica of the ENTRY
+            deployment is in state ``RUNNING`` — which is the NORMAL state for an app whose
+            entry deployment has scaled to zero while idle, not a fault and not a sign the
+            app is down. So ``None`` here means "no baked version could be read", NOT
+            "nothing is running": use ``version`` for the deployed version and ``status``
+            for liveness.
+
+            ``version_verified`` is whether EVERY live replica, across all deployments and
+            not only the entry one, booted the expected version. Because it is accumulated
+            over all deployments, **it can be ``True`` while ``running_version`` is
+            ``None``** — a healthy app with a scaled-down entry deployment reads exactly
+            that way, and the pair is not contradictory.
+
+            ``code_verified`` is the same check over source content rather than version
+            strings, which catches a version re-staged with different files.
+
             Each value has the fields built by ``_get_app_status``. Two of them are nested
             deeper than the rest and are easy to mis-read:
 
