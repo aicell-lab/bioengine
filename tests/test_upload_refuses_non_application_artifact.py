@@ -66,6 +66,7 @@ class _FakeArtifactManager:
         self.deleted = []
         self.created = []
         self.edited = []
+        self.reparented = []
 
     async def read(self, artifact_id):
         if self._existing is None:
@@ -74,6 +75,18 @@ class _FakeArtifactManager:
 
     async def delete(self, artifact_id=None, **kw):
         self.deleted.append(artifact_id)
+
+    async def set_parent(self, *args, **kw):
+        # The migration is now a true move, not a delete-and-recreate. Positional only,
+        # which is how the live server takes it -- `parent_id=` raises TypeError there.
+        if kw:
+            raise TypeError(
+                f"set_parent() takes positional arguments, got {sorted(kw)}"
+            )
+        artifact_id, parent_id = args[0], args[1]
+        self.reparented.append((artifact_id, parent_id))
+        if self._existing is not None:
+            self._existing.parent_id = parent_id
 
     async def create(self, **kw):
         self.created.append(kw)
@@ -109,10 +122,19 @@ def test_a_non_application_artifact_is_REFUSED(artifact_type):
             collection_id=COLLECTION,
         )
     msg = str(excinfo.value)
-    # The message has to be actionable: name the id, say it would be destroyed, and say
-    # what to do. A bare "refused" would satisfy pytest.raises and help nobody.
+    # The message has to be actionable: name the id, name what it found, say what the
+    # upload would otherwise do to it, and say what to do instead. A bare "refused"
+    # would satisfy pytest.raises and help nobody.
+    #
+    # This used to assert the literal "DELETE". That word was the old CONSEQUENCE: the
+    # upload deleted and recreated a wrongly placed artifact. A strayed
+    # APPLICATION is moved with `set_parent` instead, so what this refusal now prevents
+    # is an unwanted MOVE of someone else's dataset into this worker's applications
+    # collection. Asserting the consequence by name is what coupled this arm to the old
+    # mechanism, so it now asserts the id, the type and the remedy -- the parts that are
+    # about the caller's situation rather than about our implementation.
     assert ARTIFACT_ID in msg
-    assert "DELETE" in msg
+    assert "not a BioEngine application" in msg
     assert "manifest.yaml" in msg
     assert repr(artifact_type) in msg
 
@@ -274,12 +296,22 @@ async def test_a_wrong_collection_APPLICATION_is_still_migrated():
         manifest=_manifest(),
     )
 
-    assert am.deleted == [ARTIFACT_ID], (
-        "the strayed application was not deleted and recreated; the migration path "
-        f"regressed (deleted={am.deleted})"
+    # This arm used to assert `am.deleted == [ARTIFACT_ID]`, i.e. it
+    # pinned delete-and-recreate as the migration mechanism. That mechanism destroyed the
+    # application's committed version history, which is the defect now fixed, so the
+    # assertion had to change with it. The arm's PURPOSE is unchanged and is still worth
+    # having: it stops "refuse everything" being an accepted answer to the refusal rule.
+    assert am.deleted == [], (
+        "the strayed application was DELETED; the migration must move it with set_parent "
+        f"and preserve its version history (deleted={am.deleted})"
     )
-    assert am.created, "it was not recreated in the applications collection"
-    assert am.created[0]["parent_id"] == COLLECTION
+    assert am.reparented == [(ARTIFACT_ID, COLLECTION)], (
+        f"the strayed application was not moved into the collection "
+        f"(reparented={am.reparented})"
+    )
+    assert (
+        not am.created
+    ), f"the application was recreated rather than moved (created={am.created})"
 
 
 @pytest.mark.asyncio

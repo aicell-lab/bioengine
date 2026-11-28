@@ -82,21 +82,33 @@ def _enforce_version_increases(
         )
 
 
+def _describe_collection(parent_id: Optional[str]) -> str:
+    """Render a parent collection for a message, without printing a bare ``None``.
+
+    A root-level artifact has ``parent_id`` None, and interpolating it produced "in
+    collection None", which reads as a defect in the message rather than as a fact about
+    the artifact -- and root level is exactly where a strayed application is found, so it
+    is the common case here, not the edge one.
+    """
+    return f"'{parent_id}'" if parent_id else "no collection (root level)"
+
+
 def _enforce_replaceable_artifact(
     artifact_id: str,
     artifact_type: Optional[str],
     current_parent_id: Optional[str],
     collection_id: str,
 ) -> None:
-    """Refuse to delete an artifact that is not a BioEngine application.
+    """Refuse to touch an artifact that is not a BioEngine application.
 
     ``stage_artifact`` resolves the manifest's ``id`` to ``<workspace>/<alias>`` across
     the WHOLE workspace, but applications live in ``<workspace>/applications``. So an
     upload can find an artifact at that alias which is not an application at all -- a
-    dataset, a model, a collection. Recreating it in the right collection is only
-    sensible when it IS an application that has strayed; for anything else the delete
-    destroys unrelated work, and the version-monotonicity guard cannot protect it
-    because that guard only runs for an artifact the caller keeps.
+    dataset, a model, a collection. Moving it into the applications collection is only
+    sensible when it IS an application that has strayed; for anything else the move
+    would file someone's unrelated work under this worker's applications and then
+    subject it to the version-monotonicity guard, which is not a thing to do to a
+    dataset.
 
     Raises:
         ValueError: If the existing artifact is not an application artifact. An absent
@@ -110,8 +122,9 @@ def _enforce_replaceable_artifact(
     raise ValueError(
         f"Cannot upload to '{artifact_id}': an artifact already exists at that id and "
         f"it is not a BioEngine application (artifact type: {artifact_type!r}). It is "
-        f"in collection {current_parent_id!r} rather than '{collection_id}', so "
-        f"uploading here would DELETE it. The manifest's 'id' is resolved against the "
+        f"in {_describe_collection(current_parent_id)} rather than '{collection_id}', "
+        f"so uploading here would MOVE it into this worker's applications collection. "
+        f"The manifest's 'id' is resolved against the "
         f"whole workspace, not only the applications collection, so an id that no "
         f"application uses can still be taken. Choose a different 'id' in "
         f"manifest.yaml. If that artifact really is obsolete, delete it deliberately "
@@ -602,8 +615,8 @@ async def stage_artifact(
         # Check if artifact is in the correct collection
         current_parent_id = getattr(existing_artifact, "parent_id", None)
         if current_parent_id != collection_id:
-            # Only an application artifact may be recreated here. Anything else at this
-            # alias belongs to someone's other work, and the delete below is final.
+            # Only an application artifact may be moved here. Anything else at this
+            # alias belongs to someone's other work and is refused outright.
             _enforce_replaceable_artifact(
                 artifact_id=artifact_id,
                 artifact_type=getattr(existing_artifact, "type", None),
@@ -611,12 +624,28 @@ async def stage_artifact(
                 collection_id=collection_id,
             )
             logger.info(
-                f"Artifact '{artifact_id}' exists but is in wrong collection "
-                f"(current: {current_parent_id}, expected: {collection_id}). "
-                "Deleting and recreating..."
+                f"Application '{artifact_id}' sits outside the applications collection "
+                f"(current: {_describe_collection(current_parent_id)}, expected: "
+                f"'{collection_id}'). Moving it in; its committed versions and their "
+                "files are preserved."
             )
-            await artifact_manager.delete(artifact_id=artifact_id)
-            existing_artifact = None
+            # A TRUE MOVE, not a rebuild. ``set_parent`` was measured in a throwaway
+            # workspace to leave committed versions and their payloads byte-identical.
+            # The delete-and-recreate this replaces destroyed the version history AND
+            # skipped the version-increase check, because that check runs only in the
+            # ``if existing_artifact:`` branch below, which a recreated artifact never
+            # reached.
+            #
+            # The re-read is therefore not cosmetic: it keeps ``existing_artifact``
+            # truthy, so a migrated application is version-gated like any other. That is
+            # deliberate. An app that strayed is still an app with a published lineage,
+            # and letting a move reset its version floor would reopen the hole from the
+            # other side.
+            #
+            # ``set_parent`` takes the parent POSITIONALLY -- ``parent_id=`` raises
+            # TypeError.
+            await artifact_manager.set_parent(artifact_id, collection_id)
+            existing_artifact = await artifact_manager.read(artifact_id)
 
         if existing_artifact:
             # Edit existing artifact — preserve existing config, then apply overrides
