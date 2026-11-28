@@ -97,22 +97,61 @@ def test_the_docstring_warns_that_version_verified_can_be_TRUE_beside_a_None():
     )
 
 
-def test_every_version_field_in_the_public_allowlist_is_described():
-    """Guards against describing three of the four and leaving one to be guessed at.
+def test_the_docstring_names_ALL_FOUR_paths_that_yield_a_null_running_version():
+    """Scale-to-zero is the routine one, not the only one.
 
-    Keyed to the allowlist rather than to a hand-written list, so a version field published
-    later without a description fails here instead of passing by omission.
+    Naming only scale-to-zero would leave a caller who hits one of the other three — status not
+    RUNNING, the identity read failing, or a RUNNING entry replica with no identity entry —
+    believing their app is merely idle. The first round of this change made exactly that
+    omission.
+    """
+    doc = _doc()
+    for claim in (
+        "scaled to zero",  # the routine path
+        "``status`` is not ``RUNNING``",
+        "reading the replica identities failed",
+        "no identity entry",
+    ):
+        assert claim in doc, f"the docstring does not name the None path: {claim!r}"
+
+
+def test_the_docstring_separates_None_from_False_on_the_verified_fields():
+    """``None`` is "could not check", ``False`` is "checked and wrong".
+
+    Collapsing them is the mistake that makes a caller treat an unverifiable app as a
+    mismatched one, and it is the same confusion as reading a null running_version as "down".
+    """
+    doc = _doc()
+    assert (
+        "NOT the same as ``False``" in doc
+    ), "the docstring does not distinguish version_verified None from False"
+    assert (
+        "not the same as ``False``" in doc
+    ), "the docstring does not distinguish code_verified None from False"
+
+
+def test_every_version_field_in_the_public_allowlist_is_described():
+    """A version field published later without a description must fail HERE.
+
+    Selected by NAME PATTERN over the allowlist, deliberately, not by an allowlist membership
+    test against a hand-written tuple. A tuple would have to be edited to notice a new field,
+    which is the one thing this arm is for: it would pass by omission on exactly the change it
+    exists to catch, while its own docstring promised otherwise. That is the defect this PR
+    fixes, so it must not live in the test that fixes it.
     """
     doc = _doc()
     version_fields = [
-        f
-        for f in PUBLIC_APP_STATUS_FIELDS
-        if f in ("version", "running_version", "version_verified", "code_verified")
+        f for f in PUBLIC_APP_STATUS_FIELDS if "version" in f or "verified" in f
     ]
-    assert (
-        len(version_fields) == 4
-    ), f"the allowlist's version fields changed: {version_fields}"
+    # Lower bound only. An exact count would re-introduce the hand-written list by the back
+    # door: adding a field would fail on the count rather than on the missing description,
+    # and removing one would fail even though nothing was left undocumented.
+    assert len(version_fields) >= 4, (
+        "the allowlist no longer publishes the four version fields this arm was written for: "
+        f"{version_fields}"
+    )
     missing = [f for f in version_fields if f"``{f}``" not in doc]
-    assert (
-        not missing
-    ), f"published version fields with no description in the docstring: {missing}"
+    assert not missing, (
+        "these version fields are PUBLISHED through PUBLIC_APP_STATUS_FIELDS but have no "
+        f"description in get_app_status's docstring: {missing}"
+    )

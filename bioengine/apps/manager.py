@@ -4980,21 +4980,40 @@ class AppsManager:
 
             ``running_version`` is the version BAKED INTO the entry deployment's running
             replica, read out of band so that a replica Ray Serve reused across a version
-            bump cannot read as healthy. It is ``None`` whenever no replica of the ENTRY
-            deployment is in state ``RUNNING`` — which is the NORMAL state for an app whose
-            entry deployment has scaled to zero while idle, not a fault and not a sign the
-            app is down. So ``None`` here means "no baked version could be read", NOT
-            "nothing is running": use ``version`` for the deployed version and ``status``
-            for liveness.
+            bump cannot read as healthy. ``None`` means "no baked version could be read",
+            NOT "nothing is running" — use ``version`` for the deployed version and
+            ``status`` for liveness. It is ``None`` on four separate paths:
+
+              * no replica of the ENTRY deployment is in state ``RUNNING``. This is the
+                NORMAL state for an app whose entry deployment has scaled to zero while
+                idle: healthy, serving, and not a fault. Of the four, this is the only one
+                that is routine, and the only one where ``None`` says nothing is wrong;
+              * ``status`` is not ``RUNNING``, in which case the replica identities are
+                never read at all;
+              * reading the replica identities failed;
+              * a RUNNING entry replica reported no identity entry.
 
             ``version_verified`` is whether EVERY live replica, across all deployments and
             not only the entry one, booted the expected version. Because it is accumulated
             over all deployments, **it can be ``True`` while ``running_version`` is
             ``None``** — a healthy app with a scaled-down entry deployment reads exactly
-            that way, and the pair is not contradictory.
+            that way, and the pair is not contradictory. It is ``None`` when no replica
+            could be checked, which is NOT the same as ``False``: ``False`` means a live
+            replica booted something other than the expected version.
 
             ``code_verified`` is the same check over source content rather than version
-            strings, which catches a version re-staged with different files.
+            strings, which catches a version re-staged with different files. It is ``None``
+            when no expected source signature is known or no replica reported a hash —
+            again not the same as ``False``.
+
+            ``pinned_version`` is about the FUTURE, not the present: it is the version this
+            worker's startup configuration would restore on its next restart. It is read
+            from the running process's own startup arguments, so a worker mid-rollout still
+            reports the OLD pin. ``None`` means the app is not a startup application, or is
+            listed without a version — in which case a restart redeploys whatever is
+            running rather than resetting it. When it disagrees with ``version``, a restart
+            will CHANGE the running version, which is worth knowing before restarting a
+            worker.
 
             Each value has the fields built by ``_get_app_status``. Two of them are nested
             deeper than the rest and are easy to mis-read:
