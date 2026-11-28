@@ -893,8 +893,11 @@ you lose it.
 (`validate_artifact_id`), while apps live in `<workspace>/applications`. So the id can already
 be held by something that is not an app at all — a dataset, a model, a collection — and
 `bioengine apps list` cannot show you, because it enumerates only the app collection. An
-upload onto such an id is **refused**, at any version: the artifact is left alone and the
-error names it and tells you to change the `id`. Only an artifact that is itself an app, but
+upload onto such an id is **refused by a worker at 0.16.142 or later**, at any manifest
+version: the artifact is left alone and the error names it and tells you to change the
+`id`. A worker at or below 0.16.141 instead DELETES that artifact and recreates it as an
+app, so read the worker's `bioengine_version` (`bioengine call <worker-service-id>
+get_status`) before relying on the refusal. Only an artifact that is itself an app, but
 sits outside the app collection, is moved into it (deleted and recreated there), which is a
 migration rather than a loss. An absent or unrecognised artifact type is refused too — this
 fails closed on purpose, because refusing a migration costs a message while allowing one

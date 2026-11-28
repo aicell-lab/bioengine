@@ -69,3 +69,57 @@ def test_the_boundary_constants_are_adjacent_releases():
     last = tuple(int(p) for p in _LAST_DELETING_WORKER.split("."))
     assert first[:2] == last[:2]
     assert first[2] == last[2] + 1
+
+
+def test_the_caveat_names_a_RUNNABLE_route_to_the_worker_version(caveat):
+    """ "Read the worker's bioengine_version" is only advice if a command prints it.
+
+    No bioengine CLI command does: the field is in the worker's public get_status allowlist
+    and on the website's worker cards, but `cluster status --json` prints cluster and nodes
+    only. So the caveat has to name the route, or it tells the reader to check something they
+    cannot reach from the CLI they are already holding.
+    """
+    assert "get_status" in caveat, caveat
+    assert "bioengine call" in caveat, caveat
+
+
+def test_NO_OTHER_doc_promises_the_refusal_without_the_worker_qualifier():
+    """The CLI caveat and the prose docs must not contradict each other.
+
+    The defect is a reader reassured of a protection their worker may not have. Fixing it in
+    the CLI while `docs/apps-guide.md` and the maintainer skill still say "refused at any
+    version" leaves the reassurance in place and makes the tree self-contradictory. This arm
+    is tree-wide on purpose: the same fix-one-file-and-stop mistake has now happened three
+    times on this work.
+
+    Reads the WHOLE SENTENCE around each promise, because the qualifier may FOLLOW the phrase
+    ("refused at any manifest version by a worker at 0.16.142 or later") and a window ending
+    at "version" reports a false positive -- which is exactly what my first version of this
+    scan did.
+    """
+    import os
+    import re
+
+    pattern = re.compile(r"refused[^.]{0,200}at any (?:manifest )?version[^.]{0,200}\.")
+    qualifier = re.compile(r"0\.16\.14[0-9]|worker at|bioengine_version")
+    offenders = []
+    for root in ("docs", ".claude/skills", "bioengine"):
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if not name.endswith((".md", ".py")):
+                    continue
+                path = os.path.join(dirpath, name)
+                with open(path, encoding="utf-8") as handle:
+                    flat = handle.read().replace("\n", " ")
+                for match in pattern.finditer(flat):
+                    if not qualifier.search(match.group(0)):
+                        offenders.append(f"{path}: {match.group(0)[:120]}")
+
+    # Control: the pattern must still catch an unqualified promise, or a clean result here
+    # would only mean the regex stopped matching.
+    planted = "An upload onto such an id is refused at any version, so you are safe."
+    assert pattern.search(planted) and not qualifier.search(
+        planted
+    ), "the scan can no longer detect an unqualified promise; a clean result is meaningless"
+
+    assert not offenders, "unqualified refusal promises:\n" + "\n".join(offenders)
